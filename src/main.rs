@@ -303,6 +303,48 @@ pub fn forward(token: usize, pos: usize, config: &EsmConfig, weights: &EsmWeight
         for i in 0..dim {
             state.x[i] += state.xb[i];
         }
+
+    // --- g) Bloque FeedForward (Expansión Biológica) ---
+        // 1. Normalización previa al FFN (Layer Norm 2)
+        layer_norm(
+            &mut state.xb, 
+            &state.x, 
+            &weights.ln_2_weight[layer_dim_offset..layer_dim_offset + dim], 
+            &weights.ln_2_bias[layer_dim_offset..layer_dim_offset + dim]
+        );
+
+        // 2. Expansión densa (fc1: 320 -> 1280)
+        let hidden_dim = config.hidden_dim;
+        let fc1_w_offset = l * dim * hidden_dim;
+        let fc1_b_offset = l * hidden_dim;
+        
+        matmul(
+            &mut state.hb, 
+            &state.xb, 
+            &weights.fc1_weight[fc1_w_offset..fc1_w_offset + (dim * hidden_dim)], 
+            &weights.fc1_bias[fc1_b_offset..fc1_b_offset + hidden_dim], 
+            dim, hidden_dim
+        );
+
+        // 3. Activación biológica no lineal
+        gelu(&mut state.hb2, &state.hb);
+
+        // 4. Compresión de vuelta (fc2: 1280 -> 320)
+        let fc2_w_offset = l * hidden_dim * dim;
+        
+        matmul(
+            &mut state.xb, 
+            &state.hb2, 
+            &weights.fc2_weight[fc2_w_offset..fc2_w_offset + (hidden_dim * dim)], 
+            &weights.fc2_bias[layer_dim_offset..layer_dim_offset + dim], // ESM-2 usa dim para los sesgos de fc2
+            hidden_dim, dim
+        );
+
+        // 5. Conexión Residual 2 (Sumar al vector original)
+        for i in 0..dim {
+            state.x[i] += state.xb[i];
+        }
+
     }
 }
 
@@ -358,9 +400,10 @@ fn main() -> io::Result<()> {
     println!("- Memoria KV Cache asignada: {} parámetros (flotantes)", kv_cache_size);
 
     // --- ESTO ES LO NUEVO (Reemplaza a todas las pruebas matemáticas anteriores) ---
-    println!("\nSometiendo a prueba el bucle Forward (Fase 2: Atención + Residual 1)...");
+    
+    println!("\nSometiendo a prueba el bucle Forward (Fase 3: Ciclo completo por capas con FFN)...");
     forward(1, 0, &config, &_weights, &mut run_state);
-    println!("Fase 2 exitosa. Primer valor del vector estado X tras atención en última capa: {:.6}", run_state.x[0]);
+    println!("Fase 3 exitosa. Primer valor del vector estado X al salir de las 6 capas: {:.6}", run_state.x[0]);
 
     Ok(())
 }
