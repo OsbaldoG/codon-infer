@@ -151,6 +151,85 @@ pub fn softmax(x: &mut [f32]) {
     }
 }
 
+// --- Generador Pseudoaleatorio Cero-Asignación (Xorshift) ---
+pub struct SimpleRng {
+    state: u64,
+}
+
+impl SimpleRng {
+    pub fn new(seed: u64) -> Self {
+        Self { state: if seed == 0 { 0x123456789abcdef } else { seed } }
+    }
+
+    pub fn next_u32(&mut self) -> u32 {
+        let mut x = self.state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.state = x;
+        (x & 0xffffffff) as u32
+    }
+
+    pub fn next_f32(&mut self) -> f32 {
+        (self.next_u32() as f32) / (u32::MAX as f32)
+    }
+}
+
+pub fn sample(logits: &mut [f32], temperature: f32, rng: &mut SimpleRng) -> usize {
+    let vocab_size = logits.len();
+
+    // --- REGLA DE ENMASCARAMIENTO BIOLÓGICO ---
+    // Permitir únicamente Aminoácidos Estándar (4..=23) y el token <eos> (2).
+    // Anular el resto asignando -infinito a sus logits.
+    for i in 0..vocab_size {
+        let is_standard_amino_acid = i >= 4 && i <= 23;
+        let is_eos = i == 2;
+        
+        if !is_standard_amino_acid && !is_eos {
+            logits[i] = -f32::INFINITY;
+        }
+    }
+
+    // Si la temperatura es 0, modo greedy puro (Argmax)
+    if temperature <= 0.0 {
+        let mut max_val = logits[0];
+        let mut max_idx = 0;
+        for i in 1..vocab_size {
+            if logits[i] > max_val {
+                max_val = logits[i];
+                max_idx = i;
+            }
+        }
+        return max_idx;
+    }
+
+    // 1. Escalar por temperatura in-place (evitando logits enmascarados de -inf)
+    for val in logits.iter_mut() {
+        if *val != -f32::INFINITY {
+            *val /= temperature;
+        }
+    }
+
+    // 2. Convertir a probabilidades mediante softmax in-place
+    softmax(logits);
+
+    // 3. Muestreo estocástico acumulativo (Ruleta)
+    let r = rng.next_f32();
+    let mut cumulative = 0.0;
+    for (i, &prob) in logits.iter().enumerate() {
+        if prob.is_nan() || prob == 0.0 {
+            continue;
+        }
+        cumulative += prob;
+        if r <= cumulative {
+            return i;
+        }
+    }
+
+    // Fallback de seguridad al primer aminoácido estándar si hay desvíos numéricos
+    4
+}
+
 pub fn apply_rope(q: &mut [f32], k: &mut [f32], pos: usize, dim: usize, n_heads: usize) {
     let head_dim = dim / n_heads;
     for h in 0..n_heads {
@@ -325,12 +404,31 @@ impl Tokenizer {
 }
 
 // ==========================================
-// 6. EJECUCIÓN (MAIN)
+// 6. EJECUCIÓN (MAIN & CLI)
 // ==========================================
 
 fn main() -> io::Result<()> {
-    println!("--- Codon-Infer Engine V0.4.2 ---");
-    println!("Iniciando inferencia estricta...\n");
+    // 1. Parseo manual de argumentos CLI según el contrato de la Data Spec
+    let args: Vec<String> = std::env::args().collect();
+    let mut model_path = "esm2_pesos.bin".to_string();
+    let mut prompt = "M".to_string();
+
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "--model" && i + 1 < args.len() {
+            model_path = args[i + 1].clone();
+            i += 2;
+        } else if args[i] == "--sequence" && i + 1 < args.len() {
+            prompt = args[i + 1].clone();
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+
+    println!("--- Codon-Infer Engine V1.0 ---");
+    println!("Cargando modelo desde '{}'...", model_path);
+    println!("Secuencia inicial (Prompt): '{}'\n", prompt);
 
     let config = EsmConfig {
         dim: 320,
@@ -341,7 +439,7 @@ fn main() -> io::Result<()> {
         max_seq_len: 1024,
     };
 
-    let mut file = File::open("esm2_pesos.bin")?;
+    let mut file = File::open(&model_path)?;
 
     let weights = EsmWeights {
         token_embedding_table: read_floats(&mut file, config.vocab_size * config.dim)?,
@@ -367,20 +465,47 @@ fn main() -> io::Result<()> {
     };
 
     let mut run_state = RunState::new(&config);
+
+    println!("Iniciando Generación Auto-Regresiva...");
+    use std::io::Write;
+
+    let mut prompt_tokens = Tokenizer::encode(&prompt);
+    prompt_tokens.pop(); // Remover token <eos> (2) para permitir continuación
+
+    print!("Generación: {}", prompt);
+    io::stdout().flush().unwrap();
     
-    // Simulamos el paso del token 1 en la posición 0
-    println!("\nPrueba del Tokenizer...");
-    let seq = "MKTV";
-    let tokens = Tokenizer::encode(seq);
-    println!("Secuencia '{}' codificada: {:?}", seq, tokens);
+    let mut pos = 0;
     
-    print!("Decodificación inversa: ");
-    for &t in &tokens {
-        if let Some(c) = Tokenizer::decode(t) {
+    // Procesar prompt (Pre-fill)
+    for idx in 0..(prompt_tokens.len() - 1) {
+        let token = prompt_tokens[idx];
+        forward(token, pos, &config, &weights, &mut run_state);
+        pos += 1;
+    }
+
+    let mut next_token = prompt_tokens[prompt_tokens.len() - 1];
+    let mut rng = SimpleRng::new(42);
+    let temperature = 0.7;
+
+    // Bucle Auto-Regresivo Estocástico
+    while pos < config.max_seq_len {
+        forward(next_token, pos, &config, &weights, &mut run_state);
+        
+        if let Some(c) = Tokenizer::decode(next_token) {
             print!("{}", c);
+            io::stdout().flush().unwrap();
+        }
+
+        next_token = sample(&mut run_state.logits, temperature, &mut rng);
+        pos += 1;
+
+        if next_token == 2 {
+            break;
         }
     }
-    println!("\n(Nota: Los tokens 0 y 2 fueron filtrados por seguridad, como dictan las reglas).");
+    
+    println!("\n\n[Generación Finalizada con Éxito]");
 
     Ok(())
 }
