@@ -1,8 +1,8 @@
 use std::fs::File;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 
 // ==========================================
-// 1. ESPECIFICACIÓN DE ARQUITECTURA
+// 1. ARCHITECTURE SPECIFICATION
 // ==========================================
 
 #[derive(Debug, Clone)]
@@ -73,7 +73,7 @@ impl RunState {
 }
 
 // ==========================================
-// 2. ESPECIFICACIÓN DE I/O (DATOS)
+// 2. I/O DATA SPECIFICATION
 // ==========================================
 
 fn read_floats(file: &mut File, num_floats: usize) -> io::Result<Vec<f32>> {
@@ -89,7 +89,7 @@ fn read_floats(file: &mut File, num_floats: usize) -> io::Result<Vec<f32>> {
 }
 
 // ==========================================
-// 3. ESPECIFICACIÓN DE CÓMPUTO (PRIMITIVAS)
+// 3. COMPUTE SPECIFICATION (PRIMITIVES)
 // ==========================================
 
 pub fn layer_norm(out: &mut [f32], x: &[f32], weight: &[f32], bias: &[f32]) {
@@ -151,7 +151,7 @@ pub fn softmax(x: &mut [f32]) {
     }
 }
 
-// --- Generador Pseudoaleatorio Cero-Asignación (Xorshift) ---
+// --- Zero-Allocation Pseudo-Random Number Generator (Xorshift64) ---
 pub struct SimpleRng {
     state: u64,
 }
@@ -178,9 +178,9 @@ impl SimpleRng {
 pub fn sample(logits: &mut [f32], temperature: f32, rng: &mut SimpleRng) -> usize {
     let vocab_size = logits.len();
 
-    // --- REGLA DE ENMASCARAMIENTO BIOLÓGICO ---
-    // Permitir únicamente Aminoácidos Estándar (4..=23) y el token <eos> (2).
-    // Anular el resto asignando -infinito a sus logits.
+    // --- BIOLOGICAL LOGIT MASKING RULE ---
+    // Allow only standard amino acids (indices 4..=23) and the <eos> boundary token (2).
+    // Mask all non-standard, ambiguous, and control tokens by setting logits to -infinity.
     for i in 0..vocab_size {
         let is_standard_amino_acid = i >= 4 && i <= 23;
         let is_eos = i == 2;
@@ -190,7 +190,7 @@ pub fn sample(logits: &mut [f32], temperature: f32, rng: &mut SimpleRng) -> usiz
         }
     }
 
-    // Si la temperatura es 0, modo greedy puro (Argmax)
+    // Pure greedy mode (Argmax) if temperature <= 0
     if temperature <= 0.0 {
         let mut max_val = logits[0];
         let mut max_idx = 0;
@@ -203,17 +203,17 @@ pub fn sample(logits: &mut [f32], temperature: f32, rng: &mut SimpleRng) -> usiz
         return max_idx;
     }
 
-    // 1. Escalar por temperatura in-place (evitando logits enmascarados de -inf)
+    // 1. Scale logits by temperature in-place (preserving masked -inf)
     for val in logits.iter_mut() {
         if *val != -f32::INFINITY {
             *val /= temperature;
         }
     }
 
-    // 2. Convertir a probabilidades mediante softmax in-place
+    // 2. Convert to probabilities via in-place softmax
     softmax(logits);
 
-    // 3. Muestreo estocástico acumulativo (Ruleta)
+    // 3. Cumulative stochastic sampling (roulette wheel)
     let r = rng.next_f32();
     let mut cumulative = 0.0;
     for (i, &prob) in logits.iter().enumerate() {
@@ -226,7 +226,7 @@ pub fn sample(logits: &mut [f32], temperature: f32, rng: &mut SimpleRng) -> usiz
         }
     }
 
-    // Fallback de seguridad al primer aminoácido estándar si hay desvíos numéricos
+    // Safe fallback to first standard amino acid (Leu) on numerical drift
     4
 }
 
@@ -257,22 +257,22 @@ pub fn apply_rope(q: &mut [f32], k: &mut [f32], pos: usize, dim: usize, n_heads:
 }
 
 // ==========================================
-// 4. ORQUESTADOR PRINCIPAL (FORWARD PASS)
+// 4. MAIN ORCHESTRATOR (FORWARD PASS)
 // ==========================================
 
 pub fn forward(token: usize, pos: usize, config: &EsmConfig, weights: &EsmWeights, state: &mut RunState) {
     let dim = config.dim;
     
-    // 1. Extracción del Embedding Inicial
+    // 1. Initial token embedding lookup
     let embed_offset = token * dim;
     state.x.copy_from_slice(&weights.token_embedding_table[embed_offset..embed_offset + dim]);
 
-    // 2. Iteración a través de las 6 capas del Transformer
+    // 2. Transformer layers loop (6 layers)
     for l in 0..config.n_layers {
         let layer_dim_offset = l * dim;
         let layer_matrix_offset = l * dim * dim;
 
-        // --- a) Normalización de entrada (Layer Norm 1) ---
+        // --- a) Pre-attention Layer Normalization (Layer Norm 1) ---
         layer_norm(
             &mut state.xb, 
             &state.x, 
@@ -280,20 +280,20 @@ pub fn forward(token: usize, pos: usize, config: &EsmConfig, weights: &EsmWeight
             &weights.ln_1_bias[layer_dim_offset..layer_dim_offset + dim]
         );
 
-        // --- b) Proyecciones Q, K, V ---
+        // --- b) Q, K, V Projections ---
         matmul(&mut state.q, &state.xb, &weights.wq[layer_matrix_offset..layer_matrix_offset + (dim * dim)], &weights.bq[layer_dim_offset..layer_dim_offset + dim], dim, dim);
         matmul(&mut state.k, &state.xb, &weights.wk[layer_matrix_offset..layer_matrix_offset + (dim * dim)], &weights.bk[layer_dim_offset..layer_dim_offset + dim], dim, dim);
         matmul(&mut state.v, &state.xb, &weights.wv[layer_matrix_offset..layer_matrix_offset + (dim * dim)], &weights.bv[layer_dim_offset..layer_dim_offset + dim], dim, dim);
 
-        // --- c) Inyección Posicional Relativa ---
+        // --- c) Rotary Position Embedding (RoPE) ---
         apply_rope(&mut state.q, &mut state.k, pos, dim, config.n_heads);
         
-        // --- d) Caché KV (Contexto histórico) ---
+        // --- d) KV Cache Update ---
         let kv_offset = l * config.max_seq_len * dim + pos * dim;
         state.key_cache[kv_offset..kv_offset + dim].copy_from_slice(&state.k);
         state.value_cache[kv_offset..kv_offset + dim].copy_from_slice(&state.v);
 
-        // --- e) Atención Multicabezal ---
+        // --- e) Multi-Head Attention ---
         let head_dim = dim / config.n_heads;
         let scale = (head_dim as f32).sqrt();
 
@@ -325,13 +325,13 @@ pub fn forward(token: usize, pos: usize, config: &EsmConfig, weights: &EsmWeight
             }
         }
 
-        // --- f) Proyección de Salida y Conexión Residual 1 ---
+        // --- f) Output Projection and Residual Connection 1 ---
         matmul(&mut state.xb, &state.xb2, &weights.wo[layer_matrix_offset..layer_matrix_offset + (dim * dim)], &weights.bo[layer_dim_offset..layer_dim_offset + dim], dim, dim);
         for i in 0..dim {
             state.x[i] += state.xb[i];
         }
 
-        // --- g) Bloque FeedForward ---
+        // --- g) Feed-Forward Network (FFN) and Residual Connection 2 ---
         layer_norm(&mut state.xb, &state.x, &weights.ln_2_weight[layer_dim_offset..layer_dim_offset + dim], &weights.ln_2_bias[layer_dim_offset..layer_dim_offset + dim]);
 
         let hidden_dim = config.hidden_dim;
@@ -349,7 +349,7 @@ pub fn forward(token: usize, pos: usize, config: &EsmConfig, weights: &EsmWeight
         }
     }
 
-    // --- 3. Clasificación Final (Language Modeling Head) ---
+    // --- 3. Final Classification (Language Modeling Head) ---
     layer_norm(&mut state.xb, &state.x, &weights.ln_f_weight, &weights.ln_f_bias);
 
     const ZERO_BIAS: [f32; 33] = [0.0; 33];
@@ -357,38 +357,38 @@ pub fn forward(token: usize, pos: usize, config: &EsmConfig, weights: &EsmWeight
 }
 
 // ==========================================
-// 5. TOKENIZER (TRADUCCIÓN BIOLÓGICA)
+// 5. TOKENIZER (BIOLOGICAL TRANSLATION)
 // ==========================================
 
 pub struct Tokenizer;
 
 impl Tokenizer {
-    // Convierte un string biológico en un arreglo de Token IDs
+    /// Encodes a biological sequence string into an array of Token IDs.
     pub fn encode(text: &str) -> Vec<usize> {
         let mut tokens = Vec::new();
         
-        // 1. Regla de Frontera: Añadir Token <cls> al inicio
+        // 1. Boundary token: Prepend <cls> token
         tokens.push(0);
 
-        // 2. Mapeo de caracteres
+        // 2. Character mapping
         for c in text.chars() {
             let token_id = match c {
                 'L' => 4, 'A' => 5, 'G' => 6, 'V' => 7, 'S' => 8, 'E' => 9, 'R' => 10,
                 'T' => 11, 'I' => 12, 'D' => 13, 'P' => 14, 'K' => 15, 'Q' => 16, 'N' => 17,
                 'F' => 18, 'Y' => 19, 'M' => 20, 'H' => 21, 'W' => 22, 'C' => 23,
                 'X' => 24, 'B' => 25, 'U' => 26, 'Z' => 27, 'O' => 28, '.' => 29, '-' => 30,
-                _ => 3, // Token <unk> para caracteres no reconocidos
+                _ => 3, // <unk> token for unrecognized characters
             };
             tokens.push(token_id);
         }
 
-        // 3. Regla de Frontera: Añadir Token <eos> al final
+        // 3. Boundary token: Append <eos> token
         tokens.push(2);
         
         tokens
     }
 
-    // Convierte un Token ID numérico de vuelta a un caracter biológico
+    /// Decodes a numeric Token ID back to a biological amino acid character.
     pub fn decode(token_id: usize) -> Option<char> {
         match token_id {
             4 => Some('L'), 5 => Some('A'), 6 => Some('G'), 7 => Some('V'), 8 => Some('S'),
@@ -397,20 +397,24 @@ impl Tokenizer {
             19 => Some('Y'), 20 => Some('M'), 21 => Some('H'), 22 => Some('W'), 23 => Some('C'),
             24 => Some('X'), 25 => Some('B'), 26 => Some('U'), 27 => Some('Z'), 28 => Some('O'),
             29 => Some('.'), 30 => Some('-'),
-            // Ignorar tokens de control (0, 1, 2, 3) y tokens especiales (31, 32) silenciosamente
+            // Silently ignore control tokens (0, 1, 2, 3) and special tokens (31, 32)
             _ => None,
         }
     }
 }
 
 // ==========================================
-// 6. EJECUCIÓN (MAIN & CLI)
+// 6. EXECUTION (MAIN & CLI)
 // ==========================================
 
 fn main() -> io::Result<()> {
-    // 1. Parseo manual de argumentos CLI según el contrato de la Data Spec
+    // 1. Parse manual CLI arguments according to Data Spec contract
     let args: Vec<String> = std::env::args().collect();
-    let mut model_path = "esm2_pesos.bin".to_string();
+    let mut model_path = if std::path::Path::new("esm2_weights.bin").exists() {
+        "esm2_weights.bin".to_string()
+    } else {
+        "esm2_pesos.bin".to_string()
+    };
     let mut prompt = "M".to_string();
 
     let mut i = 1;
@@ -428,7 +432,7 @@ fn main() -> io::Result<()> {
 
     println!("--- Codon-Infer Engine V1.0 (Benchmarking Mode) ---");
     let load_timer = std::time::Instant::now();
-    println!("Cargando modelo desde '{}'...", model_path);
+    println!("Loading model weights from '{}'...", model_path);
 
     let config = EsmConfig {
         dim: 320,
@@ -464,23 +468,22 @@ fn main() -> io::Result<()> {
         classifier_weights: read_floats(&mut file, 102_849)?,
     };
 
-    println!("¡Modelo cargado exitosamente en {:?}!\n", load_timer.elapsed());
+    println!("Model weights loaded successfully in {:?}!\n", load_timer.elapsed());
 
     let mut run_state = RunState::new(&config);
 
-    println!("Secuencia inicial (Prompt): '{}'", prompt);
-    println!("Iniciando Generación Auto-Regresiva con Muestreo Estocástico...");
-    use std::io::Write;
+    println!("Initial seed prompt: '{}'", prompt);
+    println!("Starting autoregressive generation with stochastic sampling...");
 
     let mut prompt_tokens = Tokenizer::encode(&prompt);
-    prompt_tokens.pop(); // Remover token <eos> (2) para permitir continuación
+    prompt_tokens.pop(); // Remove <eos> (2) boundary token to allow continuation
 
-    print!("Generación: {}", prompt);
+    print!("Generation: {}", prompt);
     io::stdout().flush().unwrap();
     
     let mut pos = 0;
     
-    // Cronometrar fase Pre-fill
+    // Measure pre-fill phase latency
     let prefill_timer = std::time::Instant::now();
     for idx in 0..(prompt_tokens.len() - 1) {
         let token = prompt_tokens[idx];
@@ -495,7 +498,7 @@ fn main() -> io::Result<()> {
     let mut generated_tokens_count = 0;
     let gen_timer = std::time::Instant::now();
 
-    // Bucle Auto-Regresivo Estocástico
+    // Autoregressive generation loop
     while pos < config.max_seq_len {
         forward(next_token, pos, &config, &weights, &mut run_state);
         
@@ -514,21 +517,21 @@ fn main() -> io::Result<()> {
     }
     let gen_duration = gen_timer.elapsed();
     
-    println!("\n\n--- Reporte de Validación y Rendimiento ---");
-    println!(" * Tiempo de Pre-fill (Prompt):        {:?}", prefill_duration);
-    println!(" * Tiempo de Generación de Tokens:     {:?}", gen_duration);
-    println!(" * Tokens Generados:                   {} tokens", generated_tokens_count);
+    println!("\n\n--- Performance & Validation Report ---");
+    println!(" * Prompt Pre-fill Latency:            {:?}", prefill_duration);
+    println!(" * Token Generation Time:              {:?}", gen_duration);
+    println!(" * Tokens Generated:                   {} tokens", generated_tokens_count);
     if gen_duration.as_secs_f32() > 0.0 {
         let throughput = generated_tokens_count as f32 / gen_duration.as_secs_f32();
-        println!(" * Throughput (Velocidad):             {:.2} tokens/segundo", throughput);
+        println!(" * Throughput (Speed):                 {:.2} tokens/second", throughput);
     }
-    println!("[Validación de Ejecución Finalizada con Éxito]");
+    println!("[Execution Completed Successfully]");
 
     Ok(())
 }
 
 // ==========================================
-// 7. PRUEBAS UNITARIAS
+// 7. UNIT TESTS
 // ==========================================
 
 #[cfg(test)]

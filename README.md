@@ -128,27 +128,27 @@ cargo build --release
 ```
 
 ### Run Inference & Benchmarking
-Run the compiled binary passing the model weights and a starting amino acid prompt:
+Run the compiled binary passing the starting amino acid prompt (uses `esm2_weights.bin` by default):
 ```bash
-cargo run --release -- --model esm2_pesos.bin --sequence "MCMPCFTTDHQMARKCDD"
+cargo run --release -- --sequence "MCMPCFTTDHQMARKCDD"
 ```
 
 Sample output:
 ```text
 --- Codon-Infer Engine V1.0 (Benchmarking Mode) ---
-Cargando modelo desde 'esm2_pesos.bin'...
-¡Modelo cargado exitosamente en 113.15ms!
+Loading model weights from 'esm2_weights.bin'...
+Model weights loaded successfully in 38.05ms!
 
-Secuencia inicial (Prompt): 'MCMPCFTTDHQMARKCDD'
-Iniciando Generación Auto-Regresiva con Muestreo Estocástico...
-Generación: MCMPCFTTDHQMARKCDDDPCCIIVQCCRQEIIQRCCLRIDRNCCIIIVYCCNCY
+Initial seed prompt: 'MCMPCFTTDHQMARKCDD'
+Starting autoregressive generation with stochastic sampling...
+Generation: MCMPCFTTDHQMARKCDDDPCCIIVQCCRQEIIQRCCLRIDRNCCIIIVYCCNCY
 
---- Reporte de Validación y Rendimiento ---
- * Tiempo de Pre-fill (Prompt):        120.55ms
- * Tiempo de Generación de Tokens:     287.30ms
- * Tokens Generados:                   37 tokens
- * Throughput (Velocidad):             128.78 tokens/segundo
-[Validación de Ejecución Finalizada con Éxito]
+--- Performance & Validation Report ---
+ * Prompt Pre-fill Latency:            132.85ms
+ * Token Generation Time:              270.91ms
+ * Tokens Generated:                   37 tokens
+ * Throughput (Speed):                 136.57 tokens/second
+[Execution Completed Successfully]
 ```
 
 ### Run Unit Tests
@@ -170,7 +170,7 @@ test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 
 | Argument | Description | Default |
 | :--- | :--- | :--- |
-| `--model <PATH>` | Path to the raw binary weights file (`esm2_pesos.bin`) | `esm2_pesos.bin` |
+| `--model <PATH>` | Path to the raw binary weights file (`esm2_weights.bin`) | `esm2_weights.bin` (or `esm2_pesos.bin`) |
 | `--sequence <STR>` | Initial amino acid sequence seed / prompt | `"M"` |
 
 ---
@@ -179,10 +179,11 @@ test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 
 ```text
 codon-infer/
-├── Cargo.toml          # Zero external dependencies
-├── esm2_pesos.bin      # Raw binary dump of 7.5M f32 parameters (~30 MB)
+├── Cargo.toml          # Zero external dependencies (pure std)
+├── esm2_weights.bin    # Raw binary dump of 7.5M f32 parameters (~30 MB)
 ├── src/
-│   └── main.rs         # Monolithic, zero-allocation Transformer engine & CLI
+│   └── main.rs         # Zero-allocation ESM-2 Transformer engine, CLI & benchmarks
+├── LICENSE             # MIT License
 └── README.md           # Documentation
 ```
 
