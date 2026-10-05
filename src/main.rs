@@ -426,9 +426,9 @@ fn main() -> io::Result<()> {
         }
     }
 
-    println!("--- Codon-Infer Engine V1.0 ---");
+    println!("--- Codon-Infer Engine V1.0 (Benchmarking Mode) ---");
+    let load_timer = std::time::Instant::now();
     println!("Cargando modelo desde '{}'...", model_path);
-    println!("Secuencia inicial (Prompt): '{}'\n", prompt);
 
     let config = EsmConfig {
         dim: 320,
@@ -464,9 +464,12 @@ fn main() -> io::Result<()> {
         classifier_weights: read_floats(&mut file, 102_849)?,
     };
 
+    println!("¡Modelo cargado exitosamente en {:?}!\n", load_timer.elapsed());
+
     let mut run_state = RunState::new(&config);
 
-    println!("Iniciando Generación Auto-Regresiva...");
+    println!("Secuencia inicial (Prompt): '{}'", prompt);
+    println!("Iniciando Generación Auto-Regresiva con Muestreo Estocástico...");
     use std::io::Write;
 
     let mut prompt_tokens = Tokenizer::encode(&prompt);
@@ -477,16 +480,20 @@ fn main() -> io::Result<()> {
     
     let mut pos = 0;
     
-    // Procesar prompt (Pre-fill)
+    // Cronometrar fase Pre-fill
+    let prefill_timer = std::time::Instant::now();
     for idx in 0..(prompt_tokens.len() - 1) {
         let token = prompt_tokens[idx];
         forward(token, pos, &config, &weights, &mut run_state);
         pos += 1;
     }
+    let prefill_duration = prefill_timer.elapsed();
 
     let mut next_token = prompt_tokens[prompt_tokens.len() - 1];
     let mut rng = SimpleRng::new(42);
     let temperature = 0.7;
+    let mut generated_tokens_count = 0;
+    let gen_timer = std::time::Instant::now();
 
     // Bucle Auto-Regresivo Estocástico
     while pos < config.max_seq_len {
@@ -499,13 +506,58 @@ fn main() -> io::Result<()> {
 
         next_token = sample(&mut run_state.logits, temperature, &mut rng);
         pos += 1;
+        generated_tokens_count += 1;
 
         if next_token == 2 {
             break;
         }
     }
+    let gen_duration = gen_timer.elapsed();
     
-    println!("\n\n[Generación Finalizada con Éxito]");
+    println!("\n\n--- Reporte de Validación y Rendimiento ---");
+    println!(" * Tiempo de Pre-fill (Prompt):        {:?}", prefill_duration);
+    println!(" * Tiempo de Generación de Tokens:     {:?}", gen_duration);
+    println!(" * Tokens Generados:                   {} tokens", generated_tokens_count);
+    if gen_duration.as_secs_f32() > 0.0 {
+        let throughput = generated_tokens_count as f32 / gen_duration.as_secs_f32();
+        println!(" * Throughput (Velocidad):             {:.2} tokens/segundo", throughput);
+    }
+    println!("[Validación de Ejecución Finalizada con Éxito]");
 
     Ok(())
+}
+
+// ==========================================
+// 7. PRUEBAS UNITARIAS
+// ==========================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_layer_norm_stability() {
+        let input = vec![1.0, 2.0, 3.0, 4.0];
+        let mut output = vec![0.0; 4];
+        let weight = vec![1.0; 4];
+        let bias = vec![0.0; 4];
+        layer_norm(&mut output, &input, &weight, &bias);
+        assert_eq!(output.len(), 4);
+        assert!(!output[0].is_nan());
+    }
+
+    #[test]
+    fn test_softmax_sum_to_one() {
+        let mut logits = vec![1.0, 2.0, 3.0];
+        softmax(&mut logits);
+        let sum: f32 = logits.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_tokenizer_boundaries() {
+        let seq = "LA";
+        let tokens = Tokenizer::encode(seq);
+        assert_eq!(tokens, vec![0, 4, 5, 2]);
+    }
 }
