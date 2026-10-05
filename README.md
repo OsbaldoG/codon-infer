@@ -39,11 +39,11 @@ Benchmarked on Linux x86_64 (pure CPU single-core execution):
 
 ---
 
-## 🧬 Biological Validation
+## 🧬 Biological Exploration & BLAST Alignment
 
-During development, `codon-infer` was seeded with a cysteine-rich disulfide motif prompt (`MCMPCFTTDHQMARKCDD`). The engine completed the sequence into `MCMPCFTTDHQMARKCDDDPCYEDGQWQSQVIDNEHM`.
+During development, `codon-infer` was seeded with a cysteine-rich motif prompt (`MCMPCFTTDHQMARKCDD`, 18 aa). The engine completed the sequence with stochastic autoregressive sampling into `MCMPCFTTDHQMARKCDDDPCYEDGQWQSQVIDNEHM` (37 aa).
 
-Querying the generated candidate against the **NCBI non-redundant protein database (BLASTP, RID: `C64245BJ016`)** confirmed significant biological alignment:
+Querying the candidate against the **NCBI non-redundant protein database (BLASTP, RID: `C64245BJ016`)** revealed:
 
 ```text
 Query:  1   MCMPCFTTDHQMARKCDDDPCYEDGQWQSQVIDNEHM  37
@@ -51,7 +51,7 @@ Query:  1   MCMPCFTTDHQMARKCDDDPCYEDGQWQSQVIDNEHM  37
 Sbjct:  1   MCMPCFTTDHQMARKCDDCCGGKGRGKCYGPQCLCR   36
 ```
 * **Top Hit:** Scorpion *Leiurus quinquestriatus* chlorotoxin-like peptide (PDB: [`7X41_A`](https://www.rcsb.org/structure/7X41)).
-* **Alignment:** 100% sequence identity across the core binding domain with an E-value of $0.001$.
+* **Coverage Analysis:** 49% query coverage corresponding to the 18 aa seed motif (100% identity to the native binding domain, E-value: $0.001$), followed by a *de novo* extended variable tail exploring novel sequence space under strict canonical amino acid constraints.
 
 ---
 
@@ -172,6 +172,8 @@ test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 | :--- | :--- | :--- |
 | `--model <PATH>` | Path to the raw binary weights file (`esm2_weights.bin`) | `esm2_weights.bin` (or `esm2_pesos.bin`) |
 | `--sequence <STR>` | Initial amino acid sequence seed / prompt | `"M"` |
+| `--temperature <FLOAT>` | Sampling temperature for stochastic generation (0.0 = greedy) | `0.7` |
+| `--seed <U64>` | Pseudorandom seed (defaults to nanosecond system clock entropy) | Dynamic (Clock) |
 
 ---
 

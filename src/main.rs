@@ -232,13 +232,26 @@ pub fn sample(logits: &mut [f32], temperature: f32, rng: &mut SimpleRng) -> usiz
 
 pub fn apply_rope(q: &mut [f32], k: &mut [f32], pos: usize, dim: usize, n_heads: usize) {
     let head_dim = dim / n_heads;
+    let half_head = head_dim / 2;
+
+    // Stack-allocated buffers (8 elements each) to eliminate 960 transcendental calls per token
+    let mut cos_buf = [0.0f32; 16];
+    let mut sin_buf = [0.0f32; 16];
+
+    for j in 0..half_head {
+        let i = j * 2;
+        let freq = 1.0 / 10000.0f32.powf(i as f32 / head_dim as f32);
+        let val = pos as f32 * freq;
+        cos_buf[j] = val.cos();
+        sin_buf[j] = val.sin();
+    }
+
     for h in 0..n_heads {
         let head_offset = h * head_dim;
-        for i in (0..head_dim).step_by(2) {
-            let freq = 1.0 / 10000.0f32.powf(i as f32 / head_dim as f32);
-            let val = pos as f32 * freq;
-            let fcr = val.cos();
-            let fci = val.sin();
+        for j in 0..half_head {
+            let i = j * 2;
+            let fcr = cos_buf[j];
+            let fci = sin_buf[j];
 
             let idx0 = head_offset + i;
             let idx1 = head_offset + i + 1;
@@ -416,6 +429,8 @@ fn main() -> io::Result<()> {
         "esm2_pesos.bin".to_string()
     };
     let mut prompt = "M".to_string();
+    let mut custom_seed: Option<u64> = None;
+    let mut temperature: f32 = 0.7;
 
     let mut i = 1;
     while i < args.len() {
@@ -424,6 +439,16 @@ fn main() -> io::Result<()> {
             i += 2;
         } else if args[i] == "--sequence" && i + 1 < args.len() {
             prompt = args[i + 1].clone();
+            i += 2;
+        } else if args[i] == "--seed" && i + 1 < args.len() {
+            if let Ok(s) = args[i + 1].parse::<u64>() {
+                custom_seed = Some(s);
+            }
+            i += 2;
+        } else if args[i] == "--temperature" && i + 1 < args.len() {
+            if let Ok(t) = args[i + 1].parse::<f32>() {
+                temperature = t;
+            }
             i += 2;
         } else {
             i += 1;
@@ -493,8 +518,13 @@ fn main() -> io::Result<()> {
     let prefill_duration = prefill_timer.elapsed();
 
     let mut next_token = prompt_tokens[prompt_tokens.len() - 1];
-    let mut rng = SimpleRng::new(42);
-    let temperature = 0.7;
+    let seed = custom_seed.unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x123456789abcdef)
+    });
+    let mut rng = SimpleRng::new(seed);
     let mut generated_tokens_count = 0;
     let gen_timer = std::time::Instant::now();
 
