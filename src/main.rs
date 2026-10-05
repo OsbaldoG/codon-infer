@@ -249,6 +249,60 @@ pub fn forward(token: usize, pos: usize, config: &EsmConfig, weights: &EsmWeight
         apply_rope(&mut state.q, &mut state.k, pos, dim, config.n_heads);
         
         // TODO: d) Caché KV y Cálculo de Atención (Multi-Head Score)
+        // --- d) Caché KV (Contexto histórico) ---
+        let kv_offset = l * config.max_seq_len * dim + pos * dim;
+        state.key_cache[kv_offset..kv_offset + dim].copy_from_slice(&state.k);
+        state.value_cache[kv_offset..kv_offset + dim].copy_from_slice(&state.v);
+
+        // --- e) Atención Multicabezal (Multi-Head Attention) ---
+        let head_dim = dim / config.n_heads;
+        let scale = (head_dim as f32).sqrt();
+
+        for h in 0..config.n_heads {
+            let q_offset = h * head_dim;
+            
+            // 1. Calcular puntuación de atención contra todos los tokens en el tiempo (0 hasta pos)
+            for t in 0..=pos {
+                let cache_offset = l * config.max_seq_len * dim + t * dim + h * head_dim;
+                let mut score = 0.0;
+                for i in 0..head_dim {
+                    score += state.q[q_offset + i] * state.key_cache[cache_offset + i];
+                }
+                score /= scale;
+                state.att[h * config.max_seq_len + t] = score; // Guardar score crudo
+            }
+            
+            // 2. Softmax: Transforma scores en probabilidades (Cero-asignación mediante slicing)
+            softmax(&mut state.att[(h * config.max_seq_len)..(h * config.max_seq_len + pos + 1)]);
+            
+            // 3. Multiplicar probabilidades por Values (V) y acumular en búfer secundario xb2
+            for i in 0..head_dim {
+                state.xb2[q_offset + i] = 0.0;
+            }
+            
+            for t in 0..=pos {
+                let prob = state.att[h * config.max_seq_len + t];
+                let cache_offset = l * config.max_seq_len * dim + t * dim + h * head_dim;
+                for i in 0..head_dim {
+                    state.xb2[q_offset + i] += prob * state.value_cache[cache_offset + i];
+                }
+            }
+        }
+
+        // --- f) Proyección de Salida y Conexión Residual 1 ---
+        // Proyectar resultado consolidado de atención (xb2) hacia xb usando pesos de salida (wo)
+        matmul(
+            &mut state.xb, 
+            &state.xb2, 
+            &weights.wo[layer_matrix_offset..layer_matrix_offset + (dim * dim)], 
+            &weights.bo[layer_dim_offset..layer_dim_offset + dim], 
+            dim, dim
+        );
+        
+        // Conexión Residual: Sumar al vector original
+        for i in 0..dim {
+            state.x[i] += state.xb[i];
+        }
     }
 }
 
@@ -304,12 +358,9 @@ fn main() -> io::Result<()> {
     println!("- Memoria KV Cache asignada: {} parámetros (flotantes)", kv_cache_size);
 
     // --- ESTO ES LO NUEVO (Reemplaza a todas las pruebas matemáticas anteriores) ---
-    println!("\nSometiendo a prueba el bucle Forward (Fase 1: QKV + RoPE)...");
-    
-    // Simulamos el paso del token 1 (Leucina, por ejemplo) en la posición 0
+    println!("\nSometiendo a prueba el bucle Forward (Fase 2: Atención + Residual 1)...");
     forward(1, 0, &config, &_weights, &mut run_state);
-    
-    println!("Fase 1 exitosa. Primer valor del vector Query en la última capa: {:.6}", run_state.q[0]);
+    println!("Fase 2 exitosa. Primer valor del vector estado X tras atención en última capa: {:.6}", run_state.x[0]);
 
     Ok(())
 }
