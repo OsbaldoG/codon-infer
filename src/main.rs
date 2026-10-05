@@ -160,6 +160,101 @@ pub fn softmax(x: &mut [f32]) {
     }
 }
 
+pub fn apply_rope(q: &mut [f32], k: &mut [f32], pos: usize, dim: usize, n_heads: usize) {
+    let head_dim = dim / n_heads;
+    
+    for h in 0..n_heads {
+        // Encontramos el inicio del bloque de memoria para este cabezal
+        let head_offset = h * head_dim;
+        
+        // RoPE opera en pares de dimensiones consecutivas
+        for i in (0..head_dim).step_by(2) {
+            // Calcular la frecuencia theta para el par de dimensiones actual
+            let freq = 1.0 / 10000.0f32.powf(i as f32 / head_dim as f32);
+            let val = pos as f32 * freq;
+            let fcr = val.cos();
+            let fci = val.sin();
+
+            // Índices absolutos en el vector completo (320 dimensiones)
+            let idx0 = head_offset + i;
+            let idx1 = head_offset + i + 1;
+
+            // Leer valores originales
+            let q0 = q[idx0];
+            let q1 = q[idx1];
+            let k0 = k[idx0];
+            let k1 = k[idx1];
+
+            // Rotar Q in-place
+            q[idx0] = q0 * fcr - q1 * fci;
+            q[idx1] = q0 * fci + q1 * fcr;
+
+            // Rotar K in-place
+            k[idx0] = k0 * fcr - k1 * fci;
+            k[idx1] = k0 * fci + k1 * fcr;
+        }
+    }
+}
+
+// --- Propagación hacia adelante (Forward Pass) ---
+
+pub fn forward(token: usize, pos: usize, config: &EsmConfig, weights: &EsmWeights, state: &mut RunState) {
+    let dim = config.dim;
+    
+    // 1. Extracción del Embedding Inicial
+    // Copiamos el vector biológico de 320 dimensiones correspondiente al token actual
+    let embed_offset = token * dim;
+    state.x.copy_from_slice(&weights.token_embedding_table[embed_offset..embed_offset + dim]);
+
+    // 2. Iteración a través de las 6 capas del Transformer
+    for l in 0..config.n_layers {
+        // Calculamos los saltos de memoria para ubicar los tensores de esta capa específica
+        let layer_dim_offset = l * dim;
+        let layer_matrix_offset = l * dim * dim;
+
+        // --- INICIO DEL BLOQUE DE ATENCIÓN ---
+        
+        // a) Normalización de entrada (Layer Norm 1)
+        layer_norm(
+            &mut state.xb, 
+            &state.x, 
+            &weights.ln_1_weight[layer_dim_offset..layer_dim_offset + dim], 
+            &weights.ln_1_bias[layer_dim_offset..layer_dim_offset + dim]
+        );
+
+        // b) Proyecciones Q, K, V (Matmul)
+        matmul(
+            &mut state.q, 
+            &state.xb, 
+            &weights.wq[layer_matrix_offset..layer_matrix_offset + (dim * dim)], 
+            &weights.bq[layer_dim_offset..layer_dim_offset + dim], 
+            dim, dim
+        );
+        matmul(
+            &mut state.k, 
+            &state.xb, 
+            &weights.wk[layer_matrix_offset..layer_matrix_offset + (dim * dim)], 
+            &weights.bk[layer_dim_offset..layer_dim_offset + dim], 
+            dim, dim
+        );
+        matmul(
+            &mut state.v, 
+            &state.xb, 
+            &weights.wv[layer_matrix_offset..layer_matrix_offset + (dim * dim)], 
+            &weights.bv[layer_dim_offset..layer_dim_offset + dim], 
+            dim, dim
+        );
+
+        // c) Inyección Posicional Relativa
+        apply_rope(&mut state.q, &mut state.k, pos, dim, config.n_heads);
+        
+        // TODO: d) Caché KV y Cálculo de Atención (Multi-Head Score)
+    }
+}
+
+
+
+
 fn main() -> io::Result<()> {
     println!("--- Codon-Infer Engine V0.4.2 ---");
     println!("Alineación final de memoria y prueba de RunState...\n");
@@ -200,60 +295,21 @@ fn main() -> io::Result<()> {
 
     println!("¡Éxito Absoluto! Anatomía base mapeada.");
 
-    // Prueba de esfuerzo de memoria RAM
+    // --- ESTO SE QUEDA (Nota el 'mut' añadido a run_state) ---
     println!("\nIniciando reserva estricta de memoria de trabajo (RunState)...");
-    let run_state = RunState::new(&config);
+    let mut run_state = RunState::new(&config);
     println!("Reserva en el Heap completada.");
     
     let kv_cache_size = run_state.key_cache.len() + run_state.value_cache.len();
     println!("- Memoria KV Cache asignada: {} parámetros (flotantes)", kv_cache_size);
 
-    // Prueba de esfuerzo matemático: Normalización de Capa
-    println!("\nSometiendo a prueba matemática: layer_norm...");
-    let dummy_input = vec![1.0; config.dim];
-    let mut dummy_output = vec![0.0; config.dim];
+    // --- ESTO ES LO NUEVO (Reemplaza a todas las pruebas matemáticas anteriores) ---
+    println!("\nSometiendo a prueba el bucle Forward (Fase 1: QKV + RoPE)...");
     
-    layer_norm(
-        &mut dummy_output, 
-        &dummy_input, 
-        // Extraemos solo los pesos correspondientes a la capa 0
-        &_weights.ln_1_weight[0..config.dim], 
-        &_weights.ln_1_bias[0..config.dim]
-    );
-
-    println!("Operación exitosa. Primer valor normalizado: {:.6}", dummy_output[0]);
-
-    // Prueba de esfuerzo matemático: Multiplicación de Matrices (Q Projection)
-    println!("\nSometiendo a prueba matemática: matmul (Proyección Query)...");
+    // Simulamos el paso del token 1 (Leucina, por ejemplo) en la posición 0
+    forward(1, 0, &config, &_weights, &mut run_state);
     
-    // Usamos el resultado de la normalización anterior como entrada
-    let mut q_out = vec![0.0; config.dim];
-    
-    matmul(
-        &mut q_out,
-        &dummy_output, // El vector x que normalizamos en el paso anterior
-        &_weights.wq[0..(config.dim * config.dim)], // Matriz de pesos W (320x320)
-        &_weights.bq[0..config.dim],                // Vector de sesgo B (320)
-        config.dim,
-        config.dim
-    );
-
-    println!("Operación exitosa. Primer valor proyectado (Q): {:.6}", q_out[0]);
-    
-    // Prueba de esfuerzo matemático: Activación GELU
-    println!("\nSometiendo a prueba matemática: gelu (Activación no lineal)...");
-    
-    let mut gelu_out = vec![0.0; config.dim];
-    gelu(&mut gelu_out, &q_out);
-
-    println!("Operación exitosa. Primer valor tras GELU: {:.6}", gelu_out[0]);
-    
-    // Prueba de esfuerzo matemático: Softmax (Atención simulada)
-    println!("\nSometiendo a prueba matemática: softmax (Distribución de probabilidad)...");
-    let mut softmax_test = vec![1.0, 2.0, 3.0];
-    softmax(&mut softmax_test);
-    println!("Operación exitosa. Probabilidades resultantes: [{:.4}, {:.4}, {:.4}]", 
-             softmax_test[0], softmax_test[1], softmax_test[2]);
+    println!("Fase 1 exitosa. Primer valor del vector Query en la última capa: {:.6}", run_state.q[0]);
 
     Ok(())
 }
