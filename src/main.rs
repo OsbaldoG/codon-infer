@@ -278,7 +278,54 @@ pub fn forward(token: usize, pos: usize, config: &EsmConfig, weights: &EsmWeight
 }
 
 // ==========================================
-// 5. EJECUCIÓN (MAIN)
+// 5. TOKENIZER (TRADUCCIÓN BIOLÓGICA)
+// ==========================================
+
+pub struct Tokenizer;
+
+impl Tokenizer {
+    // Convierte un string biológico en un arreglo de Token IDs
+    pub fn encode(text: &str) -> Vec<usize> {
+        let mut tokens = Vec::new();
+        
+        // 1. Regla de Frontera: Añadir Token <cls> al inicio
+        tokens.push(0);
+
+        // 2. Mapeo de caracteres
+        for c in text.chars() {
+            let token_id = match c {
+                'L' => 4, 'A' => 5, 'G' => 6, 'V' => 7, 'S' => 8, 'E' => 9, 'R' => 10,
+                'T' => 11, 'I' => 12, 'D' => 13, 'P' => 14, 'K' => 15, 'Q' => 16, 'N' => 17,
+                'F' => 18, 'Y' => 19, 'M' => 20, 'H' => 21, 'W' => 22, 'C' => 23,
+                'X' => 24, 'B' => 25, 'U' => 26, 'Z' => 27, 'O' => 28, '.' => 29, '-' => 30,
+                _ => 3, // Token <unk> para caracteres no reconocidos
+            };
+            tokens.push(token_id);
+        }
+
+        // 3. Regla de Frontera: Añadir Token <eos> al final
+        tokens.push(2);
+        
+        tokens
+    }
+
+    // Convierte un Token ID numérico de vuelta a un caracter biológico
+    pub fn decode(token_id: usize) -> Option<char> {
+        match token_id {
+            4 => Some('L'), 5 => Some('A'), 6 => Some('G'), 7 => Some('V'), 8 => Some('S'),
+            9 => Some('E'), 10 => Some('R'), 11 => Some('T'), 12 => Some('I'), 13 => Some('D'),
+            14 => Some('P'), 15 => Some('K'), 16 => Some('Q'), 17 => Some('N'), 18 => Some('F'),
+            19 => Some('Y'), 20 => Some('M'), 21 => Some('H'), 22 => Some('W'), 23 => Some('C'),
+            24 => Some('X'), 25 => Some('B'), 26 => Some('U'), 27 => Some('Z'), 28 => Some('O'),
+            29 => Some('.'), 30 => Some('-'),
+            // Ignorar tokens de control (0, 1, 2, 3) y tokens especiales (31, 32) silenciosamente
+            _ => None,
+        }
+    }
+}
+
+// ==========================================
+// 6. EJECUCIÓN (MAIN)
 // ==========================================
 
 fn main() -> io::Result<()> {
@@ -322,18 +369,18 @@ fn main() -> io::Result<()> {
     let mut run_state = RunState::new(&config);
     
     // Simulamos el paso del token 1 en la posición 0
-    forward(1, 0, &config, &weights, &mut run_state);
+    println!("\nPrueba del Tokenizer...");
+    let seq = "MKTV";
+    let tokens = Tokenizer::encode(seq);
+    println!("Secuencia '{}' codificada: {:?}", seq, tokens);
     
-    let mut max_val = run_state.logits[0];
-    let mut max_idx = 0;
-    for (i, &val) in run_state.logits.iter().enumerate() {
-        if val > max_val {
-            max_val = val;
-            max_idx = i;
+    print!("Decodificación inversa: ");
+    for &t in &tokens {
+        if let Some(c) = Tokenizer::decode(t) {
+            print!("{}", c);
         }
     }
-    
-    println!("El modelo predice el Token ID: {} (Puntaje crudo: {:.4})", max_idx, max_val);
+    println!("\n(Nota: Los tokens 0 y 2 fueron filtrados por seguridad, como dictan las reglas).");
 
     Ok(())
 }
