@@ -6,6 +6,7 @@ authors = ["Manuel Osbaldo Gastélum Islas <gaimo41027@gmail.com>"]
 description = "High-Performance, Zero-Allocation ESM-2 Protein Language Model Inference Engine in Pure Rust"
 license = "MIT"
 repository = "https://github.com/OsbaldoG/codon-infer"
+default-run = "codon-infer"
 
 [dependencies]
 

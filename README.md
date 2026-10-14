@@ -193,10 +193,24 @@ Generation: MCMPCFTTDHQMARKCDDDPCCIIVQCCRQEIIQRCCLRIDRNCCIIIVYCCNCY
 [Execution Completed Successfully]
 ```
 
-### 4. Run Model Context Protocol (MCP) Server
+### 4. Run Stress & Bioinformatic Benchmark Suite
+Execute the full validation suite covering SIMD micro-kernels, evolutionary perplexity (LDH & bacteriocin mutational calibration), `<mask_1>` inpainting, and 10,000-token hardware stress:
+```bash
+cargo run --release -- benchmark --suite full
+```
+
+Filter by specific benchmark suite:
+```bash
+cargo run --release -- benchmark --suite simd        # SIMD micro-kernels & parity
+cargo run --release -- benchmark --suite mlm         # Evolutionary perplexity & mutational penalties
+cargo run --release -- benchmark --suite inpainting  # Bidirectional mask infilling
+cargo run --release -- benchmark --suite stress      # 10,000-token hardware cache thrashing
+```
+
+### 5. Run Model Context Protocol (MCP) Server
 For integration into autonomous LLM agents (Claude Desktop, Cursor, Gemini):
 ```bash
-./target/release/codon-infer-mcp
+cargo run --release --bin codon-infer-mcp
 ```
 
 MCP tool exposed:
@@ -206,6 +220,7 @@ MCP tool exposed:
 
 ## 🛠️ CLI Options
 
+### Inference Mode
 | Argument | Description | Default |
 | :--- | :--- | :--- |
 | `--model <PATH>` | Path to raw binary parameters | `esm2_weights.bin` (or `esm2_pesos.bin`) |
@@ -213,6 +228,13 @@ MCP tool exposed:
 | `--temperature <FLOAT>` | Sampling temperature (0.0 = greedy argmax, >0.0 = stochastic) | `0.7` |
 | `--max-tokens <USIZE>` | Maximum number of new amino acid residues to generate | Full context (up to 1,024) |
 | `--seed <U64>` | Seed for XORShift64 PRNG | Dynamic (system clock entropy) |
+
+### Benchmark Mode
+| Argument | Description | Default |
+| :--- | :--- | :--- |
+| `benchmark` | Triggers the automated stress and functional validation suite | - |
+| `--suite <STR>` | Benchmark suite to run (`full`, `simd`, `mlm`, `inpainting`, `stress`) | `"full"` |
+| `--model <PATH>` | Custom weights file path | `esm2_weights.bin` |
 
 ---
 

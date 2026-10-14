@@ -5,6 +5,31 @@ use codon_infer::{EsmConfig, EsmWeights, RunState, active_simd_backend, generate
 fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let mut model_path = if std::path::Path::new("esm2_weights.bin").exists() { "esm2_weights.bin".to_string() } else { "esm2_pesos.bin".to_string() };
+
+    // Subcommand: benchmark
+    if args.len() > 1 && args[1] == "benchmark" {
+        let mut suite = "full".to_string();
+        let mut i = 2;
+        while i < args.len() {
+            if (args[i] == "--suite" || args[i] == "-s") && i + 1 < args.len() {
+                suite = args[i + 1].clone();
+                i += 2;
+            } else if args[i] == "--model" && i + 1 < args.len() {
+                model_path = args[i + 1].clone();
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        let config = EsmConfig::esm2_8m();
+        let load_t = Instant::now();
+        println!("Loading ESM-2 weights from '{}' for benchmark suite...", model_path);
+        let weights = EsmWeights::from_file(&model_path, &config)?;
+        println!("Weights mapped successfully in {:.2} ms.", load_t.elapsed().as_secs_f64() * 1000.0);
+        codon_infer::benchmark::run_full_benchmark_suite(&weights, &config, &suite);
+        return Ok(());
+    }
+
     let mut prompt = "M".to_string(); let mut custom_seed: Option<u64> = None; let mut temperature: f32 = 0.7; let mut max_tokens: Option<usize> = None;
     let mut i = 1;
     while i < args.len() {

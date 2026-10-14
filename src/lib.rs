@@ -4,6 +4,7 @@ use std::io::{self, Read};
 use std::time::Instant;
 
 pub mod mcp;
+pub mod benchmark;
 
 #[derive(Debug, Clone)]
 pub struct EsmConfig {
@@ -178,6 +179,56 @@ impl RunState {
             key_cache: vec![0.0; config.n_layers * config.max_seq_len * config.dim],
             value_cache: vec![0.0; config.n_layers * config.max_seq_len * config.dim],
             rope_cos, rope_sin,
+        }
+    }
+}
+
+pub struct BidirectionalRunState {
+    pub max_len: usize,
+    pub x: Vec<f32>,
+    pub q: Vec<f32>,
+    pub k: Vec<f32>,
+    pub v: Vec<f32>,
+    pub att: Vec<f32>,
+    pub out_att: Vec<f32>,
+    pub xb: Vec<f32>,
+    pub xb2: Vec<f32>,
+    pub hb: Vec<f32>,
+    pub hb2: Vec<f32>,
+    pub logits: Vec<f32>,
+    pub rope_cos: Vec<f32>,
+    pub rope_sin: Vec<f32>,
+}
+
+impl BidirectionalRunState {
+    pub fn new(config: &EsmConfig, max_len: usize) -> Self {
+        let head_dim = config.dim / config.n_heads;
+        let half_head = head_dim / 2;
+        let mut rope_cos = vec![0.0; max_len * half_head];
+        let mut rope_sin = vec![0.0; max_len * half_head];
+        for pos in 0..max_len {
+            for j in 0..half_head {
+                let freq = 1.0 / 10000.0f32.powf((j * 2) as f32 / head_dim as f32);
+                let val = (pos as f32) * freq;
+                rope_cos[pos * half_head + j] = val.cos();
+                rope_sin[pos * half_head + j] = val.sin();
+            }
+        }
+        Self {
+            max_len,
+            x: vec![0.0; max_len * config.dim],
+            q: vec![0.0; max_len * config.dim],
+            k: vec![0.0; max_len * config.dim],
+            v: vec![0.0; max_len * config.dim],
+            att: vec![0.0; config.n_heads * max_len],
+            out_att: vec![0.0; max_len * config.dim],
+            xb: vec![0.0; config.dim],
+            xb2: vec![0.0; config.dim],
+            hb: vec![0.0; config.hidden_dim],
+            hb2: vec![0.0; config.hidden_dim],
+            logits: vec![0.0; max_len * config.vocab_size],
+            rope_cos,
+            rope_sin,
         }
     }
 }
@@ -434,15 +485,124 @@ pub fn forward(token: usize, pos: usize, config: &EsmConfig, weights: &EsmWeight
     matmul(&mut state.logits, &state.xb, &weights.token_embedding_table, lm_decoder_b, dim, config.vocab_size);
 }
 
+pub fn log_softmax_canonical(logits: &[f32]) -> [f32; 33] {
+    let mut out = [-f32::INFINITY; 33];
+    let mut max_val = f32::NEG_INFINITY;
+    for i in 4..=23 {
+        if logits[i] > max_val { max_val = logits[i]; }
+    }
+    let mut sum_exp = 0.0f32;
+    for i in 4..=23 {
+        sum_exp += (logits[i] - max_val).exp();
+    }
+    let log_sum_exp = max_val + sum_exp.ln();
+    for i in 4..=23 {
+        out[i] = logits[i] - log_sum_exp;
+    }
+    out
+}
+
+pub fn forward_bidirectional(
+    tokens: &[usize],
+    config: &EsmConfig,
+    weights: &EsmWeights,
+    state: &mut BidirectionalRunState,
+) {
+    let seq_len = tokens.len();
+    assert!(seq_len <= state.max_len, "Sequence length {} exceeds max_len {}", seq_len, state.max_len);
+    let dim = config.dim;
+    let head_dim = dim / config.n_heads;
+    let inv_scale = 1.0 / (head_dim as f32).sqrt();
+    let hidden_dim = config.hidden_dim;
+
+    for p in 0..seq_len {
+        let token = tokens[p];
+        let embed_offset = token * dim;
+        state.x[p * dim..(p + 1) * dim].copy_from_slice(&weights.token_embedding_table[embed_offset..embed_offset + dim]);
+    }
+
+    for l in 0..config.n_layers {
+        let layer_dim_offset = l * dim;
+        let layer_matrix_offset = l * dim * dim;
+        let fc1_w_offset = l * dim * hidden_dim;
+        let fc1_b_offset = l * hidden_dim;
+        let fc2_w_offset = l * hidden_dim * dim;
+
+        for p in 0..seq_len {
+            let xp = &state.x[p * dim..(p + 1) * dim];
+            layer_norm(&mut state.xb, xp, &weights.ln_1_weight[layer_dim_offset..layer_dim_offset + dim], &weights.ln_1_bias[layer_dim_offset..layer_dim_offset + dim]);
+            let q_slice = &mut state.q[p * dim..(p + 1) * dim];
+            matmul(q_slice, &state.xb, &weights.wq[layer_matrix_offset..layer_matrix_offset + dim * dim], &weights.bq[layer_dim_offset..layer_dim_offset + dim], dim, dim);
+            let k_slice = &mut state.k[p * dim..(p + 1) * dim];
+            matmul(k_slice, &state.xb, &weights.wk[layer_matrix_offset..layer_matrix_offset + dim * dim], &weights.bk[layer_dim_offset..layer_dim_offset + dim], dim, dim);
+            let v_slice = &mut state.v[p * dim..(p + 1) * dim];
+            matmul(v_slice, &state.xb, &weights.wv[layer_matrix_offset..layer_matrix_offset + dim * dim], &weights.bv[layer_dim_offset..layer_dim_offset + dim], dim, dim);
+            apply_rope(q_slice, k_slice, &state.rope_cos, &state.rope_sin, p, dim, config.n_heads);
+        }
+
+        for p in 0..seq_len {
+            for h in 0..config.n_heads {
+                let q_offset = p * dim + h * head_dim;
+                let q_head = &state.q[q_offset..q_offset + head_dim];
+                let att_head = &mut state.att[h * state.max_len..h * state.max_len + seq_len];
+
+                for t in 0..seq_len {
+                    let k_offset = t * dim + h * head_dim;
+                    let k_head = &state.k[k_offset..k_offset + head_dim];
+                    let mut score = 0.0f32;
+                    for i in 0..head_dim { score += q_head[i] * k_head[i]; }
+                    att_head[t] = score * inv_scale;
+                }
+                softmax(att_head);
+
+                let out_head = &mut state.out_att[p * dim + h * head_dim..p * dim + (h + 1) * head_dim];
+                out_head.fill(0.0);
+                for t in 0..seq_len {
+                    let prob = att_head[t];
+                    let v_offset = t * dim + h * head_dim;
+                    let v_head = &state.v[v_offset..v_offset + head_dim];
+                    for i in 0..head_dim { out_head[i] += prob * v_head[i]; }
+                }
+            }
+
+            let out_slice = &state.out_att[p * dim..(p + 1) * dim];
+            matmul(&mut state.xb, out_slice, &weights.wo[layer_matrix_offset..layer_matrix_offset + dim * dim], &weights.bo[layer_dim_offset..layer_dim_offset + dim], dim, dim);
+            for i in 0..dim { state.x[p * dim + i] += state.xb[i]; }
+
+            let xp = &state.x[p * dim..(p + 1) * dim];
+            layer_norm(&mut state.xb, xp, &weights.ln_2_weight[layer_dim_offset..layer_dim_offset + dim], &weights.ln_2_bias[layer_dim_offset..layer_dim_offset + dim]);
+            matmul(&mut state.hb, &state.xb, &weights.fc1_weight[fc1_w_offset..fc1_w_offset + dim * hidden_dim], &weights.fc1_bias[fc1_b_offset..fc1_b_offset + hidden_dim], dim, hidden_dim);
+            gelu(&mut state.hb2, &state.hb);
+            matmul(&mut state.xb, &state.hb2, &weights.fc2_weight[fc2_w_offset..fc2_w_offset + hidden_dim * dim], &weights.fc2_bias[layer_dim_offset..layer_dim_offset + dim], hidden_dim, dim);
+            for i in 0..dim { state.x[p * dim + i] += state.xb[i]; }
+        }
+    }
+
+    let d2 = dim * dim;
+    let lm_dense_w = &weights.classifier_weights[0..d2];
+    let lm_dense_b = &weights.classifier_weights[d2..d2 + dim];
+    let lm_decoder_b = &weights.classifier_weights[weights.classifier_weights.len() - config.vocab_size..];
+
+    for p in 0..seq_len {
+        let xp = &state.x[p * dim..(p + 1) * dim];
+        layer_norm(&mut state.xb, xp, &weights.ln_f_weight, &weights.ln_f_bias);
+        matmul(&mut state.xb2, &state.xb, lm_dense_w, lm_dense_b, dim, dim);
+        gelu(&mut state.xb, &state.xb2);
+        let logits_p = &mut state.logits[p * config.vocab_size..(p + 1) * config.vocab_size];
+        matmul(logits_p, &state.xb, &weights.token_embedding_table, lm_decoder_b, dim, config.vocab_size);
+    }
+}
+
 pub struct Tokenizer;
 impl Tokenizer {
     pub fn encode(text: &str) -> Vec<usize> {
         let mut tokens = Vec::with_capacity(text.len() + 2); tokens.push(0);
-        for c in text.chars() {
+        let normalized = text.replace("<mask_1>", "*").replace("<mask_1>", "*").replace("<mask>", "*");
+        for c in normalized.chars() {
             let id = match c {
                 'L'=>4,'A'=>5,'G'=>6,'V'=>7,'S'=>8,'E'=>9,'R'=>10,'T'=>11,'I'=>12,'D'=>13,
                 'P'=>14,'K'=>15,'Q'=>16,'N'=>17,'F'=>18,'Y'=>19,'M'=>20,'H'=>21,'W'=>22,'C'=>23,
-                'X'=>24,'B'=>25,'U'=>26,'Z'=>27,'O'=>28,'.'=>29,'-'=>30, _=>3,
+                'X'=>24,'B'=>25,'U'=>26,'Z'=>27,'O'=>28,'.'=>29,'-'=>30,'*'=>32, _=>3,
             }; tokens.push(id);
         }
         tokens.push(2); tokens
@@ -452,7 +612,7 @@ impl Tokenizer {
             4=>Some('L'),5=>Some('A'),6=>Some('G'),7=>Some('V'),8=>Some('S'),9=>Some('E'),10=>Some('R'),
             11=>Some('T'),12=>Some('I'),13=>Some('D'),14=>Some('P'),15=>Some('K'),16=>Some('Q'),17=>Some('N'),
             18=>Some('F'),19=>Some('Y'),20=>Some('M'),21=>Some('H'),22=>Some('W'),23=>Some('C'),24=>Some('X'),
-            25=>Some('B'),26=>Some('U'),27=>Some('Z'),28=>Some('O'),29=>Some('.'),30=>Some('-'),_=>None,
+            25=>Some('B'),26=>Some('U'),27=>Some('Z'),28=>Some('O'),29=>Some('.'),30=>Some('-'),32=>Some('*'),_=>None,
         }
     }
 }
@@ -540,5 +700,44 @@ mod tests {
         let mut state = RunState::new(&config);
         forward(1, 0, &config, &weights, &mut state);
         assert!(!state.logits[0].is_nan());
+    }
+
+    #[test]
+    fn test_mask_token_encoding_and_decoding() {
+        assert_eq!(Tokenizer::encode("M*C"), vec![0, 20, 32, 23, 2]);
+        assert_eq!(Tokenizer::encode("M<mask_1>C"), vec![0, 20, 32, 23, 2]);
+        assert_eq!(Tokenizer::decode(32), Some('*'));
+    }
+
+    #[test]
+    fn test_log_softmax_canonical() {
+        let logits = [1.0f32; 33];
+        let log_probs = log_softmax_canonical(&logits);
+        let mut sum_prob = 0.0f32;
+        for i in 4..=23 {
+            sum_prob += log_probs[i].exp();
+        }
+        assert!((sum_prob - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_forward_bidirectional_if_available() {
+        if !std::path::Path::new("esm2_weights.bin").exists() {
+            return;
+        }
+        let config = EsmConfig::esm2_8m();
+        let weights = EsmWeights::from_file("esm2_weights.bin", &config).expect("weights should load");
+        let mut bi_state = BidirectionalRunState::new(&config, 32);
+        let tokens = Tokenizer::encode("MCMP*TTD");
+        forward_bidirectional(&tokens, &config, &weights, &mut bi_state);
+        let mask_idx = 5;
+        let mask_logits = &bi_state.logits[mask_idx * config.vocab_size..(mask_idx + 1) * config.vocab_size];
+        assert!(!mask_logits[18].is_nan()); // Phenylalanine (F) logit
+    }
+
+    #[test]
+    fn test_simd_benchmark_parity_run() {
+        let rep = crate::benchmark::run_simd_benchmark(20);
+        assert!(rep.rmse_parity < 1e-4);
     }
 }
