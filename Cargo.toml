@@ -1,7 +1,11 @@
 [package]
 name = "codon-infer"
-version = "0.1.0"
+version = "1.2.0"
 edition = "2024"
+authors = ["Manuel Osbaldo Gastélum Islas <gaimo41027@gmail.com>"]
+description = "High-Performance, Zero-Allocation ESM-2 Protein Language Model Inference Engine in Pure Rust"
+license = "MIT"
+repository = "https://github.com/OsbaldoG/codon-infer"
 
 [dependencies]
 

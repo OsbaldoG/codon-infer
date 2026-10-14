@@ -1,6 +1,29 @@
+# Build artifacts and directories
+/target/
+target/
+*.o
+*.a
+*.so
+*.dylib
+*.rlib
+
+# Binaries and executable outputs
 bio_engine
+codon-infer
+codon-infer-mcp
 
+# Backups and temporary files
+*.backup
+*.bak
+*.tmp
+*~
+.DS_Store
 
-# Added by cargo
+# IDE and editors
+.vscode/
+.idea/
+*.swp
+*.swo
 
-/target
+# Logs
+*.log

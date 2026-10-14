@@ -15,7 +15,7 @@ fn main() -> io::Result<()> {
         else if args[i] == "--max-tokens" && i + 1 < args.len() { if let Ok(m) = args[i+1].parse::<usize>() { max_tokens = Some(m); } i += 2; }
         else { i += 1; }
     }
-    println!("--- Codon-Infer Engine V1.1 (Zero-Deps SIMD Mode) ---"); println!("Active SIMD Backend: {}", active_simd_backend());
+    println!("--- Codon-Infer Engine V1.2 (Zero-Deps SIMD Mode) ---"); println!("Active SIMD Backend: {}", active_simd_backend());
     let load_timer = Instant::now(); println!("Loading model weights from '{}'...", model_path);
     let config = EsmConfig::esm2_8m(); let weights = EsmWeights::from_file(&model_path, &config)?;
     println!("Model weights loaded successfully in {:?}!\n", load_timer.elapsed());

@@ -428,13 +428,10 @@ pub fn forward(token: usize, pos: usize, config: &EsmConfig, weights: &EsmWeight
     let d2 = dim * dim;
     let lm_dense_w = &weights.classifier_weights[0..d2];
     let lm_dense_b = &weights.classifier_weights[d2..d2 + dim];
-    let lm_ln_w = &weights.classifier_weights[d2 + dim..d2 + 2 * dim];
-    let lm_ln_b = &weights.classifier_weights[d2 + 2 * dim..d2 + 3 * dim];
-    let lm_decoder_b = &weights.classifier_weights[d2 + 3 * dim..d2 + 3 * dim + config.vocab_size];
+    let lm_decoder_b = &weights.classifier_weights[weights.classifier_weights.len() - config.vocab_size..];
     matmul(&mut state.xb2, &state.xb, lm_dense_w, lm_dense_b, dim, dim);
     gelu(&mut state.xb, &state.xb2);
-    layer_norm(&mut state.xb2, &state.xb, lm_ln_w, lm_ln_b);
-    matmul(&mut state.logits, &state.xb2, &weights.token_embedding_table, lm_decoder_b, dim, config.vocab_size);
+    matmul(&mut state.logits, &state.xb, &weights.token_embedding_table, lm_decoder_b, dim, config.vocab_size);
 }
 
 pub struct Tokenizer;
@@ -531,5 +528,17 @@ mod tests {
             let mut out_avx1 = vec![0.0; out_dim]; unsafe { matmul_avx1(&mut out_avx1, &x, &w, &bias, in_dim, out_dim); }
             for i in 0..out_dim { assert!((out_scalar[i]-out_avx1[i]).abs() < 1e-4, "AVX1 mismatch at {}", i); }
         }
+    }
+
+    #[test]
+    fn test_forward_pass_with_weights_if_available() {
+        if !std::path::Path::new("esm2_weights.bin").exists() {
+            return;
+        }
+        let config = EsmConfig::esm2_8m();
+        let weights = EsmWeights::from_file("esm2_weights.bin", &config).expect("weights should load");
+        let mut state = RunState::new(&config);
+        forward(1, 0, &config, &weights, &mut state);
+        assert!(!state.logits[0].is_nan());
     }
 }
