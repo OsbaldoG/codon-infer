@@ -198,6 +198,7 @@ pub struct BidirectionalRunState {
     pub logits: Vec<f32>,
     pub rope_cos: Vec<f32>,
     pub rope_sin: Vec<f32>,
+    pub final_layer_att: Vec<f32>,
 }
 
 impl BidirectionalRunState {
@@ -229,6 +230,7 @@ impl BidirectionalRunState {
             logits: vec![0.0; max_len * config.vocab_size],
             rope_cos,
             rope_sin,
+            final_layer_att: vec![0.0; max_len * max_len],
         }
     }
 }
@@ -476,13 +478,8 @@ pub fn forward(token: usize, pos: usize, config: &EsmConfig, weights: &EsmWeight
         for i in 0..dim { state.x[i] += state.xb[i]; }
     }
     layer_norm(&mut state.xb, &state.x, &weights.ln_f_weight, &weights.ln_f_bias);
-    let d2 = dim * dim;
-    let lm_dense_w = &weights.classifier_weights[0..d2];
-    let lm_dense_b = &weights.classifier_weights[d2..d2 + dim];
-    let lm_decoder_b = &weights.classifier_weights[weights.classifier_weights.len() - config.vocab_size..];
-    matmul(&mut state.xb2, &state.xb, lm_dense_w, lm_dense_b, dim, dim);
-    gelu(&mut state.xb, &state.xb2);
-    matmul(&mut state.logits, &state.xb, &weights.token_embedding_table, lm_decoder_b, dim, config.vocab_size);
+    const ZERO_BIAS: [f32; 33] = [0.0; 33];
+    matmul(&mut state.logits, &state.xb, &weights.token_embedding_table, &ZERO_BIAS, dim, config.vocab_size);
 }
 
 pub fn log_softmax_canonical(logits: &[f32]) -> [f32; 33] {
@@ -540,6 +537,11 @@ pub fn forward_bidirectional(
             apply_rope(q_slice, k_slice, &state.rope_cos, &state.rope_sin, p, dim, config.n_heads);
         }
 
+        let is_last_layer = l == config.n_layers - 1;
+        if is_last_layer {
+            state.final_layer_att[0..seq_len * seq_len].fill(0.0);
+        }
+
         for p in 0..seq_len {
             for h in 0..config.n_heads {
                 let q_offset = p * dim + h * head_dim;
@@ -554,6 +556,13 @@ pub fn forward_bidirectional(
                     att_head[t] = score * inv_scale;
                 }
                 softmax(att_head);
+
+                if is_last_layer {
+                    let head_weight = 1.0 / config.n_heads as f32;
+                    for t in 0..seq_len {
+                        state.final_layer_att[p * seq_len + t] += att_head[t] * head_weight;
+                    }
+                }
 
                 let out_head = &mut state.out_att[p * dim + h * head_dim..p * dim + (h + 1) * head_dim];
                 out_head.fill(0.0);
@@ -578,18 +587,12 @@ pub fn forward_bidirectional(
         }
     }
 
-    let d2 = dim * dim;
-    let lm_dense_w = &weights.classifier_weights[0..d2];
-    let lm_dense_b = &weights.classifier_weights[d2..d2 + dim];
-    let lm_decoder_b = &weights.classifier_weights[weights.classifier_weights.len() - config.vocab_size..];
-
+    const ZERO_BIAS: [f32; 33] = [0.0; 33];
     for p in 0..seq_len {
         let xp = &state.x[p * dim..(p + 1) * dim];
         layer_norm(&mut state.xb, xp, &weights.ln_f_weight, &weights.ln_f_bias);
-        matmul(&mut state.xb2, &state.xb, lm_dense_w, lm_dense_b, dim, dim);
-        gelu(&mut state.xb, &state.xb2);
         let logits_p = &mut state.logits[p * config.vocab_size..(p + 1) * config.vocab_size];
-        matmul(logits_p, &state.xb, &weights.token_embedding_table, lm_decoder_b, dim, config.vocab_size);
+        matmul(logits_p, &state.xb, &weights.token_embedding_table, &ZERO_BIAS, dim, config.vocab_size);
     }
 }
 
@@ -733,6 +736,30 @@ mod tests {
         let mask_idx = 5;
         let mask_logits = &bi_state.logits[mask_idx * config.vocab_size..(mask_idx + 1) * config.vocab_size];
         assert!(!mask_logits[18].is_nan()); // Phenylalanine (F) logit
+    }
+
+    #[test]
+    fn test_bidirectional_logits_entropy() {
+        if !std::path::Path::new("esm2_weights.bin").exists() {
+            return;
+        }
+        let config = EsmConfig::esm2_8m();
+        let weights = EsmWeights::from_file("esm2_weights.bin", &config).expect("weights should load");
+        let mut bi_state = BidirectionalRunState::new(&config, 32);
+        let tokens = Tokenizer::encode("MCMP*TTD");
+        forward_bidirectional(&tokens, &config, &weights, &mut bi_state);
+        let mask_idx = 5;
+        let mask_logits = &bi_state.logits[mask_idx * config.vocab_size..(mask_idx + 1) * config.vocab_size];
+        let log_probs = log_softmax_canonical(mask_logits);
+
+        let mut entropy = 0.0f32;
+        for i in 4..=23 {
+            let p = log_probs[i].exp();
+            if p > 1e-12 {
+                entropy -= p * log_probs[i];
+            }
+        }
+        assert!(entropy > 0.1, "Logits collapsed to a single token! Shannon entropy H = {}", entropy);
     }
 
     #[test]
