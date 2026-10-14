@@ -1,0 +1,1 @@
+/home/manuel/REA_GENOMICS/codon-infer/target/release/codon-infer-mcp: /home/manuel/REA_GENOMICS/codon-infer/src/lib.rs /home/manuel/REA_GENOMICS/codon-infer/src/mcp.rs /home/manuel/REA_GENOMICS/codon-infer/src/mcp_main.rs
