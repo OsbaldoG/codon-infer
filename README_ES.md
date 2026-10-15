@@ -8,13 +8,13 @@
 [![Version](https://img.shields.io/badge/versión-1.4.0-blue.svg)]()
 [![Dependencies](https://img.shields.io/badge/dependencias-0%20(std%20puro)-brightgreen.svg)]()
 [![License](https://img.shields.io/badge/licencia-MIT-blue.svg)](LICENSE)
-[![Model](https://img.shields.io/badge/modelo-ESM--2%20(8M%20%7C%2035M%20%7C%20150M)-blueviolet.svg)](https://github.com/facebookresearch/esm)
-[![SIMD](https://img.shields.io/badge/SIMD-AVX2%2BFMA%20%7C%20AVX1-red.svg)]()
+[![Model](https://img.shields.io/badge/modelo-ESM--2%20(8M%20a%203B)-blueviolet.svg)](https://github.com/facebookresearch/esm)
+[![SIMD](https://img.shields.io/badge/SIMD-AVX512%20%7C%20AVX2%2BFMA%20%7C%20AVX1-red.svg)]()
 [![Throughput](https://img.shields.io/badge/Rendimiento%20CPU->200%20tokens%2Fseg-success.svg)]()
 
 > 📖 **Nota de Idioma:** Este documento constituye la documentación oficial técnica completa en **español**. Para consultar la versión original en inglés técnico, acceda a [README.md](README.md).
 
-`codon-infer` es un motor de inferencia y suite de análisis bioinformático ultraligero y libre de dependencias externas para la familia de modelos de lenguaje de proteínas Evolutionary Scale Modeling (**ESM-2**) en sus variantes de escala (`8M`, `35M` y `150M`), diseñado desde primeros principios matemáticos y de hardware en **Rust 100% seguro e idiomático (`std` exclusivamente)**.
+`codon-infer` es un motor de inferencia y suite de análisis bioinformático ultraligero y libre de dependencias externas para la familia de modelos de lenguaje de proteínas Evolutionary Scale Modeling (**ESM-2**) en todas sus variantes de escala (`8M`, `35M`, `150M`, `650M` y `3B`), diseñado desde primeros principios matemáticos y de hardware en **Rust 100% seguro e idiomático (`std` exclusivamente)**.
 
 Al prescindir por completo de los ecosistemas de Python, PyTorch, C/CUDA y crates externos de terceros, `codon-infer` ejecuta generación autorregresiva de secuencias, *inpainting* bidireccional de sitios activos, escaneo mutacional profundo *in silico* (DMS) y predicción de contactos estructurales mediante vectorización SIMD dinámica a más de **200 tokens/segundo en CPUs x86_64 estándar**, manteniendo una huella de memoria estática inferior a 40 MB para modelos de 8M.
 
@@ -23,9 +23,9 @@ Al prescindir por completo de los ecosistemas de Python, PyTorch, C/CUDA y crate
 ## ⚡ Aspectos Destacados (Versión 1.4)
 
 * **Arquitectura Multi-Escala y Autodetección Paramétrica (`detect_from_file_len`):**
-  * Instanciación instantánea y sin configuración manual para las variantes **ESM-2 8M**, **35M** y **150M** a partir de la longitud en bytes del archivo binario de pesos, eliminando la necesidad de archivos de configuración JSON o manifiestos auxiliares.
-* **Kernels de Atención SIMD Dinámicos y Heterogéneos ($d_k \in \{16, 24, 32\}$):**
-  * Micro-kernels vectoriales AVX de 256 bits optimizados a mano y mapeados a 2, 3 o 4 registros `__m256` por cabeza de atención, maximizando la densidad de cómputo vectorial con paridad escalar bit a bit ($\Delta < 10^{-5}$) tanto en pasadas autorregresivas causales como bidireccionales completas.
+  * Instanciación instantánea y sin configuración manual para las variantes **ESM-2 8M**, **35M**, **150M**, **650M** y **3B** a partir de la longitud en bytes del archivo binario de pesos, eliminando la necesidad de archivos de configuración JSON o manifiestos auxiliares.
+* **Kernels de Atención SIMD Dinámicos y Heterogéneos ($d_k \in \{16, 24, 32, 64\}$):**
+  * Micro-kernels vectoriales AVX de 256 bits y AVX-512 de 512 bits optimizados a mano y mapeados a 2, 3, 4 u 8 registros `__m256` (o 4 registros `__m512` ZMM) por cabeza de atención, maximizando la densidad de cómputo vectorial con paridad escalar bit a bit ($\Delta < 10^{-5}$) tanto en pasadas autorregresivas causales como bidireccionales completas.
 * **Subcomandos de CLI para Entornos de Producción (`generate`, `inpaint`, `dms`, `contacts`, `benchmark`):**
   * Interfaz de terminal expresiva y unificada con soporte de subcomandos, banderas globales (`--model`, `--color`, `--no-color`), detección automática de TTY y diagnósticos claros de errores.
 * **Experiencia de Usuario TrueColor ANSI sin Dependencias (`ui.rs`):**
@@ -38,7 +38,8 @@ Al prescindir por completo de los ecosistemas de Python, PyTorch, C/CUDA y crate
   * Generación de matrices rectangulares en formato CSV e informes exhaustivos en JSON con tolerancias mutacionales por residuo, entropía informacional de Shannon y pares de contacto de alta probabilidad.
 * **Evaluador de Ventana Deslizante para Proteínas de Longitud Completa (`pipeline.rs`):**
   * Procesa proteínas de longitud arbitraria mediante ventanas deslizantes adaptativas ($W=128, S=64$) centradas en los residuos evaluados, evitando distorsiones en los bordes por RoPE y garantizando localidad en caché.
-* **Aceleración por Hardware Dual SIMD y Núcleo en Rust Puro:**
+* **Aceleración por Hardware Multi-SIMD y Núcleo en Rust Puro:**
+  * **AVX-512:** Pipeline vectorial de 512 bits para procesamiento ultraveloz de atención con $d_k=64$ en arquitecturas Intel Xeon y AMD Zen 4+.
   * **AVX2 + FMA:** Pipeline vectorial con instrucciones Fused Multiply-Add de 256 bits para arquitecturas AMD Ryzen e Intel Haswell o superiores.
   * **AVX1:** Kernel SIMD de 256 bits compatible con procesadores Intel Sandy Bridge / Ivy Bridge heredados.
   * **Despacho Dinámico en Tiempo de Ejecución:** Detección de capacidades del microprocesador al inicio mediante `is_x86_feature_detected!`.
@@ -90,7 +91,7 @@ Al someter las secuencias candidatas a la base de datos **NCBI BLASTP** contra s
 
 ## 🧬 Arquitectura Multi-Escala ESM-2 y Motor SIMD Dinámico
 
-A partir de la versión **v1.4.0**, `codon-infer` proporciona soporte nativo de primer nivel para los tres niveles principales de escala de la familia ESM-2:
+A partir de la versión **v1.4.0**, `codon-infer` proporciona soporte nativo de primer nivel para la totalidad del espectro multi-escala de la familia ESM-2 (8M, 35M, 150M, 650M y 3B):
 
 ```text
                                   ┌────────────────────────┐
@@ -101,13 +102,14 @@ A partir de la versión **v1.4.0**, `codon-infer` proporciona soporte nativo de 
                                               ▼
                               EsmConfig::detect_from_file_len()
                                               │
-               ┌──────────────────────────────┼───────────────────────────────┐
-               ▼                              ▼                               ▼
-       ESM-2 8M (t6_8M)               ESM-2 35M (t12_35M)             ESM-2 150M (t30_150M)
-    L=6, d=320, H=20, dk=16        L=12, d=480, H=20, dk=24        L=30, d=640, H=20, dk=32
-    2 Regs AVX (__m256 x 2)        3 Regs AVX (__m256 x 3)         4 Regs AVX (__m256 x 4)
-               │                              │                               │
-               └──────────────────────────────┼───────────────────────────────┘
+  ┌───────────────────┬───────────────────────┼───────────────────────┬───────────────────┐
+  ▼                   ▼                       ▼                       ▼                   ▼
+8M (t6_8M)          35M (t12_35M)           150M (t30_150M)         650M (t33_650M)     3B (t36_3B)
+L=6, d=320          L=12, d=480             L=30, d=640             L=33, d=1280        L=36, d=2560
+H=20, dk=16         H=20, dk=24             H=20, dk=32             H=20, dk=64         H=40, dk=64
+2 Regs AVX          3 Regs AVX              4 Regs AVX              8 AVX / 4 AVX-512   8 AVX / 4 AVX-512
+  │                   │                       │                       │                   │
+  └───────────────────┴───────────────────────┼───────────────────────┴───────────────────┘
                                               ▼
                                Runtime Unificado Cero-Asignación
                                (RunState / BidirectionalRunState)
@@ -119,15 +121,32 @@ Los frameworks convencionales de aprendizaje profundo en Python exigen archivos 
 ```rust
 pub fn detect_from_file_len(file_len: u64) -> io::Result<Self> {
     if file_len >= 3_000_000_000 {
-        Ok(Self::esm2_3b())   // 3B (~11.4 GB FP32 / ~3.2 GB Q8_0)
-    } else if file_len >= 2_000_000_000 || file_len >= 700_000_000 {
-        Ok(Self::esm2_650m()) // 650M (~2.6 GB FP32 / ~732 MB Q8_0)
-    } else if file_len >= 450_000_000 || file_len >= 155_000_000 {
-        Ok(Self::esm2_150m()) // 150M (~592 MB FP32 / ~166 MB Q8_0)
-    } else if file_len >= 95_000_000 || file_len >= 34_000_000 {
-        Ok(Self::esm2_35m())  // 35M (~134 MB FP32 / ~38 MB Q8_0)
+        // ESM-2 3B: ~11.4 GB (FP32) o ~3.2 GB - 3.4 GB (Q8_0)
+        Ok(Self::esm2_3b())
+    } else if file_len >= 2_000_000_000 {
+        // ESM-2 650M: ~2.60 GB (FP32)
+        Ok(Self::esm2_650m())
+    } else if file_len >= 700_000_000 {
+        // ESM-2 650M: ~732 MB - 780 MB (Q8_0)
+        Ok(Self::esm2_650m())
+    } else if file_len >= 450_000_000 {
+        // ESM-2 150M: ~592.5 MB (FP32)
+        Ok(Self::esm2_150m())
+    } else if file_len >= 155_000_000 {
+        // ESM-2 150M: ~166 MB - 178 MB (Q8_0)
+        Ok(Self::esm2_150m())
+    } else if file_len >= 95_000_000 {
+        // ESM-2 35M: ~134 MB (FP32)
+        Ok(Self::esm2_35m())
+    } else if file_len >= 34_000_000 {
+        // ESM-2 35M: ~38 MB - 48 MB (Q8_0)
+        Ok(Self::esm2_35m())
+    } else if file_len >= 22_000_000 {
+        // ESM-2 8M: ~30 MB (FP32)
+        Ok(Self::esm2_8m())
     } else if file_len >= 6_000_000 {
-        Ok(Self::esm2_8m())   // 8M (~30 MB FP32 / ~8.5 MB Q8_0)
+        // ESM-2 8M: ~8.5 MB - 12 MB (Q8_0)
+        Ok(Self::esm2_8m())
     } else {
         Err(io::Error::new(io::ErrorKind::InvalidData, "Tamaño binario de pesos ESM-2 no reconocido"))
     }
@@ -194,9 +213,9 @@ El pipeline de ejecución reproduce con absoluta fidelidad la arquitectura ESM-2
  └──────────────────────────────┬───────────────────────────────┘
                                 │  x [dim]
  ┌──────────────────────────────▼───────────────────────────────┐ ◄──┐
- │ Capa Transformer (×L Capas: 6, 12, o 30)                     │    │
+ │ Capa Transformer (×L Capas: 6, 12, 30, 33, o 36)            │    │
  │  ├── LayerNorm 1 (dim, eps 1e-5)                             │    │
- │  ├── Atención Multi-Cabeza (20 Cabezas × dk: 16, 24, o 32)   │    │
+ │  ├── Atención Multi-Cabeza (20/40 Cabezas × dk: 16, 24, 32, 64)│    │
  │  │    ├── Proyecciones: Q, K, V (SIMD Matmul AVX2+FMA / AVX1)│    │
  │  │    ├── RoPE Split-Half: rotación x[:half], x[half:dk]     │    │
  │  │    ├── Actualización Caché KV Ring Estática (pos × dim)   │    │
@@ -289,18 +308,22 @@ cargo test
 ```
 Salida esperada:
 ```text
-running 22 tests
+running 26 tests
+test benchmark::tests::test_benchmark_report_to_json_validity ... ok
+test benchmark::tests::test_discover_available_models ... ok
 test export::tests::test_json_string_serializers ... ok
 test fasta::tests::test_parse_multi_fasta_with_masks ... ok
-test fasta::tests::test_parse_simple_fasta ... ok
 test fasta::tests::test_parse_raw_sequence_fallback ... ok
+test fasta::tests::test_parse_simple_fasta ... ok
 test mcp::tests::test_mcp_json_parser_and_formatter ... ok
 test mcp::tests::test_mcp_resolve_record_fallback ... ok
 test export::tests::test_dms_row_and_csv_generation ... ok
-test mcp::tests::test_mcp_tools_list_schema ... ok
 test tests::test_attention_simd_parity_dk_16_24_32 ... ok
+test tests::test_attention_simd_parity_dk_64 ... ok
+test mcp::tests::test_mcp_tools_list_schema ... ok
 test tests::test_esm_config_autodetection ... ok
-test tests::test_forward_pass_with_weights_if_available ... ok
+test tests::test_bidirectional_logits_entropy ... ok
+test tests::test_forward_bidirectional_if_available ... ok
 test tests::test_layer_norm_stability ... ok
 test tests::test_log_softmax_canonical ... ok
 test tests::test_mask_token_encoding_and_decoding ... ok
@@ -309,16 +332,16 @@ test tests::test_q8_0_quantization_roundtrip ... ok
 test tests::test_simd_benchmark_parity_run ... ok
 test tests::test_softmax_sum_to_one ... ok
 test tests::test_tokenizer_boundaries ... ok
-test tests::test_bidirectional_logits_entropy ... ok
-test tests::test_forward_bidirectional_if_available ... ok
+test tests::test_forward_pass_with_weights_if_available ... ok
+test benchmark::tests::test_multi_scale_simd_parity ... ok
 test mcp::tests::test_mcp_dispatch_with_weights_if_available ... ok
 
-test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; finished in 7.45s
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.34s
 ```
 
 ### 4. Subcomandos y Pipelines Bioinformáticos
 
-Todos los subcomandos aceptan la bandera global `--model <RUTA>`. `codon-infer` detecta automáticamente si el archivo binario corresponde a **ESM-2 8M**, **35M** o **150M** (en precisión completa FP32 o cuantizado `Q8_0`) y autoconfigura los kernels vectoriales correspondientes.
+Todos los subcomandos aceptan la bandera global `--model <RUTA>`. `codon-infer` detecta automáticamente si el archivo binario corresponde a **ESM-2 8M**, **35M**, **150M**, **650M** o **3B** (en precisión completa FP32 o cuantizado `Q8_0`) y autoconfigura los kernels vectoriales correspondientes.
 
 #### A. Generación Autorregresiva de Secuencias (`generate`)
 Ejecuta síntesis de secuencias peptídicas *de novo* o extensión de motivos funcionales:
@@ -407,7 +430,8 @@ cargo run --release --bin codon-infer-mcp -- --model esm2_35m_weights.bin
 | :--- | :--- | :--- |
 | `-h`, `--help` | Muestra el panel de ayuda con la guía de subcomandos | - |
 | `-V`, `--version` | Muestra la versión y el motor vectorial SIMD activo | - |
-| `--model <RUTA>` | Ruta al binario personalizado de pesos ESM-2 en FP32 o Q8_0 | `esm2_8m_weights.bin` |
+| `--model <RUTA>` | Ruta al binario personalizado de pesos ESM-2 en FP32 o Q8_0 (o `all` para benchmark comparativo) | `esm2_8m_weights.bin` |
+| `--export-json <RUTA>`| Exporta métricas de benchmark o análisis directamente a JSON | - |
 | `--color <auto\|always\|never>` | Controla el estilizado de la terminal mediante ANSI TrueColor | `auto` |
 | `--no-color` | Desactiva terminantemente los códigos de escape ANSI (estándar NO_COLOR) | `false` |
 
@@ -415,13 +439,16 @@ cargo run --release --bin codon-infer-mcp -- --model esm2_35m_weights.bin
 | Opción | Subcomandos Aplicables | Descripción | Valor por Defecto |
 | :--- | :--- | :--- | :--- |
 | `--sequence <CADENA>` | `generate`, `inpaint`, `dms`, `contacts` | Secuencia de aminoácidos suministrada de forma directa | `"M"` |
-| `--fasta <RUTA>` | `inpaint`, `dms`, `contacts` | Ruta al archivo FASTA (o `-` para leer de stdin) | - |
+| `--fasta <RUTA>` | `generate`, `inpaint`, `dms`, `contacts` | Ruta al archivo FASTA (o `-` para leer de stdin) | - |
 | `--export-csv <RUTA>`| `dms`, `contacts` | Ruta de destino para la matriz rectangular o tabla CSV | - |
 | `--export-json <RUTA>`| `dms`, `contacts`, `benchmark` | Ruta de destino para el informe estructurado en JSON | - |
 | `--window <USIZE>` | `dms` | Tamaño de ventana deslizante para proteínas largas | `128` |
 | `--stride <USIZE>` | `dms` | Paso de desplazamiento de la ventana deslizante | `64` |
+| `--min-separation <USIZE>` | `contacts` | Separación mínima de secuencia para contactos epistáticos | `6` |
+| `--top-l <F32>` | `contacts` | Umbral de factor de contactos Top L (ej. 1.0 = $L$ contactos) | `1.0` |
 | `--temperature <F32>`| `generate` | Temperatura de muestreo (0.0 = búsqueda voraz argmax) | `0.7` |
 | `--max-tokens <USIZE>`| `generate` | Número máximo de nuevos residuos a generar | `1024` |
+| `--seed <U64>` | `generate` | Semilla numérica personalizada para generador pseudoaleatorio | - |
 | `--suite <CADENA>` | `benchmark` | Suite específica de benchmark (full, simd, mlm, dms, contacts, inpainting, stress, scaling) | `"full"` |
 
 ---
@@ -460,6 +487,8 @@ codon-infer/
 - [x] Migración completa a Rust puro desde el prototipo preliminar en C (**ADR-01**).
 - [x] Runtime con estricta ausencia de asignaciones en heap durante inferencia (`RunState`).
 - [x] Vectorización SIMD dual: micro-kernels `AVX2+FMA` y `AVX1 Sandy Bridge` con despacho dinámico.
+- [x] Escalamiento multi-escala de la arquitectura (8M, 35M, 150M, 650M, 3B) con atención heterogénea ($d_k \in \{16, 24, 32, 64\}$).
+- [x] Micro-kernels vectoriales SIMD AVX-512 para el cómputo de atención con $d_k=64$.
 - [x] Formulación RoPE *split-half* y aproximación numérica precisa de GELU mediante `erf`.
 - [x] Integración completa del cabezal clasificador `EsmLMHead` (102,849 pesos).
 - [x] Cuantización por bloques `Q8_0` para optimización de residencia en caché L3.
