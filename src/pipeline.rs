@@ -1,8 +1,8 @@
 use std::time::Instant;
 use crate::{
     forward_bidirectional, forward_bidirectional_parallel, forward_bidirectional_q8,
-    log_softmax_canonical, BidirectionalRunState, EsmConfig, EsmWeights, ModelWeightsRef,
-    Tokenizer,
+    forward_bidirectional_q4, log_softmax_canonical, BidirectionalRunState, EsmConfig,
+    EsmWeights, ModelWeightsRef, Tokenizer,
 };
 use crate::benchmark::{ContactPair, CANONICAL_AAS};
 use crate::export::DmsPositionRow;
@@ -97,6 +97,9 @@ pub fn run_pipeline_dms_parallel(
             }
             ModelWeightsRef::Q8(w_q8) => {
                 forward_bidirectional_q8(&tokens, config, w_q8, &mut state, num_threads);
+            }
+            ModelWeightsRef::Q4(w_q4) => {
+                forward_bidirectional_q4(&tokens, config, w_q4, &mut state, num_threads);
             }
         }
 
@@ -297,6 +300,9 @@ pub fn compute_pipeline_contacts_parallel(
         }
         ModelWeightsRef::Q8(w_q8) => {
             forward_bidirectional_q8(&tokens, config, w_q8, &mut state, num_threads);
+        }
+        ModelWeightsRef::Q4(w_q4) => {
+            forward_bidirectional_q4(&tokens, config, w_q4, &mut state, num_threads);
         }
     }
 
@@ -528,6 +534,9 @@ pub fn compute_pipeline_inpaint_parallel(
         }
         ModelWeightsRef::Q8(w_q8) => {
             forward_bidirectional_q8(&tokens, config, w_q8, &mut state, num_threads);
+        }
+        ModelWeightsRef::Q4(w_q4) => {
+            forward_bidirectional_q4(&tokens, config, w_q4, &mut state, num_threads);
         }
     }
 

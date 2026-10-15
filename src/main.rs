@@ -3,10 +3,11 @@ use std::time::Instant;
 use codon_infer::{
     active_simd_backend, export_contacts_csv, export_contacts_json,
     export_dms_csv, export_dms_json, generate_sequence_parallel,
-    generate_sequence_q8, parse_fasta_file, parse_raw_sequence, render_dms_heatmap,
+    generate_sequence_q8, generate_sequence_q4, parse_fasta_file, parse_raw_sequence, render_dms_heatmap,
     run_pipeline_contacts_parallel, run_pipeline_dms_parallel,
     run_pipeline_inpaint_parallel, detect_optimal_threads, EsmConfig, EsmWeights, EsmWeightsQ8,
-    FastaRecord, ModelWeightsRef, RunState, TerminalTheme,
+    EsmWeightsQ4, FastaRecord, ModelWeightsRef, RunState, TerminalTheme,
+    CodqHeader, CODQ_MAGIC, DTYPE_Q4_0, DTYPE_Q8_0, DTYPE_FP32,
 };
 
 fn print_version() {
@@ -89,6 +90,7 @@ fn load_input_record(
 pub enum LoadedWeights {
     Fp32(EsmWeights),
     Q8(EsmWeightsQ8),
+    Q4(EsmWeightsQ4),
 }
 
 impl LoadedWeights {
@@ -96,15 +98,56 @@ impl LoadedWeights {
         match *self {
             LoadedWeights::Fp32(ref w) => ModelWeightsRef::Fp32(w),
             LoadedWeights::Q8(ref w) => ModelWeightsRef::Q8(w),
+            LoadedWeights::Q4(ref w) => ModelWeightsRef::Q4(w),
         }
     }
 }
 
 pub fn load_model_weights(model_path: &str, quantize_q8: bool) -> io::Result<(EsmConfig, LoadedWeights)> {
+    // 1. Check for CODQ Header
+    if let Ok(mut file) = std::fs::File::open(model_path) {
+        use std::io::{Read, Seek};
+        let mut magic = [0u8; 4];
+        if file.read_exact(&mut magic).is_ok() && magic == CODQ_MAGIC {
+            let _ = file.rewind();
+            if let Ok(header) = CodqHeader::read_from(&mut file) {
+                if let Ok(config) = header.to_config() {
+                    match header.dtype {
+                        DTYPE_Q4_0 => {
+                            let weights = EsmWeightsQ4::from_file(model_path, &config)?;
+                            return Ok((config, LoadedWeights::Q4(weights)));
+                        }
+                        DTYPE_Q8_0 => {
+                            let weights = EsmWeightsQ8::from_file(model_path, &config)?;
+                            return Ok((config, LoadedWeights::Q8(weights)));
+                        }
+                        DTYPE_FP32 => {
+                            let weights = EsmWeights::from_file(model_path, &config)?;
+                            return Ok((config, LoadedWeights::Fp32(weights)));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
     let config = match EsmConfig::detect_from_file(model_path) {
         Ok(cfg) => cfg,
         Err(_) => EsmConfig::esm2_8m(),
     };
+
+    let is_q4_file = model_path.ends_with(".q4")
+        || model_path.ends_with(".q4.bin")
+        || model_path.ends_with("_q4_0.bin")
+        || model_path.ends_with("_q4.bin")
+        || model_path.contains("q4");
+
+    if is_q4_file {
+        let weights_q4 = EsmWeightsQ4::from_file(model_path, &config)?;
+        return Ok((config, LoadedWeights::Q4(weights_q4)));
+    }
+
     let file_len = std::fs::metadata(model_path).map(|m| m.len()).unwrap_or(0);
     let is_q8_file = model_path.ends_with(".q8")
         || model_path.ends_with(".q8.bin")
@@ -544,6 +587,19 @@ fn main() -> io::Result<()> {
                         seed,
                         &config,
                         weights_q8,
+                        &mut run_state,
+                        num_threads,
+                        Some(&mut print_cb),
+                    )
+                }
+                LoadedWeights::Q4(ref weights_q4) => {
+                    generate_sequence_q4(
+                        &prompt,
+                        temperature,
+                        max_tokens,
+                        seed,
+                        &config,
+                        weights_q4,
                         &mut run_state,
                         num_threads,
                         Some(&mut print_cb),
