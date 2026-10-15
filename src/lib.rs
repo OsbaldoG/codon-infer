@@ -1274,7 +1274,7 @@ mod tests {
     #[test]
     fn test_esm_config_autodetection() {
         // 8M ~ FP32 (~30MB) and Q8_0 (~8.5-12MB)
-        let cfg_8m = EsmConfig::detect_from_file_len(30_047_236).expect("8M FP32 detection");
+        let cfg_8m = EsmConfig::detect_from_file_len(30_092_168).expect("8M FP32 detection");
         assert_eq!(cfg_8m.arch, EsmModelArch::Esm2_8M);
         assert_eq!(cfg_8m.dim, 320);
         assert_eq!(cfg_8m.hidden_dim, 1280);
@@ -1285,7 +1285,7 @@ mod tests {
         assert_eq!(cfg_8m_q8.arch, EsmModelArch::Esm2_8M);
 
         // 35M ~ FP32 (~134MB) and Q8_0 (~38-48MB)
-        let cfg_35m = EsmConfig::detect_from_file_len(134_001_652).expect("35M FP32 detection");
+        let cfg_35m = EsmConfig::detect_from_file_len(134_068_984).expect("35M FP32 detection");
         assert_eq!(cfg_35m.arch, EsmModelArch::Esm2_35M);
         assert_eq!(cfg_35m.dim, 480);
         assert_eq!(cfg_35m.hidden_dim, 1920);
@@ -1296,7 +1296,7 @@ mod tests {
         assert_eq!(cfg_35m_q8.arch, EsmModelArch::Esm2_35M);
 
         // 150M ~ FP32 (~592MB) and Q8_0 (~166-178MB)
-        let cfg_150m = EsmConfig::detect_from_file_len(592_555_428).expect("150M FP32 detection");
+        let cfg_150m = EsmConfig::detect_from_file_len(592_645_160).expect("150M FP32 detection");
         assert_eq!(cfg_150m.arch, EsmModelArch::Esm2_150M);
         assert_eq!(cfg_150m.dim, 640);
         assert_eq!(cfg_150m.hidden_dim, 2560);
@@ -1307,7 +1307,7 @@ mod tests {
         assert_eq!(cfg_150m_q8.arch, EsmModelArch::Esm2_150M);
 
         // 650M ~ FP32 (~2.60GB) and Q8_0 (~732-780MB)
-        let cfg_650m = EsmConfig::detect_from_file_len(2_604_677_252).expect("650M FP32 detection");
+        let cfg_650m = EsmConfig::detect_from_file_len(2_604_342_104).expect("650M FP32 detection");
         assert_eq!(cfg_650m.arch, EsmModelArch::Esm2_650M);
         assert_eq!(cfg_650m.dim, 1280);
         assert_eq!(cfg_650m.hidden_dim, 5120);

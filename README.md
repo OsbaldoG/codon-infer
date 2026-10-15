@@ -179,8 +179,8 @@ $$\frac{16}{8} = 2 \text{ YMM}, \quad \frac{24}{8} = 3 \text{ YMM}, \quad \frac{
 | **SIMD Registers per Head** | **2 YMM** (16 floats) | **3 YMM** (24 floats) | **4 YMM** (32 floats) | **8 YMM / 4 ZMM** (64 floats) | **8 YMM / 4 ZMM** (64 floats) |
 | **FFN Dimension ($d_{\text{ffn}}$)** | 1,280 | 1,920 | 2,560 | 5,120 | 10,240 |
 | **Vocabulary** | 33 tokens | 33 tokens | 33 tokens | 33 tokens | 33 tokens |
-| **Total Parameters** | 7,511,809 (~7.5M) | 33,524,449 (~33.5M) | 148,011,297 (~148M) | ~650M | ~2.84B (~3B) |
-| **Binary Size (FP32)** | ~30.0 MB | ~134.1 MB | ~592.5 MB | ~2.60 GB | ~11.36 GB |
+| **Total Parameters** | 7,523,042 (~7.5M) | 33,517,246 (~33.5M) | 148,161,290 (~148M) | 651,085,526 (~651M) | ~2.84B (~3B) |
+| **Binary Size (FP32)** | ~30.1 MB | ~134.1 MB | ~592.6 MB | ~2.60 GB | ~11.36 GB |
 | **Quantized Binary Size (`Q8_0`)** | ~8.5 MB | ~37.7 MB | ~166.5 MB | ~732 MB | ~3.19 GB |
 | **Weight Load Latency** | **34 – 38 ms** | **117 – 122 ms** | **466 – 487 ms** | **~2.1 s** | **~8.5 s** |
 | **Autoregressive Throughput (Generate)** | **>315 tokens/s** (~3.1 ms/tok) | **~80 – 85 tokens/s** (~11.8 ms/tok) | **~18 – 20 tokens/s** (~53.0 ms/tok) | **~3.8 – 4.5 tokens/s** | **~0.8 – 1.0 tokens/s** |
