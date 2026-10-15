@@ -69,12 +69,12 @@ $$|x_i - \hat{x}_i| \le \frac{|d|}{2.0} + 10^{-5}$$
 Para un bloque de ceros ($x_i = 0$), $d = 0$, $q_i = 8$, $\text{qs}[j] = \text{0x88}$, $\hat{x}_i = 0.0$.
 
 ### 2.6 Matrices Cuantizadas vs Matrices en FP32
-Siguiendo la arquitectura probada de Q8_0:
+Siguiendo la arquitectura probada y optimizada para fidelidad:
 - **Cuantizadas a `BlockQ4_0`**:
-  - `token_embedding_table`
-  - `wq`, `wk`, `wv`, `wo` (atención)
-  - `fc1_weight`, `fc2_weight` (feed-forward)
+  - `wq`, `wk`, `wv`, `wo` (atención en todas las capas)
+  - `fc1_weight`, `fc2_weight` (feed-forward en todas las capas)
 - **Conservadas en `f32` (FP32)**:
+  - `token_embedding_table` (preservación de precisión en la tabla de entrada de tokens)
   - LayerNorm weights y biases (`ln_1`, `ln_2`, `ln_f`)
   - Biases de proyección (`bq`, `bk`, `bv`, `bo`, `fc1_bias`, `fc2_bias`)
   - `classifier_weights` (LM head)

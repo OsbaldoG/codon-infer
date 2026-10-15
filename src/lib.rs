@@ -342,7 +342,7 @@ impl EsmWeights {
 
     pub fn quantize_q4(&self) -> EsmWeightsQ4 {
         EsmWeightsQ4 {
-            token_embedding_table: quantize_slice_to_q4(&self.token_embedding_table),
+            token_embedding_table: self.token_embedding_table.clone(),
             ln_1_weight: self.ln_1_weight.clone(),
             ln_1_bias: self.ln_1_bias.clone(),
             wq: quantize_slice_to_q4(&self.wq),
@@ -820,11 +820,9 @@ pub fn quantize_slice_to_q4(src: &[f32]) -> Vec<BlockQ4_0> {
     src.chunks_exact(32).map(BlockQ4_0::quantize).collect()
 }
 
-#[allow(clippy::uninit_vec)]
 pub fn read_q4_blocks(file: &mut File, num_blocks: usize) -> io::Result<Vec<BlockQ4_0>> {
-    let mut blocks = Vec::<BlockQ4_0>::with_capacity(num_blocks);
+    let mut blocks = vec![BlockQ4_0 { d: 0.0, qs: [0; 16] }; num_blocks];
     unsafe {
-        blocks.set_len(num_blocks);
         let byte_slice = std::slice::from_raw_parts_mut(
             blocks.as_mut_ptr() as *mut u8,
             num_blocks * std::mem::size_of::<BlockQ4_0>(),
@@ -846,7 +844,7 @@ pub fn write_q4_blocks(file: &mut File, blocks: &[BlockQ4_0]) -> io::Result<()> 
 }
 
 pub struct EsmWeightsQ4 {
-    pub token_embedding_table: Vec<BlockQ4_0>,
+    pub token_embedding_table: Vec<f32>,
     pub ln_1_weight: Vec<f32>, pub ln_1_bias: Vec<f32>,
     pub wq: Vec<BlockQ4_0>, pub bq: Vec<f32>,
     pub wk: Vec<BlockQ4_0>, pub bk: Vec<f32>,
@@ -864,7 +862,7 @@ impl EsmWeightsQ4 {
         let mut file = File::create(path)?;
         let header = CodqHeader::new(DTYPE_Q4_0, config);
         header.write_to(&mut file)?;
-        write_q4_blocks(&mut file, &self.token_embedding_table)?;
+        write_floats(&mut file, &self.token_embedding_table)?;
         write_floats(&mut file, &self.ln_1_weight)?;
         write_floats(&mut file, &self.ln_1_bias)?;
         write_q4_blocks(&mut file, &self.wq)?;
@@ -910,7 +908,7 @@ impl EsmWeightsQ4 {
             file.seek(io::SeekFrom::Start(0))?;
         }
 
-        let token_embedding_table = read_q4_blocks(&mut file, config.vocab_size * (config.dim / 32))?;
+        let token_embedding_table = read_floats(&mut file, config.vocab_size * config.dim)?;
         let ln_1_weight = read_floats(&mut file, config.n_layers * config.dim)?;
         let ln_1_bias = read_floats(&mut file, config.n_layers * config.dim)?;
         let wq = read_q4_blocks(&mut file, config.n_layers * config.dim * (config.dim / 32))?;
@@ -1088,11 +1086,10 @@ pub fn matmul_q8(out: &mut [f32], x: &[f32], w: &[BlockQ8_0], bias: &[f32], in_d
     }
 }
 
-#[allow(clippy::uninit_vec, clippy::manual_slice_size_calculation)]
+#[allow(clippy::manual_slice_size_calculation)]
 fn read_floats(file: &mut File, num_floats: usize) -> io::Result<Vec<f32>> {
-    let mut floats = Vec::<f32>::with_capacity(num_floats);
+    let mut floats = vec![0.0f32; num_floats];
     unsafe {
-        floats.set_len(num_floats);
         let byte_slice = std::slice::from_raw_parts_mut(
             floats.as_mut_ptr() as *mut u8,
             num_floats * std::mem::size_of::<f32>(),
@@ -1119,11 +1116,10 @@ fn write_floats(file: &mut File, floats: &[f32]) -> io::Result<()> {
     file.write_all(byte_slice)
 }
 
-#[allow(clippy::uninit_vec, clippy::manual_slice_size_calculation)]
+#[allow(clippy::manual_slice_size_calculation)]
 fn read_q8_blocks(file: &mut File, num_blocks: usize) -> io::Result<Vec<BlockQ8_0>> {
-    let mut blocks = Vec::<BlockQ8_0>::with_capacity(num_blocks);
+    let mut blocks = vec![BlockQ8_0 { d: 0.0, qs: [0; 32] }; num_blocks];
     unsafe {
-        blocks.set_len(num_blocks);
         let byte_slice = std::slice::from_raw_parts_mut(
             blocks.as_mut_ptr() as *mut u8,
             num_blocks * std::mem::size_of::<BlockQ8_0>(),
@@ -2693,12 +2689,9 @@ pub fn forward_q4(
     let head_dim = dim / config.n_heads;
     let inv_scale = 1.0 / (head_dim as f32).sqrt();
 
-    // Dequantize embedding for current token
-    let embed_blocks_per_row = dim / 32;
-    let embed_row = &weights.token_embedding_table[token * embed_blocks_per_row..(token + 1) * embed_blocks_per_row];
-    for (b_idx, block) in embed_row.iter().enumerate() {
-        block.dequantize_to(&mut state.x[b_idx * 32..(b_idx + 1) * 32]);
-    }
+    // Copy embedding for current token
+    let embed_row = &weights.token_embedding_table[token * dim..(token + 1) * dim];
+    state.x[0..dim].copy_from_slice(embed_row);
 
     let q4_matrix_blocks = dim * (dim / 32);
     let q4_fc1_blocks = config.hidden_dim * (dim / 32);
@@ -2869,7 +2862,7 @@ pub fn project_lm_head_q4(
     logits: &mut [f32],
     x_norm: &[f32],
     classifier_weights: &[f32],
-    embedding_table: &[BlockQ4_0],
+    embedding_table: &[f32],
     config: &EsmConfig,
     dense_buf: &mut [f32],
     ln_buf: &mut [f32],
@@ -2893,7 +2886,7 @@ pub fn project_lm_head_q4(
         matmul_parallel(logits, dense_out, lm_dec_w, lm_dec_b, dim, config.vocab_size, num_threads);
     } else {
         const ZERO_BIAS: [f32; 33] = [0.0; 33];
-        matmul_q4_parallel(logits, x_norm, embedding_table, &ZERO_BIAS, dim, config.vocab_size, num_threads);
+        matmul_parallel(logits, x_norm, embedding_table, &ZERO_BIAS, dim, config.vocab_size, num_threads);
     }
 }
 
@@ -3302,13 +3295,10 @@ pub fn forward_bidirectional_q4_ext(
     #[cfg(target_arch = "x86_64")]
     let has_avx = std::is_x86_feature_detected!("avx") && (head_dim == 16 || head_dim == 24 || head_dim == 32 || head_dim == 64);
 
-    let embed_blocks_per_row = dim / 32;
     for p in 0..seq_len {
         let token = tokens[p];
-        let row_blocks = &weights.token_embedding_table[token * embed_blocks_per_row..(token + 1) * embed_blocks_per_row];
-        for (b_idx, block) in row_blocks.iter().enumerate() {
-            block.dequantize_to(&mut state.x[p * dim + b_idx * 32..p * dim + (b_idx + 1) * 32]);
-        }
+        let embed_row = &weights.token_embedding_table[token * dim..(token + 1) * dim];
+        state.x[p * dim..(p + 1) * dim].copy_from_slice(embed_row);
     }
 
     let q4_matrix_blocks = dim * (dim / 32);
@@ -4421,9 +4411,8 @@ mod tests_q4_format {
         let temp_path = "target/test_align_q4.bin";
         let config = EsmConfig::esm2_8m();
 
-        let dummy_q4 = quantize_slice_to_q4(&vec![0.5f32; config.vocab_size * config.dim]);
         let w = EsmWeightsQ4 {
-            token_embedding_table: dummy_q4.clone(),
+            token_embedding_table: vec![0.5f32; config.vocab_size * config.dim],
             ln_1_weight: vec![1.0; config.n_layers * config.dim],
             ln_1_bias: vec![0.0; config.n_layers * config.dim],
             wq: quantize_slice_to_q4(&vec![0.1; config.n_layers * config.dim * config.dim]),
@@ -4972,11 +4961,10 @@ mod tests_q4_integration {
             let mut worst_mat_rmse = 0.0f32;
             let mut worst_mat_name = String::new();
 
-            // token embedding
-            let dequant_emb = dequantize_q4_to_vec(&weights_q4.token_embedding_table);
-            let emb_cos = compute_cosine_similarity(&weights_fp.token_embedding_table, &dequant_emb);
-            let emb_rmse = compute_rmse(&weights_fp.token_embedding_table, &dequant_emb);
-            println!(" * token_embedding_table: Cosine = {:.6}, RMSE = {:.6}", emb_cos, emb_rmse);
+            // token embedding (kept in FP32)
+            let emb_cos = compute_cosine_similarity(&weights_fp.token_embedding_table, &weights_q4.token_embedding_table);
+            let emb_rmse = compute_rmse(&weights_fp.token_embedding_table, &weights_q4.token_embedding_table);
+            println!(" * token_embedding_table (FP32): Cosine = {:.6}, RMSE = {:.6}", emb_cos, emb_rmse);
             if emb_cos < worst_mat_cos { worst_mat_cos = emb_cos; worst_mat_rmse = emb_rmse; worst_mat_name = "token_embedding_table".to_string(); }
 
             let dim = config.dim;
