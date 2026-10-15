@@ -1457,5 +1457,30 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn test_forward_650m_if_available() {
+        let model_path = "esm2_650m_weights.bin";
+        if !std::path::Path::new(model_path).exists() {
+            return;
+        }
+        let (config, weights) = load_model_from_file(model_path).expect("650M weights must load");
+        assert_eq!(config.arch, EsmModelArch::Esm2_650M);
+        assert_eq!(config.dim, 1280);
+        assert_eq!(config.n_layers, 33);
+        assert_eq!(config.n_heads, 20);
+        assert_eq!(config.head_dim(), 64);
+
+        let mut run_state = RunState::new(&config);
+        forward(20, 0, &config, &weights, &mut run_state); // token 20 = Met (M)
+        assert!(!run_state.logits[0].is_nan());
+        assert!(!run_state.logits[20].is_nan());
+
+        let mut bi_state = BidirectionalRunState::new(&config, 8);
+        let tokens = Tokenizer::encode("M");
+        forward_bidirectional(&tokens, &config, &weights, &mut bi_state);
+        assert!(!bi_state.logits[0].is_nan());
+        assert!(!bi_state.logits[config.vocab_size].is_nan());
+    }
 }
 
