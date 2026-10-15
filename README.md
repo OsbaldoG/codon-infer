@@ -34,8 +34,11 @@ By eliminating Python, PyTorch, C/CUDA runtimes, and external third-party crates
   * **AVX2 + FMA:** 256-bit Fused Multiply-Add vector pipeline for modern AMD Ryzen and Intel Haswell+.
   * **AVX1:** 256-bit SIMD kernel for legacy Intel Sandy Bridge / Ivy Bridge processors.
   * **Dynamic Runtime CPU Dispatch:** Evaluates CPU capabilities at startup via `is_x86_feature_detected!`.
+* **Multi-Scale Model Architecture & Autodetection (8M, 35M, 150M):**
+  * Dynamic architecture autodetection from weight binary size supporting **ESM-2 8M** ($d=320, L=6, d_k=16$), **ESM-2 35M** ($d=480, L=12, d_k=24$), and **ESM-2 150M** ($d=640, L=30, d_k=32$).
+  * Dynamic SIMD attention kernels supporting head dimensions $d_k \in \{16, 24, 32\}$ using 2, 3, or 4 256-bit AVX vector registers with bit-exact parity.
 * **Exact Mathematical & Architectural Parity with ESM-2:**
-  * Complete 102,849-parameter `EsmLMHead` with numerical `erf` GELU approximation and split-half RoPE positional embeddings.
+  * Complete `EsmLMHead` with numerical `erf` GELU approximation and split-half RoPE positional embeddings.
 * **Strict Zero-Allocation Runtime (`RunState`):** All transformer buffers, scratchpads, attention matrices, and KV caches pre-allocated. Zero memory churn during forward passes.
 
 ---

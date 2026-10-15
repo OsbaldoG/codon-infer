@@ -1,4 +1,4 @@
-#![allow(unused_unsafe)]
+#![allow(unused_unsafe, unsafe_op_in_unsafe_fn)]
 use std::fs::File;
 use std::io::{self, Read};
 use std::time::Instant;
@@ -22,14 +22,98 @@ pub use pipeline::{
     InpaintCandidate, ContactsPipelineResult,
 };
 
-#[derive(Debug, Clone)]
-pub struct EsmConfig {
-    pub dim: usize, pub hidden_dim: usize, pub n_layers: usize,
-    pub n_heads: usize, pub vocab_size: usize, pub max_seq_len: usize,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EsmModelArch {
+    Esm2_8M,
+    Esm2_35M,
+    Esm2_150M,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EsmConfig {
+    pub dim: usize,
+    pub hidden_dim: usize,
+    pub n_layers: usize,
+    pub n_heads: usize,
+    pub vocab_size: usize,
+    pub max_seq_len: usize,
+    pub arch: EsmModelArch,
+}
+
 impl EsmConfig {
     pub fn esm2_8m() -> Self {
-        Self { dim: 320, hidden_dim: 1280, n_layers: 6, n_heads: 20, vocab_size: 33, max_seq_len: 1024 }
+        Self {
+            dim: 320,
+            hidden_dim: 1280,
+            n_layers: 6,
+            n_heads: 20,
+            vocab_size: 33,
+            max_seq_len: 1024,
+            arch: EsmModelArch::Esm2_8M,
+        }
+    }
+
+    pub fn esm2_35m() -> Self {
+        Self {
+            dim: 480,
+            hidden_dim: 1920,
+            n_layers: 12,
+            n_heads: 20,
+            vocab_size: 33,
+            max_seq_len: 1024,
+            arch: EsmModelArch::Esm2_35M,
+        }
+    }
+
+    pub fn esm2_150m() -> Self {
+        Self {
+            dim: 640,
+            hidden_dim: 2560,
+            n_layers: 30,
+            n_heads: 20,
+            vocab_size: 33,
+            max_seq_len: 1024,
+            arch: EsmModelArch::Esm2_150M,
+        }
+    }
+
+    #[inline]
+    pub fn head_dim(&self) -> usize {
+        self.dim / self.n_heads
+    }
+
+    pub fn model_name(&self) -> &'static str {
+        match self.arch {
+            EsmModelArch::Esm2_8M => "ESM-2 8M (esm2_t6_8M_UR50D)",
+            EsmModelArch::Esm2_35M => "ESM-2 35M (esm2_t12_35M_UR50D)",
+            EsmModelArch::Esm2_150M => "ESM-2 150M (esm2_t30_150M_UR50D)",
+        }
+    }
+
+    /// Autodetects ESM-2 model architecture from weights file length in bytes.
+    pub fn detect_from_file_len(file_len: u64) -> io::Result<Self> {
+        let floats = file_len / 4;
+        if floats >= 140_000_000 {
+            Ok(Self::esm2_150m())
+        } else if floats >= 30_000_000 {
+            Ok(Self::esm2_35m())
+        } else if floats >= 7_000_000 {
+            Ok(Self::esm2_8m())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Unrecognized ESM-2 weights size: {} bytes ({} floats). Expected ~30MB (8M), ~133MB (35M), or ~591MB (150M).",
+                    file_len, floats
+                ),
+            ))
+        }
+    }
+
+    /// Opens file on disk and autodetects ESM-2 configuration.
+    pub fn detect_from_file(path: &str) -> io::Result<Self> {
+        let metadata = std::fs::metadata(path)?;
+        Self::detect_from_file_len(metadata.len())
     }
 }
 
@@ -46,27 +130,55 @@ pub struct EsmWeights {
 impl EsmWeights {
     pub fn from_file(model_path: &str, config: &EsmConfig) -> io::Result<Self> {
         let mut file = File::open(model_path)?;
+        let token_embedding_table = read_floats(&mut file, config.vocab_size * config.dim)?;
+        let ln_1_weight = read_floats(&mut file, config.n_layers * config.dim)?;
+        let ln_1_bias = read_floats(&mut file, config.n_layers * config.dim)?;
+        let wq = read_floats(&mut file, config.n_layers * config.dim * config.dim)?;
+        let bq = read_floats(&mut file, config.n_layers * config.dim)?;
+        let wk = read_floats(&mut file, config.n_layers * config.dim * config.dim)?;
+        let bk = read_floats(&mut file, config.n_layers * config.dim)?;
+        let wv = read_floats(&mut file, config.n_layers * config.dim * config.dim)?;
+        let bv = read_floats(&mut file, config.n_layers * config.dim)?;
+        let wo = read_floats(&mut file, config.n_layers * config.dim * config.dim)?;
+        let bo = read_floats(&mut file, config.n_layers * config.dim)?;
+        let ln_2_weight = read_floats(&mut file, config.n_layers * config.dim)?;
+        let ln_2_bias = read_floats(&mut file, config.n_layers * config.dim)?;
+        let fc1_weight = read_floats(&mut file, config.n_layers * config.dim * config.hidden_dim)?;
+        let fc1_bias = read_floats(&mut file, config.n_layers * config.hidden_dim)?;
+        let fc2_weight = read_floats(&mut file, config.n_layers * config.hidden_dim * config.dim)?;
+        let fc2_bias = read_floats(&mut file, config.n_layers * config.dim)?;
+        let ln_f_weight = read_floats(&mut file, config.dim)?;
+        let ln_f_bias = read_floats(&mut file, config.dim)?;
+
+        // Dynamically read remaining bytes until EOF for classifier_weights (EsmLMHead)
+        let mut remaining_bytes = Vec::new();
+        file.read_to_end(&mut remaining_bytes)?;
+        let classifier_weights: Vec<f32> = remaining_bytes
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect();
+
         Ok(Self {
-            token_embedding_table: read_floats(&mut file, config.vocab_size * config.dim)?,
-            ln_1_weight: read_floats(&mut file, config.n_layers * config.dim)?,
-            ln_1_bias: read_floats(&mut file, config.n_layers * config.dim)?,
-            wq: read_floats(&mut file, config.n_layers * config.dim * config.dim)?,
-            bq: read_floats(&mut file, config.n_layers * config.dim)?,
-            wk: read_floats(&mut file, config.n_layers * config.dim * config.dim)?,
-            bk: read_floats(&mut file, config.n_layers * config.dim)?,
-            wv: read_floats(&mut file, config.n_layers * config.dim * config.dim)?,
-            bv: read_floats(&mut file, config.n_layers * config.dim)?,
-            wo: read_floats(&mut file, config.n_layers * config.dim * config.dim)?,
-            bo: read_floats(&mut file, config.n_layers * config.dim)?,
-            ln_2_weight: read_floats(&mut file, config.n_layers * config.dim)?,
-            ln_2_bias: read_floats(&mut file, config.n_layers * config.dim)?,
-            fc1_weight: read_floats(&mut file, config.n_layers * config.dim * config.hidden_dim)?,
-            fc1_bias: read_floats(&mut file, config.n_layers * config.hidden_dim)?,
-            fc2_weight: read_floats(&mut file, config.n_layers * config.hidden_dim * config.dim)?,
-            fc2_bias: read_floats(&mut file, config.n_layers * config.dim)?,
-            ln_f_weight: read_floats(&mut file, config.dim)?,
-            ln_f_bias: read_floats(&mut file, config.dim)?,
-            classifier_weights: read_floats(&mut file, 102_849)?,
+            token_embedding_table,
+            ln_1_weight,
+            ln_1_bias,
+            wq,
+            bq,
+            wk,
+            bk,
+            wv,
+            bv,
+            wo,
+            bo,
+            ln_2_weight,
+            ln_2_bias,
+            fc1_weight,
+            fc1_bias,
+            fc2_weight,
+            fc2_bias,
+            ln_f_weight,
+            ln_f_bias,
+            classifier_weights,
         })
     }
 
@@ -352,26 +464,103 @@ pub fn matmul(out: &mut [f32], x: &[f32], w: &[f32], bias: &[f32], in_dim: usize
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx")]
-unsafe fn attention_head_avx1(q_head: &[f32], key_cache: &[f32], value_cache: &[f32], att_head: &mut [f32], xb2_head: &mut [f32], layer_kv_base: usize, q_offset: usize, pos: usize, dim: usize, inv_scale: f32) {
-    use std::arch::x86_64::*; unsafe {
-        let q0 = _mm256_loadu_ps(q_head.as_ptr()); let q1 = _mm256_loadu_ps(q_head.as_ptr().add(8));
-        for t in 0..=pos {
-            let k_ptr = key_cache.as_ptr().add(layer_kv_base + t * dim + q_offset);
-            let k0 = _mm256_loadu_ps(k_ptr); let k1 = _mm256_loadu_ps(k_ptr.add(8));
-            let sum = _mm256_add_ps(_mm256_mul_ps(q0, k0), _mm256_mul_ps(q1, k1));
-            *att_head.get_unchecked_mut(t) = hsum256_ps_avx(sum) * inv_scale;
+pub unsafe fn dot_product_head_avx(q: *const f32, k: *const f32, head_dim: usize) -> f32 {
+    use std::arch::x86_64::*;
+    match head_dim {
+        16 => {
+            let s0 = _mm256_mul_ps(_mm256_loadu_ps(q), _mm256_loadu_ps(k));
+            let s1 = _mm256_mul_ps(_mm256_loadu_ps(q.add(8)), _mm256_loadu_ps(k.add(8)));
+            hsum256_ps_avx(_mm256_add_ps(s0, s1))
         }
-        softmax(&mut att_head[0..=pos]);
-        let mut out0 = _mm256_setzero_ps(); let mut out1 = _mm256_setzero_ps();
-        for t in 0..=pos {
-            let prob_v = _mm256_set1_ps(*att_head.get_unchecked(t));
-            let v_ptr = value_cache.as_ptr().add(layer_kv_base + t * dim + q_offset);
-            let v0 = _mm256_loadu_ps(v_ptr); let v1 = _mm256_loadu_ps(v_ptr.add(8));
-            out0 = _mm256_add_ps(out0, _mm256_mul_ps(prob_v, v0));
-            out1 = _mm256_add_ps(out1, _mm256_mul_ps(prob_v, v1));
+        24 => {
+            let s0 = _mm256_mul_ps(_mm256_loadu_ps(q), _mm256_loadu_ps(k));
+            let s1 = _mm256_mul_ps(_mm256_loadu_ps(q.add(8)), _mm256_loadu_ps(k.add(8)));
+            let s2 = _mm256_mul_ps(_mm256_loadu_ps(q.add(16)), _mm256_loadu_ps(k.add(16)));
+            hsum256_ps_avx(_mm256_add_ps(_mm256_add_ps(s0, s1), s2))
         }
-        _mm256_storeu_ps(xb2_head.as_mut_ptr(), out0);
-        _mm256_storeu_ps(xb2_head.as_mut_ptr().add(8), out1);
+        32 => {
+            let s0 = _mm256_mul_ps(_mm256_loadu_ps(q), _mm256_loadu_ps(k));
+            let s1 = _mm256_mul_ps(_mm256_loadu_ps(q.add(8)), _mm256_loadu_ps(k.add(8)));
+            let s2 = _mm256_mul_ps(_mm256_loadu_ps(q.add(16)), _mm256_loadu_ps(k.add(16)));
+            let s3 = _mm256_mul_ps(_mm256_loadu_ps(q.add(24)), _mm256_loadu_ps(k.add(24)));
+            hsum256_ps_avx(_mm256_add_ps(_mm256_add_ps(s0, s1), _mm256_add_ps(s2, s3)))
+        }
+        _ => {
+            let mut sum = 0.0f32;
+            for i in 0..head_dim {
+                sum += *q.add(i) * *k.add(i);
+            }
+            sum
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+pub unsafe fn accumulate_value_head_avx(out: *mut f32, v: *const f32, prob: f32, head_dim: usize) {
+    use std::arch::x86_64::*;
+    let p_vec = _mm256_set1_ps(prob);
+    match head_dim {
+        16 => {
+            let o0 = _mm256_add_ps(_mm256_loadu_ps(out), _mm256_mul_ps(p_vec, _mm256_loadu_ps(v)));
+            let o1 = _mm256_add_ps(_mm256_loadu_ps(out.add(8)), _mm256_mul_ps(p_vec, _mm256_loadu_ps(v.add(8))));
+            _mm256_storeu_ps(out, o0);
+            _mm256_storeu_ps(out.add(8), o1);
+        }
+        24 => {
+            let o0 = _mm256_add_ps(_mm256_loadu_ps(out), _mm256_mul_ps(p_vec, _mm256_loadu_ps(v)));
+            let o1 = _mm256_add_ps(_mm256_loadu_ps(out.add(8)), _mm256_mul_ps(p_vec, _mm256_loadu_ps(v.add(8))));
+            let o2 = _mm256_add_ps(_mm256_loadu_ps(out.add(16)), _mm256_mul_ps(p_vec, _mm256_loadu_ps(v.add(16))));
+            _mm256_storeu_ps(out, o0);
+            _mm256_storeu_ps(out.add(8), o1);
+            _mm256_storeu_ps(out.add(16), o2);
+        }
+        32 => {
+            let o0 = _mm256_add_ps(_mm256_loadu_ps(out), _mm256_mul_ps(p_vec, _mm256_loadu_ps(v)));
+            let o1 = _mm256_add_ps(_mm256_loadu_ps(out.add(8)), _mm256_mul_ps(p_vec, _mm256_loadu_ps(v.add(8))));
+            let o2 = _mm256_add_ps(_mm256_loadu_ps(out.add(16)), _mm256_mul_ps(p_vec, _mm256_loadu_ps(v.add(16))));
+            let o3 = _mm256_add_ps(_mm256_loadu_ps(out.add(24)), _mm256_mul_ps(p_vec, _mm256_loadu_ps(v.add(24))));
+            _mm256_storeu_ps(out, o0);
+            _mm256_storeu_ps(out.add(8), o1);
+            _mm256_storeu_ps(out.add(16), o2);
+            _mm256_storeu_ps(out.add(24), o3);
+        }
+        _ => {
+            for i in 0..head_dim {
+                *out.add(i) += prob * *v.add(i);
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+unsafe fn attention_head_avx1(
+    q_head: &[f32],
+    key_cache: &[f32],
+    value_cache: &[f32],
+    att_head: &mut [f32],
+    xb2_head: &mut [f32],
+    layer_kv_base: usize,
+    q_offset: usize,
+    pos: usize,
+    dim: usize,
+    head_dim: usize,
+    inv_scale: f32,
+) {
+    let q_ptr = q_head.as_ptr();
+    for t in 0..=pos {
+        let k_ptr = key_cache.as_ptr().add(layer_kv_base + t * dim + q_offset);
+        let score = dot_product_head_avx(q_ptr, k_ptr, head_dim);
+        *att_head.get_unchecked_mut(t) = score * inv_scale;
+    }
+    softmax(&mut att_head[0..=pos]);
+    xb2_head.fill(0.0);
+    let out_ptr = xb2_head.as_mut_ptr();
+    for t in 0..=pos {
+        let prob = *att_head.get_unchecked(t);
+        let v_ptr = value_cache.as_ptr().add(layer_kv_base + t * dim + q_offset);
+        accumulate_value_head_avx(out_ptr, v_ptr, prob, head_dim);
     }
 }
 
@@ -450,7 +639,7 @@ pub fn forward(token: usize, pos: usize, config: &EsmConfig, weights: &EsmWeight
     state.x.copy_from_slice(&weights.token_embedding_table[embed_offset..embed_offset + dim]);
     let head_dim = dim / config.n_heads; let inv_scale = 1.0 / (head_dim as f32).sqrt();
     #[cfg(target_arch = "x86_64")]
-    let has_avx = std::is_x86_feature_detected!("avx") && head_dim == 16;
+    let has_avx = std::is_x86_feature_detected!("avx") && (head_dim == 16 || head_dim == 24 || head_dim == 32);
     for l in 0..config.n_layers {
         let layer_dim_offset = l * dim; let layer_matrix_offset = l * dim * dim;
         layer_norm(&mut state.xb, &state.x, &weights.ln_1_weight[layer_dim_offset..layer_dim_offset + dim], &weights.ln_1_bias[layer_dim_offset..layer_dim_offset + dim]);
@@ -467,7 +656,7 @@ pub fn forward(token: usize, pos: usize, config: &EsmConfig, weights: &EsmWeight
             let xb2_head = &mut state.xb2[q_offset..q_offset + head_dim];
             #[cfg(target_arch = "x86_64")]
             if has_avx {
-                unsafe { attention_head_avx1(q_head, &state.key_cache, &state.value_cache, att_head, xb2_head, layer_kv_base, q_offset, pos, dim, inv_scale); }
+                unsafe { attention_head_avx1(q_head, &state.key_cache, &state.value_cache, att_head, xb2_head, layer_kv_base, q_offset, pos, dim, head_dim, inv_scale); }
                 continue;
             }
             for t in 0..=pos {
@@ -558,18 +747,32 @@ pub fn forward_bidirectional(
             state.final_layer_att[0..seq_len * seq_len].fill(0.0);
         }
 
+        #[cfg(target_arch = "x86_64")]
+        let has_avx = std::is_x86_feature_detected!("avx") && (head_dim == 16 || head_dim == 24 || head_dim == 32);
+
         for p in 0..seq_len {
             for h in 0..config.n_heads {
                 let q_offset = p * dim + h * head_dim;
                 let q_head = &state.q[q_offset..q_offset + head_dim];
                 let att_head = &mut state.att[h * state.max_len..h * state.max_len + seq_len];
 
-                for t in 0..seq_len {
-                    let k_offset = t * dim + h * head_dim;
-                    let k_head = &state.k[k_offset..k_offset + head_dim];
-                    let mut score = 0.0f32;
-                    for i in 0..head_dim { score += q_head[i] * k_head[i]; }
-                    att_head[t] = score * inv_scale;
+                #[cfg(target_arch = "x86_64")]
+                if has_avx {
+                    let q_ptr = q_head.as_ptr();
+                    for t in 0..seq_len {
+                        let k_offset = t * dim + h * head_dim;
+                        let k_ptr = unsafe { state.k.as_ptr().add(k_offset) };
+                        let score = unsafe { dot_product_head_avx(q_ptr, k_ptr, head_dim) };
+                        att_head[t] = score * inv_scale;
+                    }
+                } else {
+                    for t in 0..seq_len {
+                        let k_offset = t * dim + h * head_dim;
+                        let k_head = &state.k[k_offset..k_offset + head_dim];
+                        let mut score = 0.0f32;
+                        for i in 0..head_dim { score += q_head[i] * k_head[i]; }
+                        att_head[t] = score * inv_scale;
+                    }
                 }
                 softmax(att_head);
 
@@ -582,11 +785,22 @@ pub fn forward_bidirectional(
 
                 let out_head = &mut state.out_att[p * dim + h * head_dim..p * dim + (h + 1) * head_dim];
                 out_head.fill(0.0);
-                for t in 0..seq_len {
-                    let prob = att_head[t];
-                    let v_offset = t * dim + h * head_dim;
-                    let v_head = &state.v[v_offset..v_offset + head_dim];
-                    for i in 0..head_dim { out_head[i] += prob * v_head[i]; }
+                #[cfg(target_arch = "x86_64")]
+                if has_avx {
+                    let out_ptr = out_head.as_mut_ptr();
+                    for t in 0..seq_len {
+                        let prob = att_head[t];
+                        let v_offset = t * dim + h * head_dim;
+                        let v_ptr = unsafe { state.v.as_ptr().add(v_offset) };
+                        unsafe { accumulate_value_head_avx(out_ptr, v_ptr, prob, head_dim); }
+                    }
+                } else {
+                    for t in 0..seq_len {
+                        let prob = att_head[t];
+                        let v_offset = t * dim + h * head_dim;
+                        let v_head = &state.v[v_offset..v_offset + head_dim];
+                        for i in 0..head_dim { out_head[i] += prob * v_head[i]; }
+                    }
                 }
             }
 
@@ -783,4 +997,81 @@ mod tests {
         let rep = crate::benchmark::run_simd_benchmark(20);
         assert!(rep.rmse_parity < 1e-4);
     }
+
+    #[test]
+    fn test_esm_config_autodetection() {
+        // 8M ~ 7.5M floats (30MB)
+        let cfg_8m = EsmConfig::detect_from_file_len(30_000_000).expect("8M config detection");
+        assert_eq!(cfg_8m.arch, EsmModelArch::Esm2_8M);
+        assert_eq!(cfg_8m.dim, 320);
+        assert_eq!(cfg_8m.n_layers, 6);
+        assert_eq!(cfg_8m.head_dim(), 16);
+
+        // 35M ~ 33.3M floats (133MB)
+        let cfg_35m = EsmConfig::detect_from_file_len(133_200_000).expect("35M config detection");
+        assert_eq!(cfg_35m.arch, EsmModelArch::Esm2_35M);
+        assert_eq!(cfg_35m.dim, 480);
+        assert_eq!(cfg_35m.n_layers, 12);
+        assert_eq!(cfg_35m.head_dim(), 24);
+
+        // 150M ~ 147.8M floats (591MB)
+        let cfg_150m = EsmConfig::detect_from_file_len(591_200_000).expect("150M config detection");
+        assert_eq!(cfg_150m.arch, EsmModelArch::Esm2_150M);
+        assert_eq!(cfg_150m.dim, 640);
+        assert_eq!(cfg_150m.n_layers, 30);
+        assert_eq!(cfg_150m.head_dim(), 32);
+
+        // Invalid length
+        assert!(EsmConfig::detect_from_file_len(100_000).is_err());
+    }
+
+    #[test]
+    fn test_attention_simd_parity_dk_16_24_32() {
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("avx") {
+            for &dk in &[16, 24, 32] {
+                let q: Vec<f32> = (0..dk).map(|i| (i as f32) * 0.1 - 0.5).collect();
+                let k: Vec<f32> = (0..dk).map(|i| ((i * 7) as f32) * 0.05 - 0.3).collect();
+                let v: Vec<f32> = (0..dk).map(|i| ((i * 13) as f32) * 0.03 - 0.2).collect();
+
+                // 1. Dot product parity
+                let mut scalar_dot = 0.0f32;
+                for i in 0..dk {
+                    scalar_dot += q[i] * k[i];
+                }
+                let avx_dot = unsafe { dot_product_head_avx(q.as_ptr(), k.as_ptr(), dk) };
+                assert!(
+                    (scalar_dot - avx_dot).abs() < 1e-5,
+                    "Dot product mismatch for dk={}: scalar={} vs avx={}",
+                    dk,
+                    scalar_dot,
+                    avx_dot
+                );
+
+                // 2. Accumulate value parity
+                let prob = 0.42f32;
+                let mut scalar_out = vec![1.5f32; dk];
+                let mut avx_out = vec![1.5f32; dk];
+
+                for i in 0..dk {
+                    scalar_out[i] += prob * v[i];
+                }
+                unsafe {
+                    accumulate_value_head_avx(avx_out.as_mut_ptr(), v.as_ptr(), prob, dk);
+                }
+
+                for i in 0..dk {
+                    assert!(
+                        (scalar_out[i] - avx_out[i]).abs() < 1e-5,
+                        "Accumulate mismatch for dk={} at idx {}: scalar={} vs avx={}",
+                        dk,
+                        i,
+                        scalar_out[i],
+                        avx_out[i]
+                    );
+                }
+            }
+        }
+    }
 }
+

@@ -347,7 +347,7 @@ pub fn handle_jsonrpc_message(
 
 /// Runs the MCP stdio JSON-RPC loop.
 pub fn run_stdio_server(model_path: &str) -> io::Result<()> {
-    let config = EsmConfig::esm2_8m();
+    let config = EsmConfig::detect_from_file(model_path).unwrap_or_else(|_| EsmConfig::esm2_8m());
     let mut weights_opt: Option<EsmWeights> = None;
     let mut run_state = RunState::new(&config);
 

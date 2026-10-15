@@ -74,6 +74,15 @@ fn load_input_record(
     }
 }
 
+fn load_model(model_path: &str) -> io::Result<(EsmConfig, EsmWeights)> {
+    let config = match EsmConfig::detect_from_file(model_path) {
+        Ok(cfg) => cfg,
+        Err(_) => EsmConfig::esm2_8m(),
+    };
+    let weights = EsmWeights::from_file(model_path, &config)?;
+    Ok((config, weights))
+}
+
 fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
@@ -135,11 +144,10 @@ fn main() -> io::Result<()> {
                     i += 1;
                 }
             }
-            let config = EsmConfig::esm2_8m();
             let load_t = Instant::now();
             println!("Loading ESM-2 weights from '{}'...", model_path);
-            let weights = EsmWeights::from_file(&model_path, &config)?;
-            println!("Weights mapped successfully in {:.2} ms.", load_t.elapsed().as_secs_f64() * 1000.0);
+            let (config, weights) = load_model(&model_path)?;
+            println!("Weights mapped successfully for {} in {:.2} ms.", config.model_name(), load_t.elapsed().as_secs_f64() * 1000.0);
             codon_infer::benchmark::run_full_benchmark_suite(&weights, &config, &suite);
             Ok(())
         }
@@ -184,8 +192,7 @@ fn main() -> io::Result<()> {
             }
 
             let record = load_input_record(fasta_path.as_deref(), sequence_arg.as_deref(), "target_protein")?;
-            let config = EsmConfig::esm2_8m();
-            let weights = EsmWeights::from_file(&model_path, &config)?;
+            let (config, weights) = load_model(&model_path)?;
 
             let result = run_pipeline_dms(&record, window_size, stride, &config, &weights, &theme);
             render_dms_heatmap(&result, 25, &theme);
@@ -225,8 +232,7 @@ fn main() -> io::Result<()> {
             }
 
             let record = load_input_record(fasta_path.as_deref(), sequence_arg.as_deref(), "masked_protein")?;
-            let config = EsmConfig::esm2_8m();
-            let weights = EsmWeights::from_file(&model_path, &config)?;
+            let (config, weights) = load_model(&model_path)?;
 
             run_pipeline_inpaint(&record, &config, &weights, &theme);
             Ok(())
@@ -272,8 +278,7 @@ fn main() -> io::Result<()> {
             }
 
             let record = load_input_record(fasta_path.as_deref(), sequence_arg.as_deref(), "target_structure")?;
-            let config = EsmConfig::esm2_8m();
-            let weights = EsmWeights::from_file(&model_path, &config)?;
+            let (config, weights) = load_model(&model_path)?;
 
             let (top_contacts, enrichment, cys_indices) = run_pipeline_contacts(&record, min_separation, top_l_factor, &config, &weights, &theme);
 
@@ -332,9 +337,8 @@ fn main() -> io::Result<()> {
             println!("Active SIMD Backend: {}", active_simd_backend());
             let load_timer = Instant::now();
             println!("Loading model weights from '{}'...", model_path);
-            let config = EsmConfig::esm2_8m();
-            let weights = EsmWeights::from_file(&model_path, &config)?;
-            println!("Model weights loaded successfully in {:?}!\n", load_timer.elapsed());
+            let (config, weights) = load_model(&model_path)?;
+            println!("Model weights loaded successfully for {} in {:?}!\n", config.model_name(), load_timer.elapsed());
 
             let mut run_state = RunState::new(&config);
             println!("Initial seed prompt: '{}'", prompt);
