@@ -264,6 +264,7 @@ El pipeline de ejecución reproduce con absoluta fidelidad la arquitectura ESM-2
  │ EsmLMHead (Cabezal de Clasificación de Lenguaje)             │
  │  ├── Capa Densa: dim × dim + Bias                            │
  │  ├── Activación GELU (basada en erf)                         │
+ │  ├── Head LayerNorm (dim, eps 1e-5)                          │
  │  └── Proyección de Embeddings Ligados (dim × 33) + Dec Bias  │
  └──────────────────────────────┬───────────────────────────────┘
                                 │  logits [33]
@@ -298,30 +299,28 @@ cargo build --release
 ### 2. Pesos Preentrenados y GitHub Releases
 
 `codon-infer` estandariza los archivos binarios de pesos bajo una nomenclatura limpia y explícita:
-* **ESM-2 8M (`esm2_8m_weights.bin`):** Pre-empaquetado en la raíz del repositorio (~30 MB FP32) para inferencia instantánea sin configuraciones adicionales, desarrollo local y pruebas unitarias rápidas sin descargas externas.
-* **ESM-2 35M (`esm2_35m_weights.bin`):** Modelo de capacidad intermedia (~134 MB FP32), hospedado en [GitHub Releases](https://github.com/OsbaldoG/codon-infer/releases/tag/v1.5.0) para prevenir la sobrecarga del repositorio Git.
-* **ESM-2 150M (`esm2_150m_weights.bin`):** Modelo de alta fidelidad para predicción de contactos y bioinformática con calidad de publicación (~592 MB FP32), hospedado en [GitHub Releases](https://github.com/OsbaldoG/codon-infer/releases/tag/v1.5.0).
-* **ESM-2 650M FP32 (`esm2_650m_weights.bin`):** Modelo de investigación de gran capacidad (~2.60 GB FP32), hospedado en [GitHub Releases](https://github.com/OsbaldoG/codon-infer/releases/tag/v1.5.0).
-* **ESM-2 650M Q8_0 (`esm2_650m_q8_0.bin`):** Binario cuantizado nativo de alta capacidad (738.9 MB Q8_0), hospedado en [GitHub Releases](https://github.com/OsbaldoG/codon-infer/releases/tag/v1.5.0) para arranque zero-copy en 220 ms.
-* **ESM-2 3B (`esm2_3b_weights.bin`):** Modelo de frontera para modelado de lenguaje de proteínas (~11.4 GB FP32 / ~3.2 GB Q8_0), hospedado en [GitHub Releases](https://github.com/OsbaldoG/codon-infer/releases/tag/v1.5.0).
+* **ESM-2 8M (`esm2_8m_weights.bin`):** Pre-empaquetado en la raíz del repositorio (~30.1 MB FP32) para inferencia instantánea sin configuraciones adicionales, desarrollo local y pruebas unitarias rápidas sin descargas externas.
+* **ESM-2 35M (`esm2_35m_weights.bin`):** Modelo de capacidad intermedia (~134.1 MB FP32), hospedado en [GitHub Releases v1.4.0](https://github.com/OsbaldoG/codon-infer/releases/tag/v1.4.0).
+* **ESM-2 150M (`esm2_150m_weights.bin`):** Modelo de alta fidelidad para predicción de contactos y bioinformática con calidad de publicación (~592.6 MB FP32), hospedado en [GitHub Releases v1.4.0](https://github.com/OsbaldoG/codon-infer/releases/tag/v1.4.0).
+* **ESM-2 650M Q8_0 (`esm2_650m_q8_0.bin`):** Binario cuantizado nativo de alta capacidad (738.9 MB Q8_0), hospedado en [GitHub Releases v1.5.0](https://github.com/OsbaldoG/codon-infer/releases/tag/v1.5.0) para arranque zero-copy en 220 ms.
+* **ESM-2 650M FP32 (`esm2_650m_weights.bin`) y ESM-2 3B (`esm2_3b_weights.bin`):** Debido al límite de 2.0 GiB por archivo en GitHub Releases, los modelos de precisión completa que superan 2 GiB (~2.60 GB para 650M FP32 y ~11.4 GB para 3B FP32) se exportan localmente directamente desde HuggingFace/fair-esm mediante `python3 scripts/export_weights.py`.
 
 #### Descarga Directa de Pesos vía `curl`
 Descargue directamente los pesos binarios deseados en la raíz del repositorio sin necesidad de reconstruirlos en Google Colab:
 ```bash
-# Descargar pesos de ESM-2 35M (~134 MB)
-curl -L -o esm2_35m_weights.bin https://github.com/OsbaldoG/codon-infer/releases/download/v1.5.0/esm2_35m_weights.bin
+# Descargar pesos de ESM-2 35M (~134 MB, hospedado en v1.4.0)
+curl -L -o esm2_35m_weights.bin https://github.com/OsbaldoG/codon-infer/releases/download/v1.4.0/esm2_35m_weights.bin
 
-# Descargar pesos de ESM-2 150M (~592 MB)
-curl -L -o esm2_150m_weights.bin https://github.com/OsbaldoG/codon-infer/releases/download/v1.5.0/esm2_150m_weights.bin
+# Descargar pesos de ESM-2 150M (~592 MB, hospedado en v1.4.0)
+curl -L -o esm2_150m_weights.bin https://github.com/OsbaldoG/codon-infer/releases/download/v1.4.0/esm2_150m_weights.bin
 
-# Descargar pesos de ESM-2 650M Q8_0 (738.9 MB)
+# Descargar pesos de ESM-2 650M Q8_0 (738.9 MB, hospedado en v1.5.0)
 curl -L -o esm2_650m_q8_0.bin https://github.com/OsbaldoG/codon-infer/releases/download/v1.5.0/esm2_650m_q8_0.bin
 
 # O utilizar el script automatizado:
 ./scripts/download_weights.sh 35m
 ./scripts/download_weights.sh 150m
 ./scripts/download_weights.sh 650m
-./scripts/download_weights.sh 3b
 ```
 
 > [!TIP]
@@ -515,7 +514,7 @@ codon-infer/
 │   └── config.toml         # Banderas de compilación nativa (-C target-cpu=native)
 ├── .gitignore              # Filtro de artefactos generados y copias de seguridad
 ├── Cargo.toml              # Especificación cero dependencias (v1.5.0, edición 2024)
-├── esm2_8m_weights.bin     # Pesos FP32 de ESM-2 8M (7.51M parámetros, ~30 MB)
+├── esm2_8m_weights.bin     # Pesos FP32 de ESM-2 8M (7.52M parámetros, ~30 MB)
 ├── scripts/
 │   ├── download_weights.sh # Descargador veloz de pesos desde GitHub Releases
 │   └── export_weights.py   # Exportador de pesos desde HuggingFace y fair-esm
@@ -544,7 +543,7 @@ codon-infer/
 - [x] Escalamiento multi-escala de la arquitectura (8M, 35M, 150M, 650M, 3B) con atención heterogénea ($d_k \in \{16, 24, 32, 64\}$).
 - [x] Micro-kernels vectoriales SIMD AVX-512 para el cómputo de atención con $d_k=64$.
 - [x] Formulación RoPE *split-half* y aproximación numérica precisa de GELU mediante `erf`.
-- [x] Integración completa del cabezal clasificador `EsmLMHead` (102,849 pesos).
+- [x] Integración completa del cabezal clasificador `EsmLMHead` (denso canónico + GELU + LayerNorm + sesgo de decodificador).
 - [x] Cuantización por bloques `Q8_0` para optimización de residencia en caché L3 y ancho de banda DRAM.
 - [x] Motor de concurrencia persistente `ThreadPool` en `std` puro con barrera híbrida spin/futex.
 - [x] Soporte nativo y validado para ESM-2 650M y serialización binaria zero-copy `Q8_0`.

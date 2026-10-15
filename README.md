@@ -262,6 +262,7 @@ The runtime pipeline faithfully executes the ESM-2 architecture (RoBERTa-based):
  │ EsmLMHead (Classification Head)                              │
  │  ├── Dense Layer: dim × dim + Bias                           │
  │  ├── GELU Activation (erf-based)                             │
+ │  ├── Head LayerNorm (dim, eps 1e-5)                          │
  │  └── Tied Embedding Projection (dim × 33) + Decoder Bias     │
  └──────────────────────────────┬───────────────────────────────┘
                                 │  logits [33]
@@ -296,30 +297,28 @@ cargo build --release
 ### 2. Pretrained Weights & GitHub Releases
 
 `codon-infer` standardizes model binary files on clean, explicit nomenclature:
-* **ESM-2 8M (`esm2_8m_weights.bin`):** Pre-packaged in the repository root (~30 MB FP32) for instant out-of-the-box inference, local development, and rapid unit testing without external downloads.
-* **ESM-2 35M (`esm2_35m_weights.bin`):** Higher capacity model (~134 MB FP32), hosted in [GitHub Releases](https://github.com/OsbaldoG/codon-infer/releases/tag/v1.5.0) to prevent Git repository bloat.
-* **ESM-2 150M (`esm2_150m_weights.bin`):** Publication-grade structural contact and high-fidelity model (~592 MB FP32), hosted in [GitHub Releases](https://github.com/OsbaldoG/codon-infer/releases/tag/v1.5.0).
-* **ESM-2 650M FP32 (`esm2_650m_weights.bin`):** Research-grade high-capacity model (~2.60 GB FP32), hosted in [GitHub Releases](https://github.com/OsbaldoG/codon-infer/releases/tag/v1.5.0).
-* **ESM-2 650M Q8_0 (`esm2_650m_q8_0.bin`):** Quantized high-capacity binary (738.9 MB Q8_0), hosted in [GitHub Releases](https://github.com/OsbaldoG/codon-infer/releases/tag/v1.5.0) for zero-copy 220 ms startup.
-* **ESM-2 3B (`esm2_3b_weights.bin`):** Frontier protein language model (~11.4 GB FP32 / ~3.2 GB Q8_0), hosted in [GitHub Releases](https://github.com/OsbaldoG/codon-infer/releases/tag/v1.5.0).
+* **ESM-2 8M (`esm2_8m_weights.bin`):** Pre-packaged in the repository root (~30.1 MB FP32) for instant out-of-the-box inference, local development, and rapid unit testing without external downloads.
+* **ESM-2 35M (`esm2_35m_weights.bin`):** Higher capacity model (~134.1 MB FP32), hosted in [GitHub Releases v1.4.0](https://github.com/OsbaldoG/codon-infer/releases/tag/v1.4.0).
+* **ESM-2 150M (`esm2_150m_weights.bin`):** Publication-grade structural contact and high-fidelity model (~592.6 MB FP32), hosted in [GitHub Releases v1.4.0](https://github.com/OsbaldoG/codon-infer/releases/tag/v1.4.0).
+* **ESM-2 650M Q8_0 (`esm2_650m_q8_0.bin`):** Native zero-copy quantized high-capacity binary (738.9 MB Q8_0), hosted in [GitHub Releases v1.5.0](https://github.com/OsbaldoG/codon-infer/releases/tag/v1.5.0) for instant 220 ms startup.
+* **ESM-2 650M FP32 (`esm2_650m_weights.bin`) & ESM-2 3B (`esm2_3b_weights.bin`):** Due to GitHub Releases' 2.0 GiB file asset limit, full-precision checkpoints exceeding 2 GiB (~2.60 GB for 650M FP32 and ~11.4 GB for 3B FP32) are exported locally directly from HuggingFace/fair-esm via `python3 scripts/export_weights.py`.
 
 #### Download Weights via `curl`
 Directly download the desired scaled binary model into your repository root:
 ```bash
-# Download ESM-2 35M weights (~134 MB)
-curl -L -o esm2_35m_weights.bin https://github.com/OsbaldoG/codon-infer/releases/download/v1.5.0/esm2_35m_weights.bin
+# Download ESM-2 35M weights (~134 MB, hosted in v1.4.0)
+curl -L -o esm2_35m_weights.bin https://github.com/OsbaldoG/codon-infer/releases/download/v1.4.0/esm2_35m_weights.bin
 
-# Download ESM-2 150M weights (~592 MB)
-curl -L -o esm2_150m_weights.bin https://github.com/OsbaldoG/codon-infer/releases/download/v1.5.0/esm2_150m_weights.bin
+# Download ESM-2 150M weights (~592 MB, hosted in v1.4.0)
+curl -L -o esm2_150m_weights.bin https://github.com/OsbaldoG/codon-infer/releases/download/v1.4.0/esm2_150m_weights.bin
 
-# Download ESM-2 650M Q8_0 weights (738.9 MB)
+# Download ESM-2 650M Q8_0 weights (738.9 MB, hosted in v1.5.0)
 curl -L -o esm2_650m_q8_0.bin https://github.com/OsbaldoG/codon-infer/releases/download/v1.5.0/esm2_650m_q8_0.bin
 
 # Or use the automated helper script:
 ./scripts/download_weights.sh 35m
 ./scripts/download_weights.sh 150m
 ./scripts/download_weights.sh 650m
-./scripts/download_weights.sh 3b
 ```
 
 > [!TIP]
@@ -513,7 +512,7 @@ codon-infer/
 │   └── config.toml         # Native CPU optimization flags (-C target-cpu=native)
 ├── .gitignore              # Clean repository filter (build artifacts & backups ignored)
 ├── Cargo.toml              # Zero-dependency specification (v1.5.0, edition 2024)
-├── esm2_8m_weights.bin     # ESM-2 8M FP32 weights (7.51M parameters, ~30 MB)
+├── esm2_8m_weights.bin     # ESM-2 8M FP32 weights (7.52M parameters, ~30 MB)
 ├── scripts/
 │   ├── download_weights.sh # Fast GitHub Releases weights downloader
 │   └── export_weights.py   # HuggingFace & fair-esm weight exporter
@@ -542,7 +541,7 @@ codon-infer/
 - [x] Multi-scale architecture scaling (8M, 35M, 150M, 650M, 3B) with heterogeneous attention ($d_k \in \{16, 24, 32, 64\}$).
 - [x] AVX-512 SIMD vector micro-kernels for $d_k=64$ attention processing.
 - [x] RoPE `split-half` formulation and numerical `erf` GELU approximation.
-- [x] Full `EsmLMHead` classifier integration (102,849 weights).
+- [x] Full `EsmLMHead` classifier integration (canonical dense + GELU + LayerNorm + decoder bias).
 - [x] Block `Q8_0` Quantization for L3 cache & DRAM bandwidth optimization.
 - [x] Zero-Spawn Persistent `ThreadPool` in pure `std` with hybrid spin/futex barrier.
 - [x] ESM-2 650M native support & validated zero-copy `Q8_0` binary serialization.
