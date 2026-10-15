@@ -12,19 +12,19 @@ fn print_version() {
     println!("codon-infer v{}", env!("CARGO_PKG_VERSION"));
     println!("Engine: Pure Rust Zero-Dependencies (std)");
     println!("Vector Dispatch: {}", active_simd_backend());
-    println!("Target Model: ESM-2 Multi-Scale [8M, 35M, 150M] (Meta AI / UniRef50)");
+    println!("Target Model: ESM-2 Multi-Scale [8M, 35M, 150M, 650M, 3B] (Meta AI / UniRef50)");
 }
 
 fn print_help(theme: &TerminalTheme) {
     let logo = if theme.enabled {
         "\x1b[38;2;139;92;246m╔═══════════════════════════════════════════════════════════════════════════════╗\n\
          ║   \x1b[38;2;59;130;246mCODON-INFER\x1b[38;2;139;92;246m: High-Performance Zero-Allocation ESM-2 Engine in Pure Rust     ║\n\
-         ║   \x1b[38;2;16;185;129mVersion 1.4.0\x1b[38;2;139;92;246m | Multi-Scale CLI & Bioinformatic Analysis Pipeline          ║\n\
+         ║   \x1b[38;2;16;185;129mVersion 1.4.0\x1b[38;2;139;92;246m | Multi-Scale CLI & Bioinformatic Analysis Pipeline (8M to 3B) ║\n\
          ╚═══════════════════════════════════════════════════════════════════════════════╝\x1b[0m"
     } else {
         "╔═══════════════════════════════════════════════════════════════════════════════╗\n\
          ║   CODON-INFER: High-Performance Zero-Allocation ESM-2 Engine in Pure Rust     ║\n\
-         ║   Version 1.4.0 | Multi-Scale CLI & Bioinformatic Analysis Pipeline          ║\n\
+         ║   Version 1.4.0 | Multi-Scale CLI & Bioinformatic Analysis Pipeline (8M to 3B) ║\n\
          ╚═══════════════════════════════════════════════════════════════════════════════╝"
     };
     println!("{}", logo);
@@ -50,6 +50,7 @@ fn print_help(theme: &TerminalTheme) {
     println!("    codon-infer contacts --sequence \"MCMPCFTTDHQMARKCDDCCGGKGRGKCYGPQCLCR\" --export-csv contacts.csv");
     println!("    codon-infer benchmark --suite full");
     println!("    codon-infer benchmark --model esm2_35m_weights.bin --suite full");
+    println!("    codon-infer benchmark --model esm2_650m_weights.bin --suite full");
     println!("    codon-infer benchmark --suite full --export-json benchmark_report.json");
 }
 
@@ -112,14 +113,11 @@ fn main() -> io::Result<()> {
     }
     let theme = TerminalTheme::detect(color_arg.as_deref(), no_color_flag);
 
-    // Default model weights path
-    let mut model_path = if std::path::Path::new("esm2_8m_weights.bin").exists() {
-        "esm2_8m_weights.bin".to_string()
-    } else if std::path::Path::new("esm2_weights.bin").exists() {
-        "esm2_weights.bin".to_string()
-    } else {
-        "esm2_8m_weights.bin".to_string()
-    };
+    // Default model weights path: check for discovered weights, with esm2_8m_weights.bin fallback
+    let mut model_path = codon_infer::benchmark::discover_available_models()
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| "esm2_8m_weights.bin".to_string());
 
     // Subcommand dispatch
     let subcommand = if args.len() > 1 && !args[1].starts_with('-') {

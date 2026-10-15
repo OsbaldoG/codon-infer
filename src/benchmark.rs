@@ -246,13 +246,19 @@ pub fn run_simd_benchmark(iterations: usize) -> SimdBenchmarkReport {
 
 pub fn run_multi_scale_simd_benchmark(iterations: usize) -> MultiScaleSimdReport {
     let dims = [
-        (320, 1280), // ESM-2 8M (320 -> 1280)
-        (480, 1920), // ESM-2 35M (480 -> 1920)
-        (640, 2560), // ESM-2 150M (640 -> 2560)
+        (320, 1280),   // ESM-2 8M (320 -> 1280)
+        (480, 1920),   // ESM-2 35M (480 -> 1920)
+        (640, 2560),   // ESM-2 150M (640 -> 2560)
+        (1280, 5120),  // ESM-2 650M (1280 -> 5120)
+        (2560, 10240), // ESM-2 3B (2560 -> 10240)
     ];
     let reports = dims
         .iter()
-        .map(|&(in_d, out_d)| run_simd_benchmark_for_dims(in_d, out_d, iterations))
+        .map(|&(in_d, out_d)| {
+            let scale_factor = ((in_d as f64 * out_d as f64) / (320.0 * 1280.0)).max(1.0);
+            let iters = ((iterations as f64 / scale_factor).round() as usize).max(3);
+            run_simd_benchmark_for_dims(in_d, out_d, iters)
+        })
         .collect();
     MultiScaleSimdReport {
         active_backend: active_simd_backend(),
@@ -1012,10 +1018,6 @@ pub fn run_scaling_benchmark(
 // 9. CLI REPORTER & FORMATTER
 // ==========================================
 
-// ==========================================
-// 9. CLI REPORTER & FORMATTER
-// ==========================================
-
 pub fn discover_available_models() -> Vec<String> {
     let candidates = [
         "esm2_8m_weights.bin",
@@ -1179,14 +1181,16 @@ pub fn render_comparative_table(metrics: &[ModelBenchmarkMetrics], theme: &Termi
         ("", "", "", "", "")
     };
 
-    let model_colors: [&str; 3] = if theme.enabled {
+    let model_colors: [&str; 5] = if theme.enabled {
         [
             "\x1b[38;2;16;185;129m", // Emerald green for 8M
             "\x1b[38;2;59;130;246m", // Royal blue for 35M
             "\x1b[38;2;245;158;11m", // Amber for 150M
+            "\x1b[38;2;236;72;153m", // Pink/Magenta for 650M
+            "\x1b[38;2;168;85;247m", // Purple for 3B
         ]
     } else {
-        ["", "", ""]
+        ["", "", "", "", ""]
     };
 
     let col_w = match n_models {
@@ -1240,6 +1244,8 @@ pub fn render_comparative_table(metrics: &[ModelBenchmarkMetrics], theme: &Termi
             6 => "t6_8M",
             12 => "t12_35M",
             30 => "t30_150M",
+            33 => "t33_650M",
+            36 => "t36_3B",
             _ => "custom",
         });
         print!("{}│{} {:^width$} ", c_border, mc, label, width = col_w);
@@ -1736,9 +1742,16 @@ mod tests {
     #[test]
     fn test_multi_scale_simd_parity() {
         let rep = run_multi_scale_simd_benchmark(15);
-        assert_eq!(rep.reports.len(), 3);
+        assert_eq!(rep.reports.len(), 5);
         for r in &rep.reports {
-            assert!(r.rmse_parity < 1e-4, "SIMD RMSE {} not < 1e-4 for dim {}", r.rmse_parity, r.in_dim);
+            let max_rmse = if r.in_dim > 1000 { 2.5e-4 } else { 1e-4 };
+            assert!(
+                r.rmse_parity < max_rmse,
+                "SIMD RMSE {} not < {} for dim {}",
+                r.rmse_parity,
+                max_rmse,
+                r.in_dim
+            );
             assert!(r.speedup > 0.0);
         }
     }

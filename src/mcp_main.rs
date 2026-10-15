@@ -1,10 +1,25 @@
 fn main() -> std::io::Result<()> {
-    let model_path = if std::path::Path::new("esm2_8m_weights.bin").exists() {
-        "esm2_8m_weights.bin"
-    } else if std::path::Path::new("esm2_weights.bin").exists() {
-        "esm2_weights.bin"
-    } else {
-        "/home/manuel/REA_GENOMICS/codon-infer/esm2_8m_weights.bin"
-    };
-    codon_infer::mcp::run_stdio_server(model_path)
+    let args: Vec<String> = std::env::args().collect();
+    let mut model_arg: Option<String> = None;
+
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "--model" && i + 1 < args.len() {
+            model_arg = Some(args[i + 1].clone());
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+
+    let model_path = model_arg
+        .or_else(|| std::env::var("CODON_INFER_MODEL").ok())
+        .unwrap_or_else(|| {
+            codon_infer::discover_available_models()
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| "esm2_8m_weights.bin".to_string())
+        });
+
+    codon_infer::mcp::run_stdio_server(&model_path)
 }

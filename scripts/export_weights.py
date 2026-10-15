@@ -47,6 +47,22 @@ MODELS = {
         "dim": 640,
         "hidden_dim": 2560,
     },
+    "650M": {
+        "hf_name": "facebook/esm2_t33_650M_UR50D",
+        "fair_func": "esm2_t33_650M_UR50D",
+        "output": "esm2_650m_weights.bin",
+        "n_layers": 33,
+        "dim": 1280,
+        "hidden_dim": 5120,
+    },
+    "3B": {
+        "hf_name": "facebook/esm2_t36_3B_UR50D",
+        "fair_func": "esm2_t36_3B_UR50D",
+        "output": "esm2_3b_weights.bin",
+        "n_layers": 36,
+        "dim": 2560,
+        "hidden_dim": 10240,
+    },
 }
 
 def export_fair_esm(meta, out_path):
@@ -291,7 +307,7 @@ def main():
     parser = argparse.ArgumentParser(description="Export ESM-2 weights to codon-infer binary format.")
     parser.add_argument(
         "--model",
-        choices=["8M", "35M", "150M", "all"],
+        choices=["8M", "35M", "150M", "650M", "3B", "all"],
         default="8M",
         help="Model scale to export (default: 8M)",
     )
@@ -323,7 +339,7 @@ def main():
                 print("Install with: pip install transformers torch  OR  pip install fair-esm torch", file=sys.stderr)
                 sys.exit(1)
 
-    targets = ["8M", "35M", "150M"] if args.model == "all" else [args.model]
+    targets = ["8M", "35M", "150M", "650M", "3B"] if args.model == "all" else [args.model]
     for m in targets:
         meta = MODELS[m]
         out_path = os.path.join(args.output_dir, meta["output"])

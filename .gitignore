@@ -1,4 +1,10 @@
-# Build artifacts and directories
+# ==============================================================================
+# Codon-Infer: Git Ignore Configuration
+# Protects against committing build artifacts, large weights, profiling traces,
+# local audit reports, temporary experiments, and Python caches.
+# ==============================================================================
+
+# --- Rust Build Artifacts & Binaries ---
 /target/
 target/
 *.o
@@ -6,34 +12,16 @@ target/
 *.so
 *.dylib
 *.rlib
+*.rs.bk
 
-# Binaries and executable outputs
+# Compiled Engine Binaries
 bio_engine
 codon-infer
 codon-infer-mcp
 
-# Backups and temporary files
-*.backup
-*.bak
-*.tmp
-*~
-.DS_Store
-
-# IDE and editors
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# Logs and outputs
-*.log
-*_output.csv
-*_output.json
-dms_output.*
-contacts_output.*
-benchmark_report*.json
-
-# Large multi-model weights binaries (>30MB)
+# --- Large ESM-2 Weights & Checkpoints (>30MB) ---
+# Pretrained starter model (esm2_8m_weights.bin ~30MB) is tracked.
+# Larger variants must be downloaded via scripts/download_weights.sh
 *_pesos.bin
 esm2_35m*.bin
 esm2_150m*.bin
@@ -48,6 +36,124 @@ esm2_150m_weights.bin
 esm2_650m_weights.bin
 esm2_3b_weights.bin
 
-# Architecture & R&D Notes
-SCALING_ESM2_650M_3B_ANALYSIS.md
+# Quantized Weights & External Checkpoints
+*.q8_0.bin
+*.q4_0.bin
+*_quantized.bin
+checkpoints/
+models/
+weights/
+*.pt
+*.pth
+*.safetensors
+*.onnx
+*.gguf
 
+# Explicit whitelisting of starter weights & fixtures
+!esm2_8m_weights.bin
+!test_peptidase.fasta
+
+# --- Audit Reports, Architecture Notes & Internal Analyses ---
+# Local audit logs, findings, and technical notes should remain local
+*audit*
+*AUDIT*
+*Audit*
+*informe*
+*INFORME*
+*Informe*
+*analysis*
+*ANALYSIS*
+*report*.md
+*REPORT*.md
+*notes*.md
+NOTES*.md
+TODO*.md
+SCALING_ESM2_*.md
+audits/
+audit/
+reports/
+review/
+reviews/
+scratch/
+local/
+temp/
+tmp/
+
+# Whitelist standard repo docs & source code
+!README.md
+!README_ES.md
+!LICENSE
+!src/**
+!scripts/**
+
+# --- Python Environment & Caches (scripts/export_weights.py) ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+ENV/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# --- Hardware Profiling, Benchmarks & Diagnostics ---
+# Generated during AVX2 / AVX-512 SIMD stress testing and profiling
+perf.data
+perf.data.old
+*.folded
+flamegraph*.svg
+*.prof
+*.profraw
+*.profdata
+valgrind*.log
+callgrind.out.*
+benchmark_report*.json
+benchmark_report*.csv
+
+# --- Biological Inference Outputs & Temporary Datasets ---
+*.log
+*_output.csv
+*_output.json
+dms_output.*
+contacts_output.*
+test_*_out.*
+tmp_*.fasta
+local_*.fasta
+*.tsv
+*.parquet
+*.npy
+*.npz
+
+# --- Editors, IDEs & OS Files ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*.sublime-*
+.DS_Store
+Thumbs.db
+.directory
+.claude/
+.gemini/
+.antigravity/
+
+# --- Backup, Temporary & Patch Files ---
+*.backup
+*.bak
+*.tmp
+*~
+*.orig
+*.rej
+
+# --- Environment & Secret Credentials ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key

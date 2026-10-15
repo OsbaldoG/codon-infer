@@ -116,13 +116,16 @@ Traditional Python deep learning frameworks require external configuration files
 
 ```rust
 pub fn detect_from_file_len(file_len: u64) -> io::Result<Self> {
-    let floats = file_len / 4;
-    if floats >= 140_000_000 {
-        Ok(Self::esm2_150m()) // 150M (~591 MB FP32 / ~178 MB Q8_0)
-    } else if floats >= 30_000_000 {
-        Ok(Self::esm2_35m())  // 35M (~133 MB FP32 / ~48 MB Q8_0)
-    } else if floats >= 7_000_000 {
-        Ok(Self::esm2_8m())   // 8M (~30 MB FP32 / ~12 MB Q8_0)
+    if file_len >= 3_000_000_000 {
+        Ok(Self::esm2_3b())   // 3B (~11.4 GB FP32 / ~3.2 GB Q8_0)
+    } else if file_len >= 2_000_000_000 || file_len >= 700_000_000 {
+        Ok(Self::esm2_650m()) // 650M (~2.6 GB FP32 / ~732 MB Q8_0)
+    } else if file_len >= 450_000_000 || file_len >= 155_000_000 {
+        Ok(Self::esm2_150m()) // 150M (~592 MB FP32 / ~166 MB Q8_0)
+    } else if file_len >= 95_000_000 || file_len >= 34_000_000 {
+        Ok(Self::esm2_35m())  // 35M (~134 MB FP32 / ~38 MB Q8_0)
+    } else if file_len >= 6_000_000 {
+        Ok(Self::esm2_8m())   // 8M (~30 MB FP32 / ~8.5 MB Q8_0)
     } else {
         Err(io::Error::new(io::ErrorKind::InvalidData, "Unrecognized ESM-2 weights binary size"))
     }
@@ -131,40 +134,42 @@ pub fn detect_from_file_len(file_len: u64) -> io::Result<Self> {
 Any custom weights binary supplied via `--model <PATH>` is identified and validated at boot time in $< 0.1\text{ ms}$, automatically resizing all internal inference buffers, KV-caches, and embedding projections with zero runtime allocation overhead.
 
 ### 2. SIMD Optimization and Heterogeneous Attention Dynamic Dispatch
-In multi-head attention, every head has dimension $d_k = d_{\text{model}} / H$. Because all ESM-2 variants standardize on $H=20$ attention heads, the head dimensions differ across model scales:
+In multi-head attention, every head has dimension $d_k = d_{\text{model}} / H$. While 8M, 35M, 150M, and 650M standardize on $H=20$ attention heads, 3B scales to $H=40$ heads:
 * **8M:** $d_k = 320 / 20 = 16$ floats
 * **35M:** $d_k = 480 / 20 = 24$ floats
 * **150M:** $d_k = 640 / 20 = 32$ floats
+* **650M:** $d_k = 1280 / 20 = 64$ floats
+* **3B:** $d_k = 2560 / 40 = 64$ floats
 
-Because each 256-bit AVX register (`__m256`) holds exactly 8 single-precision (`f32`) floats, every $d_k$ is an exact integer multiple of 8:
-$$\frac{16}{8} = 2 \text{ registers}, \quad \frac{24}{8} = 3 \text{ registers}, \quad \frac{32}{8} = 4 \text{ registers}$$
+Because each 256-bit AVX register (`__m256`) holds exactly 8 single-precision (`f32`) floats, and each 512-bit AVX-512 register (`__m512`) holds 16 floats, every $d_k$ is an exact integer multiple:
+$$\frac{16}{8} = 2 \text{ YMM}, \quad \frac{24}{8} = 3 \text{ YMM}, \quad \frac{32}{8} = 4 \text{ YMM}, \quad \frac{64}{8} = 8 \text{ YMM} \quad (\text{or } 4 \text{ ZMM in AVX-512})$$
 
 `codon-infer` implements dedicated, unrolled assembly-grade vector kernels for dot products and value accumulations:
-* **Scaled Dot-Product ($Q \cdot K^\top$):** `dot_product_head_avx` evaluates 16, 24, or 32 dimensions in parallel without remaining scalar loops or loop bounds checks, performing pairwise multiplication (`_mm256_mul_ps`), vector addition (`_mm256_add_ps`), and an ultra-fast horizontal sum (`hsum256_ps_avx`).
-* **Value Vector Accumulation ($V \times \text{prob}$):** `accumulate_value_head_avx` broadcasts the scalar probability across an entire vector (`_mm256_set1_ps`) and executes direct vector multiply-accumulate operations (`_mm256_add_ps` + `_mm256_mul_ps`) straight into the output head accumulator.
-* **Scalar Parity Guarantee:** Unit tests (`test_attention_simd_parity_dk_16_24_32`) enforce mathematical equivalence with scalar reference loops under a strict tolerance threshold ($\Delta < 10^{-5}$) across all 3 head dimensions.
+* **Scaled Dot-Product ($Q \cdot K^\top$):** `dot_product_head_avx` evaluates 16, 24, 32, or 64 dimensions in parallel without remaining scalar loops or bounds checks (`_mm256_mul_ps`, `_mm256_add_ps`, `hsum256_ps_avx`). On AVX-512 hardware, $d_k=64$ dispatches to `dot_product_head_avx512_d64` utilizing 4 ZMM registers and single-cycle horizontal reduction (`_mm512_reduce_add_ps`).
+* **Value Vector Accumulation ($V \times \text{prob}$):** `accumulate_value_head_avx` broadcasts the scalar probability across vectors (`_mm256_set1_ps`) and executes direct vector multiply-accumulate operations. For $d_k=64$, AVX-512 dispatches `accumulate_value_head_avx512_d64` (`_mm512_fmadd_ps`).
+* **Scalar Parity Guarantee:** Unit tests (`test_attention_simd_parity_dk_16_24_32`, `test_attention_simd_parity_dk_64`) enforce mathematical equivalence with scalar reference loops under a strict tolerance threshold ($\Delta < 10^{-5}$) across all 4 head dimensions.
 
 ### 3. Architectural and Performance Technical Comparison Matrix
 
-| Parameter / Metric | ESM-2 8M (`esm2_t6_8M_UR50D`) | ESM-2 35M (`esm2_t12_35M_UR50D`) | ESM-2 150M (`esm2_t30_150M_UR50D`) |
-| :--- | :--- | :--- | :--- |
-| **Transformer Layers ($L$)** | 6 | 12 | 30 |
-| **Hidden Dimension ($d_{\text{model}}$)** | 320 | 480 | 640 |
-| **Attention Heads ($H$)** | 20 | 20 | 20 |
-| **Head Dimension ($d_k$)** | 16 | 24 | 32 |
-| **AVX Registers (`__m256`) per Head** | **2 registers** (16 floats) | **3 registers** (24 floats) | **4 registers** (32 floats) |
-| **FFN Dimension ($d_{\text{ffn}}$)** | 1,280 | 1,920 | 2,560 |
-| **Vocabulary** | 33 tokens | 33 tokens | 33 tokens |
-| **Total Parameters** | 7,511,809 (~7.5M) | 33,524,449 (~33.5M) | 148,011,297 (~148M) |
-| **Binary Size (FP32)** | ~30.0 MB | ~134.1 MB | ~592.5 MB |
-| **Quantized Binary Size (`Q8_0`)** | ~11.5 MB | ~48.2 MB | ~178.6 MB |
-| **Weight Load Latency** | **34 – 38 ms** | **117 – 122 ms** | **466 – 487 ms** |
-| **Autoregressive Throughput (Generate)** | **>315 tokens/s** (~3.1 ms/tok) | **~80 – 85 tokens/s** (~11.8 ms/tok) | **~18 – 20 tokens/s** (~53.0 ms/tok) |
-| **Bidirectional Throughput (Inpaint)** | **>400 tokens/s** (~76 ms / $L=32$) | **~85 – 90 tokens/s** (~356 ms / $L=32$) | **~18 – 21 tokens/s** (~1,580 ms / $L=32$) |
-| **Working State Memory ($L=128$)** | **~911 KB** | **~1,321 KB** | **~1,732 KB** |
-| **Cache Hierarchy Residency** | **100% in L3 Cache** ($\le 32$ MB) | Partial Residency in L3 / DDR | Streaming from RAM ($> 500$ MB) |
-| **Memory Bandwidth Demand** | **Compute-Bound (AVX/SIMD)** | **Balanced Cache/DRAM** | **Memory-Bus Limited** |
-| **Primary Use Case** | Fast in silico DMS, real-time inpainting | High-resolution DMS, peptide screening | 3D contact prediction, de novo design |
+| Parameter / Metric | ESM-2 8M (`esm2_t6_8M_UR50D`) | ESM-2 35M (`esm2_t12_35M_UR50D`) | ESM-2 150M (`esm2_t30_150M_UR50D`) | ESM-2 650M (`esm2_t33_650M_UR50D`) | ESM-2 3B (`esm2_t36_3B_UR50D`) |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Transformer Layers ($L$)** | 6 | 12 | 30 | 33 | 36 |
+| **Hidden Dimension ($d_{\text{model}}$)** | 320 | 480 | 640 | 1,280 | 2,560 |
+| **Attention Heads ($H$)** | 20 | 20 | 20 | 20 | 40 |
+| **Head Dimension ($d_k$)** | 16 | 24 | 32 | 64 | 64 |
+| **SIMD Registers per Head** | **2 YMM** (16 floats) | **3 YMM** (24 floats) | **4 YMM** (32 floats) | **8 YMM / 4 ZMM** (64 floats) | **8 YMM / 4 ZMM** (64 floats) |
+| **FFN Dimension ($d_{\text{ffn}}$)** | 1,280 | 1,920 | 2,560 | 5,120 | 10,240 |
+| **Vocabulary** | 33 tokens | 33 tokens | 33 tokens | 33 tokens | 33 tokens |
+| **Total Parameters** | 7,511,809 (~7.5M) | 33,524,449 (~33.5M) | 148,011,297 (~148M) | ~650M | ~2.84B (~3B) |
+| **Binary Size (FP32)** | ~30.0 MB | ~134.1 MB | ~592.5 MB | ~2.60 GB | ~11.36 GB |
+| **Quantized Binary Size (`Q8_0`)** | ~8.5 MB | ~37.7 MB | ~166.5 MB | ~732 MB | ~3.19 GB |
+| **Weight Load Latency** | **34 – 38 ms** | **117 – 122 ms** | **466 – 487 ms** | **~2.1 s** | **~8.5 s** |
+| **Autoregressive Throughput (Generate)** | **>315 tokens/s** (~3.1 ms/tok) | **~80 – 85 tokens/s** (~11.8 ms/tok) | **~18 – 20 tokens/s** (~53.0 ms/tok) | **~3.8 – 4.5 tokens/s** | **~0.8 – 1.0 tokens/s** |
+| **Bidirectional Throughput (Inpaint)** | **>400 tokens/s** (~76 ms / $L=32$) | **~85 – 90 tokens/s** (~356 ms / $L=32$) | **~18 – 21 tokens/s** (~1,580 ms / $L=32$) | **~4.0 – 4.8 tokens/s** | **~0.9 – 1.1 tokens/s** |
+| **Working State Memory ($L=128$)** | **~911 KB** | **~1,321 KB** | **~1,732 KB** | **~3,450 KB** | **~7,200 KB** |
+| **Cache Hierarchy Residency** | **100% in L3 Cache** ($\le 32$ MB) | Partial Residency in L3 / DDR | Streaming from RAM ($> 500$ MB) | DRAM Streaming Bound (>2.4 GB) | Massive DRAM Bound (>10 GB) |
+| **Memory Bandwidth Demand** | **Compute-Bound (AVX/SIMD)** | **Balanced Cache/DRAM** | **Memory-Bus Limited** | **DRAM Bound** | **Extreme Memory-Bus Bound** |
+| **Primary Use Case** | Fast in silico DMS, real-time inpainting | High-resolution DMS, peptide screening | 3D contact prediction, de novo design | Publication-grade contact maps, fine DMS | Frontier protein language modeling |
 
 ---
 
@@ -249,6 +254,8 @@ cargo build --release
 * **ESM-2 8M (`esm2_8m_weights.bin`):** Pre-packaged in the repository root (~30 MB FP32) for instant out-of-the-box inference, local development, and rapid unit testing without external downloads.
 * **ESM-2 35M (`esm2_35m_weights.bin`):** Higher capacity model (~133 MB FP32), hosted in [GitHub Releases](https://github.com/OsbaldoG/codon-infer/releases/tag/v1.4.0) to prevent Git repository bloat.
 * **ESM-2 150M (`esm2_150m_weights.bin`):** Publication-grade structural contact and high-fidelity model (~590 MB FP32), hosted in [GitHub Releases](https://github.com/OsbaldoG/codon-infer/releases/tag/v1.4.0).
+* **ESM-2 650M (`esm2_650m_weights.bin`):** Research-grade high-capacity model (~2.6 GB FP32), hosted in [GitHub Releases](https://github.com/OsbaldoG/codon-infer/releases/tag/v1.4.0).
+* **ESM-2 3B (`esm2_3b_weights.bin`):** Frontier protein language model (~11.4 GB FP32 / ~3.2 GB Q8_0), hosted in [GitHub Releases](https://github.com/OsbaldoG/codon-infer/releases/tag/v1.4.0).
 
 #### Download Weights via `curl`
 Directly download the desired scaled binary model into your repository root:
@@ -262,12 +269,15 @@ curl -L -o esm2_150m_weights.bin https://github.com/OsbaldoG/codon-infer/release
 # Or use the automated helper script:
 ./scripts/download_weights.sh 35m
 ./scripts/download_weights.sh 150m
+./scripts/download_weights.sh 650m
+./scripts/download_weights.sh 3b
 ```
 
 > [!TIP]
 > You can also export custom weights directly from HuggingFace Transformers or Meta `fair-esm` using the provided Python utility:
 > ```bash
 > python3 scripts/export_weights.py --model 35M
+> python3 scripts/export_weights.py --model 650M
 > ```
 
 ### 3. Run Test Suite
@@ -349,11 +359,12 @@ codon-infer contacts --model esm2_150m_weights.bin --fasta proteins.fasta --expo
 #### E. Hardware & Biological Benchmark Suite (`benchmark`)
 Execute the full hardware stress and biological validation suite across any model size:
 ```bash
-# Execute comparative cross-model benchmark across all discovered weights (8M, 35M, 150M):
+# Execute comparative cross-model benchmark across all discovered weights (8M, 35M, 150M, 650M, 3B):
 codon-infer benchmark --suite full
 
 # Benchmark a specific model variant:
 codon-infer benchmark --model esm2_35m_weights.bin --suite full
+codon-infer benchmark --model esm2_650m_weights.bin --suite full
 
 # Export structured performance report for CI/CD pipelines:
 codon-infer benchmark --suite full --export-json benchmark_report.json
@@ -361,7 +372,7 @@ codon-infer benchmark --suite full --export-json benchmark_report.json
 
 Available suites:
 * `full`: Multi-model comparative evaluation (weight loading latency, tokens/s throughput, working memory, cache profile) plus algorithmic tests.
-* `simd`: Multi-scale AVX2+FMA vs AVX1 numerical parity and matrix-vector microbenchmarks across projection dimensions ($320 \to 1280$, $480 \to 1920$, $640 \to 2560$) and head dimensions $d_k \in \{16, 24, 32\}$.
+* `simd`: Multi-scale AVX2+FMA vs AVX1 numerical parity and matrix-vector microbenchmarks across projection dimensions ($320 \to 1280$, $480 \to 1920$, $640 \to 2560$, $1280 \to 5120$, $2560 \to 10240$) and head dimensions $d_k \in \{16, 24, 32, 64\}$.
 * `mlm`: Evolutionary pseudo-perplexity and wild-type vs disruptive mutation penalties.
 * `dms`: Deep mutational scanning calibration on bacterial catalytic peptidase motifs.
 * `contacts`: Structural contact prediction and Cys-Cys spatial proximity scoring.
@@ -375,7 +386,7 @@ Available suites:
 # Launch with default ESM-2 8M weights
 cargo run --release --bin codon-infer-mcp
 
-# Launch with higher-capacity ESM-2 35M or 150M weights
+# Launch with higher-capacity ESM-2 35M, 150M, 650M, or 3B weights
 cargo run --release --bin codon-infer-mcp -- --model esm2_35m_weights.bin
 ```
 
