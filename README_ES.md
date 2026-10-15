@@ -1,11 +1,12 @@
 # codon-infer 🧬⚡
 
-> **Motor de Inferencia y Pipeline Bioinformático para Modelos de Lenguaje de Proteínas ESM-2 Multi-Escala, de Alto Rendimiento y Cero Asignaciones en Rust Puro (v1.4.0).**
+> **Motor de Inferencia y Pipeline Bioinformático para Modelos de Lenguaje de Proteínas ESM-2 Multi-Escala, de Alto Rendimiento y Cero Asignaciones en Rust Puro (v1.5.0).**
 
 [🇬🇧 Read in English (README.md)](README.md)
 
 [![Rust](https://img.shields.io/badge/rust-edición_2024-orange.svg)](https://www.rust-lang.org/)
-[![Version](https://img.shields.io/badge/versión-1.4.0-blue.svg)]()
+[![Version](https://img.shields.io/badge/versión-1.5.0-blue.svg)]()
+[![Tests](https://img.shields.io/badge/tests-32%20pasados%2C%200%20fallidos-brightgreen.svg)]()
 [![Dependencies](https://img.shields.io/badge/dependencias-0%20(std%20puro)-brightgreen.svg)]()
 [![License](https://img.shields.io/badge/licencia-MIT-blue.svg)](LICENSE)
 [![Model](https://img.shields.io/badge/modelo-ESM--2%20(8M%20a%203B)-blueviolet.svg)](https://github.com/facebookresearch/esm)
@@ -20,14 +21,23 @@ Al prescindir por completo de los ecosistemas de Python, PyTorch, C/CUDA y crate
 
 ---
 
-## ⚡ Aspectos Destacados (Versión 1.4)
+## ⚡ Aspectos Destacados (Versión 1.5)
 
+* **Motor de Cuantización Nativa por Bloques `Q8_0` y Serialización Binaria Directa (`BlockQ8_0`):**
+  * Formato de pesos cuantizados por bloques (32 valores `i8` + factor de escala `f32` por bloque) que reduce el ancho de banda y la huella en RAM en un factor de **3.56x** (de ~2.48 GB a **698.5 MB** en ESM-2 650M) con **99.980% de fidelidad de logits** (Similitud de Coseno `0.99980`, RMSE `0.00021`).
+  * Carga zero-copy directa desde binarios cuantizados nativos (`*_q8_0.bin`) en solo **219.98 ms** (frente a ~751 ms en FP32).
+  * Micro-kernels vectoriales GEMV de descuantización *on-the-fly* (`AVX1` / `AVX2` / `AVX-512`), eliminando asignaciones en el heap y rotación de tensores durante el producto matriz-vector.
+  * Subcomando de CLI `quantize` dedicado para convertir pesos FP32 directamente en binarios optimizados `Q8_0`.
+* **Motor de Concurrencia Persistente `ThreadPool` Cero-Spawn (`std` puro):**
+  * Paralelización sin coste de llamadas al sistema operativo a través de las proyecciones densas FFN y cabezas de atención mediante hilos persistentes, erradicando ~230 transiciones de kernel `pthread_create` / join por cada token generado.
+  * Barrera híbrida spin/futex (`ThreadBarrier`) con rendimiento spin lock-free adaptativo y estacionamiento eficiente para sincronización sub-microsegundo.
+  * Detección automática de la topología del procesador (`detect_optimal_threads` vía `/proc/cpuinfo`) que prioriza núcleos físicos de cómputo sobre hilos lógicos SMT/Hyper-Threading, saturando los puertos vectoriales AVX de 256 bits sin contención.
 * **Arquitectura Multi-Escala y Autodetección Paramétrica (`detect_from_file_len`):**
   * Instanciación instantánea y sin configuración manual para las variantes **ESM-2 8M**, **35M**, **150M**, **650M** y **3B** a partir de la longitud en bytes del archivo binario de pesos, eliminando la necesidad de archivos de configuración JSON o manifiestos auxiliares.
 * **Kernels de Atención SIMD Dinámicos y Heterogéneos ($d_k \in \{16, 24, 32, 64\}$):**
   * Micro-kernels vectoriales AVX de 256 bits y AVX-512 de 512 bits optimizados a mano y mapeados a 2, 3, 4 u 8 registros `__m256` (o 4 registros `__m512` ZMM) por cabeza de atención, maximizando la densidad de cómputo vectorial con paridad escalar bit a bit ($\Delta < 10^{-5}$) tanto en pasadas autorregresivas causales como bidireccionales completas.
-* **Subcomandos de CLI para Entornos de Producción (`generate`, `inpaint`, `dms`, `contacts`, `benchmark`):**
-  * Interfaz de terminal expresiva y unificada con soporte de subcomandos, banderas globales (`--model`, `--color`, `--no-color`), detección automática de TTY y diagnósticos claros de errores.
+* **Subcomandos de CLI para Entornos de Producción (`generate`, `inpaint`, `dms`, `contacts`, `benchmark`, `quantize`):**
+  * Interfaz de terminal expresiva y unificada con soporte de subcomandos, banderas globales (`--model`, `--threads`, `--quantize`, `--color`, `--no-color`), detección automática de TTY y diagnósticos claros de errores.
 * **Experiencia de Usuario TrueColor ANSI sin Dependencias (`ui.rs`):**
   * **Paleta Fisicoquímica:** Residuos de aminoácidos formateados en colores ANSI RGB TrueColor según sus propiedades bioquímicas (Alifáticos, Aromáticos, Básicos, Ácidos, Polares, Cisteínas y de Flexibilidad Conformacional).
   * **Mapa de Calor Térmico Continuo:** Interpolación RGB dinámica (`lerp_rgb`) desde Carmesí Profundo (`#7F1D1D`) para mutaciones deletéreas/letales ($\Delta \log P \le -4.0$) pasando por Ámbar y Pizarra Neutro, hasta Azul Eléctrico (`#1E3A8A`) para variantes benéficas, preservando glifos de densidad ASCII (`█`, `▓`, `▒`, `░`, `·`) en terminales sin soporte de color.
@@ -56,23 +66,39 @@ Evaluado en Linux x86_64 (ejecución monohilo en CPU con instrucciones vectorial
 ### 1. Contraste frente a la Línea Base de Python / PyTorch
 La migración arquitectónica a Rust puro con garantías deterministas de cero asignaciones en memoria supera drásticamente al ecosistema tradicional de Python/PyTorch en todas las métricas operativas:
 
-| Métrica | Referencia PyTorch / Python (ESM-2 8M) | `codon-infer` v1.4 (Rust Puro + SIMD) | Ventaja de Ingeniería |
+| Métrica | Referencia PyTorch / Python (ESM-2 8M) | `codon-infer` v1.5 (Rust Puro + SIMD) | Ventaja de Ingeniería |
 | :--- | :--- | :--- | :--- |
 | **Dependencias** | Python, PyTorch, LibTorch, CUDA (~4–7 GB) | **`std` puro (0 crates, 0 dependencias dinámicas)** | **~99.9% más liviano** |
 | **Tamaño del Ejecutable** | Entorno multigiagabyte | **~1.5 MB binario release compilado** | **Binario único ultra-portable** |
-| **Latencia de Carga** | ~2,500 – 4,000 ms (inicialización PyTorch) | **34.8 ms (8M) / 117.4 ms (35M) / 466.8 ms (150M)** | **~60x – 100x arranque más rápido** |
-| **Huella en Memoria (RAM)** | ~1.5 – 2.5 GB RSS base | **~35 MB RSS estático (8M FP32) / ~12 MB (Q8_0)** | **~50x más eficiente en memoria** |
-| **Rendimiento de Inferencia** | ~15 – 35 tokens/seg (CPU monohilo) | **~333.3 tokens/seg (8M) / 84.7 tok/s (35M)** | **~10x – 22x mayor throughput** |
+| **Latencia de Carga** | ~2,500 – 4,000 ms (inicialización PyTorch) | **34.8 ms (8M) / 117.4 ms (35M) / 219.98 ms (650M Q8)** | **~12x – 100x arranque más rápido** |
+| **Huella en Memoria (RAM)** | ~1.5 – 2.5 GB RSS base | **~35 MB RSS estático (8M) / ~698.5 MB (650M Q8)** | **~4x – 50x más eficiente en memoria** |
+| **Rendimiento de Inferencia** | ~15 – 35 tokens/seg (CPU monohilo) | **~333.3 tok/s (8M) / 7.70 tok/s (650M Q8_0 -t 2)** | **Máxima densidad de cómputo, 0 asignaciones** |
 | **Asignación de Memoria** | Pausas continuas de GC y churn de tensores | **0 asignaciones de heap en el hot-path** | **Garantías deterministas en tiempo real** |
 
-### 2. Matriz de Rendimiento Multi-Escala Real (ESM-2 8M, 35M y 150M)
-Medido empíricamente con `codon-infer benchmark --suite full` bajo ejecución monohilo con despacho SIMD nativo:
+### 2. Matriz de Rendimiento Multi-Escala Real (ESM-2 8M a 650M)
+Medido empíricamente con `codon-infer benchmark --suite full` bajo ejecución en CPU con despacho SIMD nativo:
 
 | Escala del Modelo | Capas ($L$) | Dimensión Oculta ($d$) | Cabezas Atención ($H \times d_k$) | Latencia Carga Pesos | Throughput Autorregresivo | Throughput Bidireccional ($L=32$) | Buffer Estado Trabajo ($L=128$) | Jerarquía de Caché y Memoria |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | **ESM-2 8M** | 6 | 320 | $20 \times 16$ (2 reg AVX) | **34.8 ms** | **~333.3 tokens/s** (3.0 ms/tok) | **~418.8 tokens/s** (76.4 ms) | **911.0 KB** | **100% en Caché L3** ($\le 32$ MB) · Limitado por Cómputo |
 | **ESM-2 35M** | 12 | 480 | $20 \times 24$ (3 reg AVX) | **117.4 ms** | **~84.7 tokens/s** (11.8 ms/tok) | **~89.9 tokens/s** (356.1 ms) | **1,321.2 KB** | **Residencia Parcial L3 / DDR** · Balanceado Caché/DRAM |
 | **ESM-2 150M** | 30 | 640 | $20 \times 32$ (4 reg AVX) | **466.8 ms** | **~18.9 tokens/s** (53.0 ms/tok) | **~20.2 tokens/s** (1,583.7 ms) | **1,731.5 KB** | **Streaming desde RAM** ($>500$ MB) · Limitado por Bus de Memoria |
+| **ESM-2 650M (FP32)** | 33 | 1280 | $20 \times 64$ (8 reg AVX) | **751.2 ms** | **4.57 tokens/s** (218.8 ms/tok) | **~4.8 tokens/s** (~6,600 ms) | **3,450.0 KB** | **Streaming desde RAM** (~2.48 GB RSS) · Limitado por Bus de Memoria |
+| **ESM-2 650M (Q8_0, -t 2)** | 33 | 1280 | $20 \times 64$ (8 reg AVX) | **219.98 ms** | **7.70 tokens/s** (129.9 ms/tok) | **~8.2 tokens/s** (~3,900 ms) | **3,450.0 KB** | **Optimizado para Streaming DRAM** (~698.5 MB RSS) · Núcleos Saturados |
+
+### 3. Escalamiento Multihilo y Cuantización en ESM-2 650M (Núcleos Físicos vs SMT)
+
+Evaluado en procesador de doble núcleo Intel Sandy Bridge (Core i5-2520M @ 2.50 GHz, 2 núcleos físicos, 4 hilos lógicos SMT) con micro-kernels vectoriales AVX1:
+
+| Configuración de Ejecución | Precisión de Pesos | Huella en Memoria (RAM) | Latencia de Carga en Frío | Throughput | Latencia por Token | Aceleración Relativa |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **1 Hilo (Monocore)** | FP32 | 2,485 MB | 751.2 ms | 4.57 tok/s | 218.8 ms/tok | 1.00x (Base) |
+| **1 Hilo (Monocore)** | Q8_0 | 698.5 MB | 219.98 ms | 5.15 tok/s | 194.2 ms/tok | 1.13x |
+| **2 Núcleos Físicos (`-t 2`)** | **Q8_0** | **698.5 MB** | **219.98 ms** | **7.70 tok/s** | **129.9 ms/tok** | **1.68x (Óptimo)** |
+| **4 Hilos SMT (`-t 4`)** | Q8_0 | 698.5 MB | 219.98 ms | 7.48 tok/s | 133.7 ms/tok | 1.64x (Contención AVX) |
+
+> [!NOTE]
+> **Saturación de Núcleos Físicos vs Hyper-Threading:** En arquitecturas donde los hilos lógicos SMT comparten el puerto de ejecución vectorial AVX de 256 bits por núcleo físico, asignar 2 hilos a los 2 núcleos reales (`-t 2`) otorga el rendimiento máximo (7.70 tok/s) y la mínima latencia de sincronización. `codon-infer` detecta automáticamente los núcleos físicos vía `detect_optimal_threads` si se omite `--threads`.
 
 ---
 
@@ -124,10 +150,10 @@ pub fn detect_from_file_len(file_len: u64) -> io::Result<Self> {
         // ESM-2 3B: ~11.4 GB (FP32) o ~3.2 GB - 3.4 GB (Q8_0)
         Ok(Self::esm2_3b())
     } else if file_len >= 2_000_000_000 {
-        // ESM-2 650M: ~2.60 GB (FP32)
+        // ESM-2 650M: ~2.60 GB (FP32: 2,604,342,104 bytes)
         Ok(Self::esm2_650m())
-    } else if file_len >= 700_000_000 {
-        // ESM-2 650M: ~732 MB - 780 MB (Q8_0)
+    } else if file_len >= 600_000_000 {
+        // ESM-2 650M: ~738.9 MB (Q8_0: 738,902,264 bytes)
         Ok(Self::esm2_650m())
     } else if file_len >= 450_000_000 {
         // ESM-2 150M: ~592.5 MB (FP32)
@@ -182,14 +208,14 @@ $$\frac{16}{8} = 2 \text{ YMM}, \quad \frac{24}{8} = 3 \text{ YMM}, \quad \frac{
 | **Dimensión FFN ($d_{\text{ffn}}$)** | 1,280 | 1,920 | 2,560 | 5,120 | 10,240 |
 | **Vocabulario** | 33 tokens | 33 tokens | 33 tokens | 33 tokens | 33 tokens |
 | **Parámetros Totales** | 7,523,042 (~7.5M) | 33,517,246 (~33.5M) | 148,161,290 (~148M) | 651,085,526 (~651M) | ~2.84B (~3B) |
-| **Tamaño Binario (FP32)** | ~30.1 MB | ~134.1 MB | ~592.6 MB | ~2.60 GB | ~11.36 GB |
-| **Tamaño Binario Cuantizado (`Q8_0`)** | ~8.5 MB | ~37.7 MB | ~166.5 MB | ~732 MB | ~3.19 GB |
-| **Latencia de Carga de Pesos** | **34 – 38 ms** | **117 – 122 ms** | **466 – 487 ms** | **~2.1 s** | **~8.5 s** |
-| **Throughput Autorregresivo (Generate)** | **>315 tokens/s** (~3.1 ms/tok) | **~80 – 85 tokens/s** (~11.8 ms/tok) | **~18 – 20 tokens/s** (~53.0 ms/tok) | **~3.8 – 4.5 tokens/s** | **~0.8 – 1.0 tokens/s** |
-| **Throughput Bidireccional (Inpaint)** | **>400 tokens/s** (~76 ms / $L=32$) | **~85 – 90 tokens/s** (~356 ms / $L=32$) | **~18 – 21 tokens/s** (~1,580 ms / $L=32$) | **~4.0 – 4.8 tokens/s** | **~0.9 – 1.1 tokens/s** |
+| **Tamaño Binario (FP32)** | 30,092,168 B (~30.1 MB) | 134,068,984 B (~134.1 MB) | 592,645,160 B (~592.6 MB) | **2,604,342,104 B (~2.60 GB)** | ~11.36 GB |
+| **Tamaño Binario Cuantizado (`Q8_0`)** | ~8.5 MB | ~37.7 MB | ~166.5 MB | **738,902,264 B (~738.9 MB)** | ~3.19 GB |
+| **Latencia de Carga de Pesos** | **34.8 ms** | **117.4 ms** | **466.8 ms** | **751 ms (FP32) / 219.98 ms (Q8_0)** | **~8.5 s** |
+| **Throughput Autorregresivo (Generate)** | **>315 tokens/s** (~3.1 ms/tok) | **~80 – 85 tokens/s** (~11.8 ms/tok) | **~18 – 20 tokens/s** (~53.0 ms/tok) | **4.57 tok/s (1T) -> 7.70 tok/s (2T Q8)** | **~0.8 – 1.0 tokens/s** |
+| **Throughput Bidireccional (Inpaint)** | **>400 tokens/s** (~76 ms / $L=32$) | **~85 – 90 tokens/s** (~356 ms / $L=32$) | **~18 – 21 tokens/s** (~1,580 ms / $L=32$) | **~4.8 tok/s (1T) -> ~8.2 tok/s (2T Q8)** | **~0.9 – 1.1 tokens/s** |
 | **Memoria de Estado de Trabajo ($L=128$)** | **~911 KB** | **~1,321 KB** | **~1,732 KB** | **~3,450 KB** | **~7,200 KB** |
-| **Residencia en Jerarquía de Caché** | **100% en Caché L3** ($\le 32$ MB) | Residencia Parcial en L3 / DDR | Transmisión (*streaming*) desde RAM ($> 500$ MB) | Transmisión RAM (>2.4 GB) | Transmisión Masiva RAM (>10 GB) |
-| **Demanda de Ancho de Banda de Memoria** | **Limitado por Cómputo (AVX/SIMD)** | **Balanceado Caché/DRAM** | **Limitado por Bus de Memoria** | **Limitado por DRAM** | **Extremadamente Limitado por DRAM** |
+| **Residencia en Jerarquía de Caché** | **100% en Caché L3** ($\le 32$ MB) | Residencia Parcial en L3 / DDR | Transmisión (*streaming*) desde RAM ($> 500$ MB) | Streaming DRAM (~2.48 GB FP32 / ~698 MB Q8) | Transmisión Masiva RAM (>10 GB) |
+| **Demanda de Ancho de Banda de Memoria** | **Limitado por Cómputo (AVX/SIMD)** | **Balanceado Caché/DRAM** | **Limitado por Bus de Memoria** | **Limitado por Bus (Optimizado Q8)** | **Extremadamente Limitado por DRAM** |
 | **Caso de Uso Primario** | DMS *in silico* ultrarrápido, inpainting en tiempo real | DMS de alta resolución, cribado de péptidos | Predicción de contactos 3D, diseño *de novo* | Mapas de contacto de alta fidelidad, DMS fino | Modelos de lenguaje de proteínas de frontera |
 
 ---
@@ -273,19 +299,23 @@ cargo build --release
 
 `codon-infer` estandariza los archivos binarios de pesos bajo una nomenclatura limpia y explícita:
 * **ESM-2 8M (`esm2_8m_weights.bin`):** Pre-empaquetado en la raíz del repositorio (~30 MB FP32) para inferencia instantánea sin configuraciones adicionales, desarrollo local y pruebas unitarias rápidas sin descargas externas.
-* **ESM-2 35M (`esm2_35m_weights.bin`):** Modelo de capacidad intermedia (~133 MB FP32), hospedado en [GitHub Releases](https://github.com/OsbaldoG/codon-infer/releases/tag/v1.4.0) para prevenir la sobrecarga del repositorio Git.
-* **ESM-2 150M (`esm2_150m_weights.bin`):** Modelo de alta fidelidad para predicción de contactos y bioinformática con calidad de publicación (~590 MB FP32), hospedado en [GitHub Releases](https://github.com/OsbaldoG/codon-infer/releases/tag/v1.4.0).
-* **ESM-2 650M (`esm2_650m_weights.bin`):** Modelo de investigación de gran capacidad (~2.6 GB FP32), hospedado en [GitHub Releases](https://github.com/OsbaldoG/codon-infer/releases/tag/v1.4.0).
-* **ESM-2 3B (`esm2_3b_weights.bin`):** Modelo de frontera para modelado de lenguaje de proteínas (~11.4 GB FP32 / ~3.2 GB Q8_0), hospedado en [GitHub Releases](https://github.com/OsbaldoG/codon-infer/releases/tag/v1.4.0).
+* **ESM-2 35M (`esm2_35m_weights.bin`):** Modelo de capacidad intermedia (~134 MB FP32), hospedado en [GitHub Releases](https://github.com/OsbaldoG/codon-infer/releases/tag/v1.5.0) para prevenir la sobrecarga del repositorio Git.
+* **ESM-2 150M (`esm2_150m_weights.bin`):** Modelo de alta fidelidad para predicción de contactos y bioinformática con calidad de publicación (~592 MB FP32), hospedado en [GitHub Releases](https://github.com/OsbaldoG/codon-infer/releases/tag/v1.5.0).
+* **ESM-2 650M FP32 (`esm2_650m_weights.bin`):** Modelo de investigación de gran capacidad (~2.60 GB FP32), hospedado en [GitHub Releases](https://github.com/OsbaldoG/codon-infer/releases/tag/v1.5.0).
+* **ESM-2 650M Q8_0 (`esm2_650m_q8_0.bin`):** Binario cuantizado nativo de alta capacidad (738.9 MB Q8_0), hospedado en [GitHub Releases](https://github.com/OsbaldoG/codon-infer/releases/tag/v1.5.0) para arranque zero-copy en 220 ms.
+* **ESM-2 3B (`esm2_3b_weights.bin`):** Modelo de frontera para modelado de lenguaje de proteínas (~11.4 GB FP32 / ~3.2 GB Q8_0), hospedado en [GitHub Releases](https://github.com/OsbaldoG/codon-infer/releases/tag/v1.5.0).
 
 #### Descarga Directa de Pesos vía `curl`
 Descargue directamente los pesos binarios deseados en la raíz del repositorio sin necesidad de reconstruirlos en Google Colab:
 ```bash
-# Descargar pesos de ESM-2 35M (~133 MB)
-curl -L -o esm2_35m_weights.bin https://github.com/OsbaldoG/codon-infer/releases/download/v1.4.0/esm2_35m_weights.bin
+# Descargar pesos de ESM-2 35M (~134 MB)
+curl -L -o esm2_35m_weights.bin https://github.com/OsbaldoG/codon-infer/releases/download/v1.5.0/esm2_35m_weights.bin
 
-# Descargar pesos de ESM-2 150M (~590 MB)
-curl -L -o esm2_150m_weights.bin https://github.com/OsbaldoG/codon-infer/releases/download/v1.4.0/esm2_150m_weights.bin
+# Descargar pesos de ESM-2 150M (~592 MB)
+curl -L -o esm2_150m_weights.bin https://github.com/OsbaldoG/codon-infer/releases/download/v1.5.0/esm2_150m_weights.bin
+
+# Descargar pesos de ESM-2 650M Q8_0 (738.9 MB)
+curl -L -o esm2_650m_q8_0.bin https://github.com/OsbaldoG/codon-infer/releases/download/v1.5.0/esm2_650m_q8_0.bin
 
 # O utilizar el script automatizado:
 ./scripts/download_weights.sh 35m
@@ -304,44 +334,50 @@ curl -L -o esm2_150m_weights.bin https://github.com/OsbaldoG/codon-infer/release
 ### 3. Ejecución de la Suite de Pruebas
 Valide las primitivas numéricas, la paridad de vectorización SIMD, el parser FASTA y los formatos de exportación:
 ```bash
-cargo test
+cargo test --release
 ```
 Salida esperada:
 ```text
-running 26 tests
+running 32 tests
 test benchmark::tests::test_benchmark_report_to_json_validity ... ok
 test benchmark::tests::test_discover_available_models ... ok
-test export::tests::test_json_string_serializers ... ok
 test fasta::tests::test_parse_multi_fasta_with_masks ... ok
+test export::tests::test_json_string_serializers ... ok
+test export::tests::test_dms_row_and_csv_generation ... ok
 test fasta::tests::test_parse_raw_sequence_fallback ... ok
 test fasta::tests::test_parse_simple_fasta ... ok
 test mcp::tests::test_mcp_json_parser_and_formatter ... ok
 test mcp::tests::test_mcp_resolve_record_fallback ... ok
-test export::tests::test_dms_row_and_csv_generation ... ok
 test tests::test_attention_simd_parity_dk_16_24_32 ... ok
 test tests::test_attention_simd_parity_dk_64 ... ok
 test mcp::tests::test_mcp_tools_list_schema ... ok
 test tests::test_esm_config_autodetection ... ok
 test tests::test_bidirectional_logits_entropy ... ok
+test mcp::tests::test_mcp_dispatch_with_weights_if_available ... ok
 test tests::test_forward_bidirectional_if_available ... ok
+test tests::test_forward_pass_with_weights_if_available ... ok
+test benchmark::tests::test_multi_scale_simd_parity ... ok
 test tests::test_layer_norm_stability ... ok
 test tests::test_log_softmax_canonical ... ok
 test tests::test_mask_token_encoding_and_decoding ... ok
 test tests::test_matmul_avx1_and_dispatch_parity ... ok
+test tests::test_matmul_fp32_parallel_parity ... ok
+test tests::test_matmul_q8_simd_parity ... ok
 test tests::test_q8_0_quantization_roundtrip ... ok
+test tests::test_forward_q8_cosine_similarity_8m ... ok
 test tests::test_simd_benchmark_parity_run ... ok
 test tests::test_softmax_sum_to_one ... ok
 test tests::test_tokenizer_boundaries ... ok
-test tests::test_forward_pass_with_weights_if_available ... ok
-test benchmark::tests::test_multi_scale_simd_parity ... ok
-test mcp::tests::test_mcp_dispatch_with_weights_if_available ... ok
+test tests::test_q8_weights_save_load_roundtrip ... ok
+test tests::test_forward_650m_if_available ... ok
+test tests::test_forward_650m_q8_and_multithread_if_available ... ok
 
-test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.34s
+test result: ok. 32 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.39s
 ```
 
 ### 4. Subcomandos y Pipelines Bioinformáticos
 
-Todos los subcomandos aceptan la bandera global `--model <RUTA>`. `codon-infer` detecta automáticamente si el archivo binario corresponde a **ESM-2 8M**, **35M**, **150M**, **650M** o **3B** (en precisión completa FP32 o cuantizado `Q8_0`) y autoconfigura los kernels vectoriales correspondientes.
+Todos los subcomandos aceptan las banderas globales `--model <RUTA>`, `--threads <N>` y `--quantize q8_0`. `codon-infer` detecta automáticamente si el archivo binario corresponde a **ESM-2 8M**, **35M**, **150M**, **650M** o **3B** (en precisión completa FP32 o cuantizado `Q8_0`) y autoconfigura los kernels vectoriales correspondientes.
 
 #### A. Generación Autorregresiva de Secuencias (`generate`)
 Ejecuta síntesis de secuencias peptídicas *de novo* o extensión de motivos funcionales:
@@ -349,9 +385,10 @@ Ejecuta síntesis de secuencias peptídicas *de novo* o extensión de motivos fu
 # Por defecto (pesos ESM-2 8M)
 codon-infer generate --sequence "MCMPCFTTDHQMARKCDD" --temperature 0.7 --max-tokens 40
 
-# Multi-escala: Ejecución con ESM-2 35M o 150M
+# Multi-escala: Ejecución con ESM-2 35M, 150M o 650M (con 2 hilos físicos)
 codon-infer generate --model esm2_35m_weights.bin --sequence "MCMPCFTTDHQMARKCDD" --temperature 0.7
 codon-infer generate --model esm2_150m_weights.bin --sequence "MCMPCFTTDHQMARKCDD" --temperature 0.7
+codon-infer generate --model esm2_650m_q8_0.bin --threads 2 --sequence "MCMPCFTTDHQMARKCDD" --temperature 0.7
 ```
 
 #### B. Inpainting Bidireccional y Reconstrucción de Motivos (`inpaint`)
@@ -360,8 +397,8 @@ Reconstruye posiciones faltantes, mutadas o enmascaradas en sitios activos (indi
 # Por defecto (ESM-2 8M)
 codon-infer inpaint --sequence "MCMPC*TTDHQMARKCDD"
 
-# Con pesos de mayor capacidad ESM-2 35M:
-codon-infer inpaint --model esm2_35m_weights.bin --sequence "MCMPC*TTDHQMARKCDD"
+# Con pesos de gran capacidad ESM-2 650M Q8_0 y paralelismo multinúcleo:
+codon-infer inpaint --model esm2_650m_q8_0.bin --threads 2 --sequence "MCMPC*TTDHQMARKCDD"
 ```
 
 #### C. Escaneo Mutacional Profundo *In Silico* (`dms`)
@@ -370,26 +407,39 @@ Ejecuta saturación mutagénica punto a punto con mapas de calor térmicos TrueC
 # Cribado masivo de alto rendimiento con ESM-2 8M:
 codon-infer dms --fasta proteins.fasta --window 128 --export-csv dms_matrix.csv --export-json dms_report.json
 
-# Escaneo de máxima precisión con ESM-2 150M:
+# Escaneo de alta precisión con ESM-2 150M o 650M:
 codon-infer dms --model esm2_150m_weights.bin --fasta target.fasta --window 128 --export-csv dms_150m.csv
+codon-infer dms --model esm2_650m_q8_0.bin --threads 2 --fasta target.fasta --window 128 --export-csv dms_650m.csv
 ```
 
 #### D. Predicción de Contactos Estructurales Residuales (`contacts`)
 Calcula acoplamientos epistáticos mediante mapas de atención multi-cabeza (con corrección APC) e identifica puentes disulfuro putativos:
 ```bash
-# Predicción de contactos 3D con ESM-2 150M para precisión de publicación:
+# Predicción de contactos 3D con ESM-2 150M o 650M para precisión de publicación:
 codon-infer contacts --model esm2_150m_weights.bin --fasta proteins.fasta --export-csv contacts.csv --export-json contacts.json
+codon-infer contacts --model esm2_650m_q8_0.bin --threads 2 --fasta proteins.fasta --export-csv contacts.csv
 ```
 
-#### E. Suite de Benchmarks de Hardware y Validación Biológica (`benchmark`)
+#### E. Cuantización Nativa de Modelos a Q8_0 (`quantize`)
+Convierte los pesos de puntos de control FP32 directamente en binarios zero-copy optimizados `Q8_0` en disco:
+```bash
+# Cuantizar pesos FP32 de ESM-2 650M (~2.60 GB) a binario directo Q8_0 (~738.9 MB):
+codon-infer quantize --model esm2_650m_weights.bin --output esm2_650m_q8_0.bin
+
+# Inferencia instantánea zero-copy utilizando el binario cuantizado resultante:
+codon-infer generate --model esm2_650m_q8_0.bin --threads 2 --sequence "MCMPCFTTDHQMARKCDD"
+```
+
+#### F. Suite de Benchmarks de Hardware y Validación Biológica (`benchmark`)
 Ejecuta la suite integral de estrés de microarquitectura y validación biológica sobre cualquier escala de modelo:
 ```bash
 # Ejecutar benchmark comparativo entre todas las variantes de pesos descubiertas (8M, 35M, 150M, 650M, 3B):
 codon-infer benchmark --suite full
 
-# Evaluar una variante de modelo específica:
+# Evaluar una variante de modelo específica con configuración personalizada de hilos:
 codon-infer benchmark --model esm2_35m_weights.bin --suite full
-codon-infer benchmark --model esm2_650m_weights.bin --suite full
+codon-infer benchmark --model esm2_650m_weights.bin --threads 2 --suite full
+codon-infer benchmark --model esm2_650m_q8_0.bin --threads 2 --suite full
 
 # Exportar reporte estructurado de rendimiento para análisis e integración continua (CI/CD):
 codon-infer benchmark --suite full --export-json benchmark_report.json
@@ -413,6 +463,7 @@ cargo run --release --bin codon-infer-mcp
 
 # Iniciar con pesos de mayor capacidad ESM-2 35M, 150M, 650M o 3B
 cargo run --release --bin codon-infer-mcp -- --model esm2_35m_weights.bin
+cargo run --release --bin codon-infer-mcp -- --model esm2_650m_q8_0.bin
 ```
 
 #### Herramientas Expuestas vía MCP:
@@ -431,6 +482,8 @@ cargo run --release --bin codon-infer-mcp -- --model esm2_35m_weights.bin
 | `-h`, `--help` | Muestra el panel de ayuda con la guía de subcomandos | - |
 | `-V`, `--version` | Muestra la versión y el motor vectorial SIMD activo | - |
 | `--model <RUTA>` | Ruta al binario personalizado de pesos ESM-2 en FP32 o Q8_0 (o `all` para benchmark comparativo) | `esm2_8m_weights.bin` |
+| `-t`, `--threads <N>` | Hilos de trabajo para la ejecución paralela matriz-vector | Núcleos físicos detectados |
+| `--quantize <q8_0>`, `--q8`| Ejecuta o convierte utilizando cuantización por bloques `Q8_0` nativa | `auto` |
 | `--export-json <RUTA>`| Exporta métricas de benchmark o análisis directamente a JSON | - |
 | `--color <auto\|always\|never>` | Controla el estilizado de la terminal mediante ANSI TrueColor | `auto` |
 | `--no-color` | Desactiva terminantemente los códigos de escape ANSI (estándar NO_COLOR) | `false` |
@@ -440,6 +493,7 @@ cargo run --release --bin codon-infer-mcp -- --model esm2_35m_weights.bin
 | :--- | :--- | :--- | :--- |
 | `--sequence <CADENA>` | `generate`, `inpaint`, `dms`, `contacts` | Secuencia de aminoácidos suministrada de forma directa | `"M"` |
 | `--fasta <RUTA>` | `generate`, `inpaint`, `dms`, `contacts` | Ruta al archivo FASTA (o `-` para leer de stdin) | - |
+| `--output <RUTA>` | `quantize` | Ruta de salida para el archivo binario cuantizado (`*_q8_0.bin`) | - |
 | `--export-csv <RUTA>`| `dms`, `contacts` | Ruta de destino para la matriz rectangular o tabla CSV | - |
 | `--export-json <RUTA>`| `dms`, `contacts`, `benchmark` | Ruta de destino para el informe estructurado en JSON | - |
 | `--window <USIZE>` | `dms` | Tamaño de ventana deslizante para proteínas largas | `128` |
@@ -460,13 +514,13 @@ codon-infer/
 ├── .cargo/
 │   └── config.toml         # Banderas de compilación nativa (-C target-cpu=native)
 ├── .gitignore              # Filtro de artefactos generados y copias de seguridad
-├── Cargo.toml              # Especificación cero dependencias (v1.4.0, edición 2024)
+├── Cargo.toml              # Especificación cero dependencias (v1.5.0, edición 2024)
 ├── esm2_8m_weights.bin     # Pesos FP32 de ESM-2 8M (7.51M parámetros, ~30 MB)
 ├── scripts/
 │   ├── download_weights.sh # Descargador veloz de pesos desde GitHub Releases
 │   └── export_weights.py   # Exportador de pesos desde HuggingFace y fair-esm
 ├── src/
-│   ├── lib.rs              # Núcleo del motor: matmul SIMD dual, RoPE split-half, Q8_0, EsmLMHead
+│   ├── lib.rs              # Núcleo del motor: ThreadPool persistente, GEMV Q8_0, atención SIMD, EsmLMHead
 │   ├── main.rs             # Despachador de CLI y parser de argumentos de subcomandos
 │   ├── ui.rs               # Paletas TrueColor ANSI, mapas de gradiente térmico y barra de progreso
 │   ├── fasta.rs            # Lector de flujos y secuencias multi-FASTA de cero copias
@@ -491,7 +545,9 @@ codon-infer/
 - [x] Micro-kernels vectoriales SIMD AVX-512 para el cómputo de atención con $d_k=64$.
 - [x] Formulación RoPE *split-half* y aproximación numérica precisa de GELU mediante `erf`.
 - [x] Integración completa del cabezal clasificador `EsmLMHead` (102,849 pesos).
-- [x] Cuantización por bloques `Q8_0` para optimización de residencia en caché L3.
+- [x] Cuantización por bloques `Q8_0` para optimización de residencia en caché L3 y ancho de banda DRAM.
+- [x] Motor de concurrencia persistente `ThreadPool` en `std` puro con barrera híbrida spin/futex.
+- [x] Soporte nativo y validado para ESM-2 650M y serialización binaria zero-copy `Q8_0`.
 - [x] Demonio estándar del protocolo Model Context Protocol (MCP) vía JSON-RPC (`codon-infer-mcp`).
 - [x] Modularización desacoplada: `lib.rs` (biblioteca núcleo), `main.rs` (CLI), `mcp.rs` (servidor MCP).
 - [ ] Implementación de micro-kernels SIMD ARM NEON para Apple Silicon (M1/M2/M3/M4) y Raspberry Pi.

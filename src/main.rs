@@ -22,12 +22,12 @@ fn print_help(theme: &TerminalTheme) {
     let logo = if theme.enabled {
         "\x1b[38;2;139;92;246m╔═══════════════════════════════════════════════════════════════════════════════╗\n\
          ║   \x1b[38;2;59;130;246mCODON-INFER\x1b[38;2;139;92;246m: High-Performance Zero-Allocation ESM-2 Engine in Pure Rust     ║\n\
-         ║   \x1b[38;2;16;185;129mVersion 1.5.0-dev\x1b[38;2;139;92;246m | Q8_0 & Scoped Multi-Thread R&D Suite (8M to 3B)       ║\n\
+         ║   \x1b[38;2;16;185;129mVersion 1.5.0\x1b[38;2;139;92;246m     | Q8_0 & Scoped Multi-Thread R&D Suite (8M to 3B)       ║\n\
          ╚═══════════════════════════════════════════════════════════════════════════════╝\x1b[0m"
     } else {
         "╔═══════════════════════════════════════════════════════════════════════════════╗\n\
          ║   CODON-INFER: High-Performance Zero-Allocation ESM-2 Engine in Pure Rust     ║\n\
-         ║   Version 1.5.0-dev | Q8_0 & Scoped Multi-Thread R&D Suite (8M to 3B)       ║\n\
+         ║   Version 1.5.0     | Q8_0 & Scoped Multi-Thread R&D Suite (8M to 3B)       ║\n\
          ╚═══════════════════════════════════════════════════════════════════════════════╝"
     };
     println!("{}", logo);
@@ -494,7 +494,7 @@ fn main() -> io::Result<()> {
                 prompt = rec.sequence;
             }
 
-            println!("--- Codon-Infer Engine V1.5-dev (Zero-Deps Multi-Scale CLI) ---");
+            println!("--- Codon-Infer Engine V1.5 (Zero-Deps Multi-Scale CLI) ---");
             println!("Active SIMD Backend:  {}", active_simd_backend());
             println!("Concurrency Threads:  {}", num_threads);
             println!("Execution Precision:  {}", if quantize_q8 { "Q8_0 (In-Memory Blocks)" } else { "FP32 (Canonical)" });

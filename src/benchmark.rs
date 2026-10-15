@@ -1555,7 +1555,7 @@ pub fn run_benchmark_cli(
     };
 
     println!("\n{}╔═══════════════════════════════════════════════════════════════════════════════════════════╗{}", c_border, c_reset);
-    println!("{}║   {}CODON-INFER: SUITE INTEGRAL DE BENCHMARKS Y VALIDACIÓN MULTI-ESCALA (v1.5.0-dev){}  {}║{}", c_border, c_hdr, c_reset, c_border, c_reset);
+    println!("{}║   {}CODON-INFER: SUITE INTEGRAL DE BENCHMARKS Y VALIDACIÓN MULTI-ESCALA (v1.5.0){}      {}║{}", c_border, c_hdr, c_reset, c_border, c_reset);
     println!("{}║   Vector Engine: {:<12} | Threads: {:<2} | Precision: {:<8} (std only)      ║{}",
         c_border, active_simd_backend(), num_threads, if quantize_q8 { "Q8_0" } else { "FP32" }, c_reset);
     println!("{}╚═══════════════════════════════════════════════════════════════════════════════════════════╝{}\n", c_border, c_reset);
