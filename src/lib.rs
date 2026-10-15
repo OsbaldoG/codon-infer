@@ -986,6 +986,25 @@ pub fn compute_cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
+pub fn compute_rmse(a: &[f32], b: &[f32]) -> f32 {
+    let len = a.len().min(b.len());
+    if len == 0 { return 0.0; }
+    let mut sum_sq = 0.0f64;
+    for i in 0..len {
+        let diff = (a[i] - b[i]) as f64;
+        sum_sq += diff * diff;
+    }
+    (sum_sq / len as f64).sqrt() as f32
+}
+
+pub fn dequantize_q4_to_vec(blocks: &[BlockQ4_0]) -> Vec<f32> {
+    let mut out = vec![0.0f32; blocks.len() * 32];
+    for (i, b) in blocks.iter().enumerate() {
+        b.dequantize_to(&mut out[i * 32..(i + 1) * 32]);
+    }
+    out
+}
+
 pub fn matmul_q8(out: &mut [f32], x: &[f32], w: &[BlockQ8_0], bias: &[f32], in_dim: usize, out_dim: usize) {
     debug_assert!(out.len() >= out_dim && bias.len() >= out_dim && x.len() >= in_dim);
     let blocks_per_row = in_dim / 32;
@@ -2830,6 +2849,17 @@ pub fn forward_bidirectional_parallel(
     state: &mut BidirectionalRunState,
     num_threads: usize,
 ) {
+    forward_bidirectional_parallel_ext(tokens, config, weights, state, num_threads, None);
+}
+
+pub fn forward_bidirectional_parallel_ext(
+    tokens: &[usize],
+    config: &EsmConfig,
+    weights: &EsmWeights,
+    state: &mut BidirectionalRunState,
+    num_threads: usize,
+    mut on_layer: Option<&mut dyn FnMut(usize, &[f32])>,
+) {
     let seq_len = tokens.len();
     assert!(seq_len <= state.max_len, "Sequence length {} exceeds max_len {}", seq_len, state.max_len);
     let dim = config.dim;
@@ -2975,6 +3005,10 @@ pub fn forward_bidirectional_parallel(
             gelu(&mut state.hb2, &state.hb);
             matmul_parallel(&mut state.xb, &state.hb2, &weights.fc2_weight[fc2_w_offset..fc2_w_offset + hidden_dim * dim], &weights.fc2_bias[layer_dim_offset..layer_dim_offset + dim], hidden_dim, dim, num_threads);
             for i in 0..dim { state.x[p * dim + i] += state.xb[i]; }
+        }
+
+        if let Some(ref mut cb) = on_layer {
+            cb(l, &state.x[0..seq_len * dim]);
         }
     }
 
@@ -3163,6 +3197,17 @@ pub fn forward_bidirectional_q4(
     state: &mut BidirectionalRunState,
     num_threads: usize,
 ) {
+    forward_bidirectional_q4_ext(tokens, config, weights, state, num_threads, None);
+}
+
+pub fn forward_bidirectional_q4_ext(
+    tokens: &[usize],
+    config: &EsmConfig,
+    weights: &EsmWeightsQ4,
+    state: &mut BidirectionalRunState,
+    num_threads: usize,
+    mut on_layer: Option<&mut dyn FnMut(usize, &[f32])>,
+) {
     let seq_len = tokens.len();
     assert!(seq_len <= state.max_len, "Sequence length {} exceeds max_len {}", seq_len, state.max_len);
     let dim = config.dim;
@@ -3315,6 +3360,10 @@ pub fn forward_bidirectional_q4(
             gelu(&mut state.hb2, &state.hb);
             matmul_q4_parallel(&mut state.xb, &state.hb2, &weights.fc2_weight[fc2_q4..fc2_q4 + q4_fc2_blocks], &weights.fc2_bias[layer_dim_offset..layer_dim_offset + dim], hidden_dim, dim, num_threads);
             for i in 0..dim { state.x[p * dim + i] += state.xb[i]; }
+        }
+
+        if let Some(ref mut cb) = on_layer {
+            cb(l, &state.x[0..seq_len * dim]);
         }
     }
 
@@ -4631,6 +4680,358 @@ mod tests_q4_simd {
         for i in 0..out_dim {
             assert!(out_pos_simd[i].is_finite());
             assert!(out_neg_simd[i].is_finite());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests_q4_integration {
+    use super::*;
+
+    #[test]
+    fn test_forward_q4_integration_8m() {
+        let q4_path = "esm2_8m_q4_0.bin";
+        if !std::path::Path::new(q4_path).exists() {
+            println!("Skipping test_forward_q4_integration_8m: file not found");
+            return;
+        }
+
+        let (config, weights_q4) = EsmWeightsQ4::load_from_file(q4_path).expect("8M Q4 weights must load");
+        assert_eq!(config.arch, EsmModelArch::Esm2_8M);
+
+        let mut state_q4 = RunState::new(&config);
+        forward_q4(20, 0, &config, &weights_q4, &mut state_q4, 4);
+
+        for &l in &state_q4.logits[..config.vocab_size] {
+            assert!(!l.is_nan() && !l.is_infinite(), "8M Q4 logits must be finite");
+        }
+
+        let fp32_path = "esm2_8m_weights.bin";
+        if std::path::Path::new(fp32_path).exists() {
+            let weights_fp = EsmWeights::from_file(fp32_path, &config).expect("FP32 weights must load");
+            let mut state_fp = RunState::new(&config);
+            forward(20, 0, &config, &weights_fp, &mut state_fp);
+
+            let cos_sim = compute_cosine_similarity(&state_fp.logits[4..=23], &state_q4.logits[4..=23]);
+            println!("8M Integration: Cosine similarity FP32 vs Q4_0 = {:.5}", cos_sim);
+            assert!(cos_sim >= 0.980, "8M Q4 cosine similarity {:.5} < 0.980", cos_sim);
+        }
+    }
+
+    #[test]
+    fn test_forward_q4_integration_35m() {
+        let q4_path = "esm2_35m_q4_0.bin";
+        if !std::path::Path::new(q4_path).exists() {
+            println!("Skipping test_forward_q4_integration_35m: file not found");
+            return;
+        }
+
+        let (config, weights_q4) = EsmWeightsQ4::load_from_file(q4_path).expect("35M Q4 weights must load");
+        assert_eq!(config.arch, EsmModelArch::Esm2_35M);
+
+        let mut state_q4 = RunState::new(&config);
+        forward_q4(20, 0, &config, &weights_q4, &mut state_q4, 4);
+
+        for &l in &state_q4.logits[..config.vocab_size] {
+            assert!(!l.is_nan() && !l.is_infinite(), "35M Q4 logits must be finite");
+        }
+
+        let fp32_path = "esm2_35m_weights.bin";
+        if std::path::Path::new(fp32_path).exists() {
+            let weights_fp = EsmWeights::from_file(fp32_path, &config).expect("FP32 weights must load");
+            let mut state_fp = RunState::new(&config);
+            forward_parallel(20, 0, &config, &weights_fp, &mut state_fp, 4);
+
+            let cos_sim = compute_cosine_similarity(&state_fp.logits[4..=23], &state_q4.logits[4..=23]);
+            println!("35M Integration: Cosine similarity FP32 vs Q4_0 = {:.5}", cos_sim);
+            assert!(cos_sim >= 0.980, "35M Q4 cosine similarity {:.5} < 0.980", cos_sim);
+        }
+    }
+
+    #[test]
+    fn test_forward_q4_integration_150m() {
+        let q4_path = "esm2_150m_q4_0.bin";
+        if !std::path::Path::new(q4_path).exists() {
+            println!("Skipping test_forward_q4_integration_150m: file not found");
+            return;
+        }
+
+        let (config, weights_q4) = EsmWeightsQ4::load_from_file(q4_path).expect("150M Q4 weights must load");
+        assert_eq!(config.arch, EsmModelArch::Esm2_150M);
+
+        let mut state_q4 = RunState::new(&config);
+        forward_q4(20, 0, &config, &weights_q4, &mut state_q4, 4);
+
+        for &l in &state_q4.logits[..config.vocab_size] {
+            assert!(!l.is_nan() && !l.is_infinite(), "150M Q4 logits must be finite");
+        }
+
+        let fp32_path = "esm2_150m_weights.bin";
+        if std::path::Path::new(fp32_path).exists() {
+            let weights_fp = EsmWeights::from_file(fp32_path, &config).expect("FP32 weights must load");
+            let mut state_fp = RunState::new(&config);
+            forward_parallel(20, 0, &config, &weights_fp, &mut state_fp, 4);
+
+            let cos_sim = compute_cosine_similarity(&state_fp.logits[4..=23], &state_q4.logits[4..=23]);
+            println!("150M Integration: Cosine similarity FP32 vs Q4_0 = {:.5}", cos_sim);
+            assert!(cos_sim >= 0.985, "150M Q4 cosine similarity {:.5} < 0.985", cos_sim);
+        }
+    }
+
+    #[test]
+    fn test_forward_q4_integration_650m() {
+        let q4_path = "esm2_650m_q4_0.bin";
+        if !std::path::Path::new(q4_path).exists() {
+            println!("Skipping test_forward_q4_integration_650m: file not found");
+            return;
+        }
+
+        let (config, weights_q4) = EsmWeightsQ4::load_from_file(q4_path).expect("650M Q4 weights must load");
+        assert_eq!(config.arch, EsmModelArch::Esm2_650M);
+
+        let mut state_q4 = RunState::new(&config);
+        forward_q4(20, 0, &config, &weights_q4, &mut state_q4, 4);
+
+        for &l in &state_q4.logits[..config.vocab_size] {
+            assert!(!l.is_nan() && !l.is_infinite(), "650M Q4 logits must be finite");
+        }
+
+        let fp32_path = "esm2_650m_weights.bin";
+        if std::path::Path::new(fp32_path).exists() {
+            let weights_fp = EsmWeights::from_file(fp32_path, &config).expect("FP32 weights must load");
+            let mut state_fp = RunState::new(&config);
+            forward_parallel(20, 0, &config, &weights_fp, &mut state_fp, 4);
+
+            let cos_sim = compute_cosine_similarity(&state_fp.logits[4..=23], &state_q4.logits[4..=23]);
+            println!("650M Integration: Cosine similarity FP32 vs Q4_0 = {:.5}", cos_sim);
+            assert!(cos_sim >= 0.940, "650M Q4 cosine similarity {:.5} < 0.940", cos_sim);
+        }
+    }
+
+    #[test]
+    fn test_forward_q8_codq_header_integration() {
+        let models = [
+            ("esm2_8m_q8_0.bin", EsmModelArch::Esm2_8M),
+            ("esm2_35m_q8_0.bin", EsmModelArch::Esm2_35M),
+            ("esm2_150m_q8_0.bin", EsmModelArch::Esm2_150M),
+            ("esm2_650m_q8_0_header.bin", EsmModelArch::Esm2_650M),
+        ];
+
+        for (path, expected_arch) in &models {
+            if !std::path::Path::new(path).exists() {
+                println!("Skipping {} integration test: file not found", path);
+                continue;
+            }
+
+            let (config, weights_q8) = EsmWeightsQ8::load_from_file(path).expect("Q8 weights must load");
+            assert_eq!(config.arch, *expected_arch, "Architecture mismatch for {}", path);
+
+            let mut state_q8 = RunState::new(&config);
+            forward_q8(20, 0, &config, &weights_q8, &mut state_q8, 4);
+
+            for &l in &state_q8.logits[..config.vocab_size] {
+                assert!(!l.is_nan() && !l.is_infinite(), "Q8 logits for {} must be finite", path);
+            }
+            println!("Validated CODQ Q8_0 forward pass for '{}'", path);
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn test_generate_validation_report() {
+        use std::time::Instant;
+
+        let scales = [
+            ("8M", "esm2_8m_weights.bin", "esm2_8m_q8_0.bin", "esm2_8m_q4_0.bin", EsmConfig::esm2_8m()),
+            ("35M", "esm2_35m_weights.bin", "esm2_35m_q8_0.bin", "esm2_35m_q4_0.bin", EsmConfig::esm2_35m()),
+            ("150M", "esm2_150m_weights.bin", "esm2_150m_q8_0.bin", "esm2_150m_q4_0.bin", EsmConfig::esm2_150m()),
+            ("650M", "esm2_650m_weights.bin", "esm2_650m_q8_0_header.bin", "esm2_650m_q4_0.bin", EsmConfig::esm2_650m()),
+        ];
+
+        let seq = "AQVGDSGGPMLCNGQLQGVTSWGYVCAQPEYPGVYTEVS";
+        let tokens = Tokenizer::encode(seq);
+        let seq_len = tokens.len();
+        let num_threads = 4;
+
+        println!("\n=========================================================================================");
+        println!("               CODON-INFER v1.6.0 Q4_0 & Q8_0 MULTI-SCALE VALIDATION REPORT              ");
+        println!("=========================================================================================\n");
+
+        for (scale_name, fp32_path, q8_path, q4_path, config) in &scales {
+            println!("#########################################################################################");
+            println!(" SCALE: {} ({})", scale_name, config.model_name());
+            println!("#########################################################################################");
+
+            if !std::path::Path::new(fp32_path).exists() || !std::path::Path::new(q4_path).exists() || !std::path::Path::new(q8_path).exists() {
+                println!("Skipping {}: one or more weights files not found.", scale_name);
+                continue;
+            }
+
+            let fp32_size = std::fs::metadata(fp32_path).unwrap().len();
+            let q8_size = std::fs::metadata(q8_path).unwrap().len();
+            let q4_size = std::fs::metadata(q4_path).unwrap().len();
+
+            println!("\n--- [1] TAMAÑO EN DISCO Y COMPRESIÓN ---");
+            println!(" * FP32:  {:>12} bytes ({:>8.2} MB)", fp32_size, fp32_size as f64 / 1_048_576.0);
+            println!(" * Q8_0:  {:>12} bytes ({:>8.2} MB) | Compresión real: {:.2}x (Teórica matriz: 3.56x)",
+                q8_size, q8_size as f64 / 1_048_576.0, fp32_size as f64 / q8_size as f64);
+            println!(" * Q4_0:  {:>12} bytes ({:>8.2} MB) | Compresión real: {:.2}x (Teórica matriz: 6.40x)",
+                q4_size, q4_size as f64 / 1_048_576.0, fp32_size as f64 / q4_size as f64);
+
+            let t_load = Instant::now();
+            let weights_fp = EsmWeights::from_file(fp32_path, config).expect("FP32 weights must load");
+            let weights_q4 = EsmWeightsQ4::load_from_file(q4_path).expect("Q4 weights must load").1;
+            let weights_q8 = EsmWeightsQ8::load_from_file(q8_path).expect("Q8 weights must load").1;
+            println!(" * Carga en memoria completada en {:.2} ms", t_load.elapsed().as_secs_f64() * 1000.0);
+
+            // Matrix-by-matrix fidelity
+            println!("\n--- [2] FIDELIDAD NUMÉRICA POR MATRIZ (FP32 vs Q4_0) ---");
+            let mut worst_mat_cos = 1.0f32;
+            let mut worst_mat_rmse = 0.0f32;
+            let mut worst_mat_name = String::new();
+
+            // token embedding
+            let dequant_emb = dequantize_q4_to_vec(&weights_q4.token_embedding_table);
+            let emb_cos = compute_cosine_similarity(&weights_fp.token_embedding_table, &dequant_emb);
+            let emb_rmse = compute_rmse(&weights_fp.token_embedding_table, &dequant_emb);
+            println!(" * token_embedding_table: Cosine = {:.6}, RMSE = {:.6}", emb_cos, emb_rmse);
+            if emb_cos < worst_mat_cos { worst_mat_cos = emb_cos; worst_mat_rmse = emb_rmse; worst_mat_name = "token_embedding_table".to_string(); }
+
+            let dim = config.dim;
+            let hidden_dim = config.hidden_dim;
+            let q4_matrix_blocks = dim * (dim / 32);
+            let q4_fc1_blocks = hidden_dim * (dim / 32);
+            let q4_fc2_blocks = dim * (hidden_dim / 32);
+
+            let mut sum_cos_wq = 0.0f32;
+            let mut sum_cos_fc1 = 0.0f32;
+            let mut sum_cos_fc2 = 0.0f32;
+
+            for l in 0..config.n_layers {
+                let layer_mat_fp = l * dim * dim;
+                let layer_mat_q4 = l * q4_matrix_blocks;
+
+                // wq
+                let dequant_wq = dequantize_q4_to_vec(&weights_q4.wq[layer_mat_q4..layer_mat_q4 + q4_matrix_blocks]);
+                let cos_wq = compute_cosine_similarity(&weights_fp.wq[layer_mat_fp..layer_mat_fp + dim * dim], &dequant_wq);
+                let rmse_wq = compute_rmse(&weights_fp.wq[layer_mat_fp..layer_mat_fp + dim * dim], &dequant_wq);
+                sum_cos_wq += cos_wq;
+                if cos_wq < worst_mat_cos { worst_mat_cos = cos_wq; worst_mat_rmse = rmse_wq; worst_mat_name = format!("layer_{}.wq", l); }
+
+                // wk
+                let dequant_wk = dequantize_q4_to_vec(&weights_q4.wk[layer_mat_q4..layer_mat_q4 + q4_matrix_blocks]);
+                let cos_wk = compute_cosine_similarity(&weights_fp.wk[layer_mat_fp..layer_mat_fp + dim * dim], &dequant_wk);
+                let rmse_wk = compute_rmse(&weights_fp.wk[layer_mat_fp..layer_mat_fp + dim * dim], &dequant_wk);
+                if cos_wk < worst_mat_cos { worst_mat_cos = cos_wk; worst_mat_rmse = rmse_wk; worst_mat_name = format!("layer_{}.wk", l); }
+
+                // wv
+                let dequant_wv = dequantize_q4_to_vec(&weights_q4.wv[layer_mat_q4..layer_mat_q4 + q4_matrix_blocks]);
+                let cos_wv = compute_cosine_similarity(&weights_fp.wv[layer_mat_fp..layer_mat_fp + dim * dim], &dequant_wv);
+                let rmse_wv = compute_rmse(&weights_fp.wv[layer_mat_fp..layer_mat_fp + dim * dim], &dequant_wv);
+                if cos_wv < worst_mat_cos { worst_mat_cos = cos_wv; worst_mat_rmse = rmse_wv; worst_mat_name = format!("layer_{}.wv", l); }
+
+                // wo
+                let dequant_wo = dequantize_q4_to_vec(&weights_q4.wo[layer_mat_q4..layer_mat_q4 + q4_matrix_blocks]);
+                let cos_wo = compute_cosine_similarity(&weights_fp.wo[layer_mat_fp..layer_mat_fp + dim * dim], &dequant_wo);
+                let rmse_wo = compute_rmse(&weights_fp.wo[layer_mat_fp..layer_mat_fp + dim * dim], &dequant_wo);
+                if cos_wo < worst_mat_cos { worst_mat_cos = cos_wo; worst_mat_rmse = rmse_wo; worst_mat_name = format!("layer_{}.wo", l); }
+
+                // fc1
+                let fc1_fp = l * dim * hidden_dim;
+                let fc1_q4 = l * q4_fc1_blocks;
+                let dequant_fc1 = dequantize_q4_to_vec(&weights_q4.fc1_weight[fc1_q4..fc1_q4 + q4_fc1_blocks]);
+                let cos_fc1 = compute_cosine_similarity(&weights_fp.fc1_weight[fc1_fp..fc1_fp + dim * hidden_dim], &dequant_fc1);
+                let rmse_fc1 = compute_rmse(&weights_fp.fc1_weight[fc1_fp..fc1_fp + dim * hidden_dim], &dequant_fc1);
+                sum_cos_fc1 += cos_fc1;
+                if cos_fc1 < worst_mat_cos { worst_mat_cos = cos_fc1; worst_mat_rmse = rmse_fc1; worst_mat_name = format!("layer_{}.fc1", l); }
+
+                // fc2
+                let fc2_fp = l * hidden_dim * dim;
+                let fc2_q4 = l * q4_fc2_blocks;
+                let dequant_fc2 = dequantize_q4_to_vec(&weights_q4.fc2_weight[fc2_q4..fc2_q4 + q4_fc2_blocks]);
+                let cos_fc2 = compute_cosine_similarity(&weights_fp.fc2_weight[fc2_fp..fc2_fp + hidden_dim * dim], &dequant_fc2);
+                let rmse_fc2 = compute_rmse(&weights_fp.fc2_weight[fc2_fp..fc2_fp + hidden_dim * dim], &dequant_fc2);
+                sum_cos_fc2 += cos_fc2;
+                if cos_fc2 < worst_mat_cos { worst_mat_cos = cos_fc2; worst_mat_rmse = rmse_fc2; worst_mat_name = format!("layer_{}.fc2", l); }
+            }
+
+            println!(" * Promedio Coseno Atencion (wq): {:.6}", sum_cos_wq / config.n_layers as f32);
+            println!(" * Promedio Coseno FFN1 (fc1):    {:.6}", sum_cos_fc1 / config.n_layers as f32);
+            println!(" * Promedio Coseno FFN2 (fc2):    {:.6}", sum_cos_fc2 / config.n_layers as f32);
+            println!(" * PEOR CASO MATRIZ: {} -> Coseno = {:.6}, RMSE = {:.6}", worst_mat_name, worst_mat_cos, worst_mat_rmse);
+
+            // Forward pass with layer tracking
+            println!("\n--- [3] INFERENCIA EN test_peptidase.fasta (SeqLen={}) ---", seq_len);
+            let mut state_fp = BidirectionalRunState::new(config, seq_len + 8);
+            let mut fp_layers: Vec<Vec<f32>> = Vec::new();
+            forward_bidirectional_parallel_ext(&tokens, config, &weights_fp, &mut state_fp, num_threads, Some(&mut |_l, x_slice| {
+                fp_layers.push(x_slice.to_vec());
+            }));
+
+            let mut state_q4 = BidirectionalRunState::new(config, seq_len + 8);
+            let mut q4_layers: Vec<Vec<f32>> = Vec::new();
+            forward_bidirectional_q4_ext(&tokens, config, &weights_q4, &mut state_q4, num_threads, Some(&mut |_l, x_slice| {
+                q4_layers.push(x_slice.to_vec());
+            }));
+
+            let mut state_q8 = BidirectionalRunState::new(config, seq_len + 8);
+            forward_bidirectional_q8(&tokens, config, &weights_q8, &mut state_q8, num_threads);
+
+            // Final embeddings fidelity
+            let emb_len = seq_len * dim;
+            let cos_emb_q4 = compute_cosine_similarity(&state_fp.x[0..emb_len], &state_q4.x[0..emb_len]);
+            let rmse_emb_q4 = compute_rmse(&state_fp.x[0..emb_len], &state_q4.x[0..emb_len]);
+            let cos_emb_q8 = compute_cosine_similarity(&state_fp.x[0..emb_len], &state_q8.x[0..emb_len]);
+            let rmse_emb_q8 = compute_rmse(&state_fp.x[0..emb_len], &state_q8.x[0..emb_len]);
+
+            println!(" * Embeddings Finales FP32 vs Q8_0: Coseno = {:.6}, RMSE = {:.6}", cos_emb_q8, rmse_emb_q8);
+            println!(" * Embeddings Finales FP32 vs Q4_0: Coseno = {:.6}, RMSE = {:.6}", cos_emb_q4, rmse_emb_q4);
+
+            // Final logits fidelity
+            let log_len = seq_len * config.vocab_size;
+            let cos_log_q4 = compute_cosine_similarity(&state_fp.logits[0..log_len], &state_q4.logits[0..log_len]);
+            let rmse_log_q4 = compute_rmse(&state_fp.logits[0..log_len], &state_q4.logits[0..log_len]);
+            let cos_log_q8 = compute_cosine_similarity(&state_fp.logits[0..log_len], &state_q8.logits[0..log_len]);
+            let rmse_log_q8 = compute_rmse(&state_fp.logits[0..log_len], &state_q8.logits[0..log_len]);
+
+            println!(" * Logits Finales FP32 vs Q8_0:     Coseno = {:.6}, RMSE = {:.6}", cos_log_q8, rmse_log_q8);
+            println!(" * Logits Finales FP32 vs Q4_0:     Coseno = {:.6}, RMSE = {:.6}", cos_log_q4, rmse_log_q4);
+
+            println!("\n * DESGLOSE CAPA POR CAPA (Coseno FP32 vs Q4_0 de Hidden States):");
+            let step = if config.n_layers > 12 { config.n_layers / 6 } else { 1 };
+            for l in 0..config.n_layers {
+                let cos_l = compute_cosine_similarity(&fp_layers[l], &q4_layers[l]);
+                let rmse_l = compute_rmse(&fp_layers[l], &q4_layers[l]);
+                if l == 0 || l == config.n_layers - 1 || l % step == 0 {
+                    println!("    - Capa {:>2}/{:>2}: Coseno = {:.6}, RMSE = {:.6}", l + 1, config.n_layers, cos_l, rmse_l);
+                }
+            }
+
+            // Latency benchmark
+            println!("\n--- [4] LATENCIA DE INFERENCIA ({} hilos, promedio 5 iteraciones) ---", num_threads);
+            // FP32 latency
+            let iters = 5;
+            for _ in 0..2 { forward_bidirectional_parallel(&tokens, config, &weights_fp, &mut state_fp, num_threads); }
+            let t0_fp = Instant::now();
+            for _ in 0..iters { forward_bidirectional_parallel(&tokens, config, &weights_fp, &mut state_fp, num_threads); }
+            let lat_fp = (t0_fp.elapsed().as_secs_f64() * 1000.0) / iters as f64;
+
+            // Q8_0 latency
+            for _ in 0..2 { forward_bidirectional_q8(&tokens, config, &weights_q8, &mut state_q8, num_threads); }
+            let t0_q8 = Instant::now();
+            for _ in 0..iters { forward_bidirectional_q8(&tokens, config, &weights_q8, &mut state_q8, num_threads); }
+            let lat_q8 = (t0_q8.elapsed().as_secs_f64() * 1000.0) / iters as f64;
+
+            // Q4_0 latency
+            for _ in 0..2 { forward_bidirectional_q4(&tokens, config, &weights_q4, &mut state_q4, num_threads); }
+            let t0_q4 = Instant::now();
+            for _ in 0..iters { forward_bidirectional_q4(&tokens, config, &weights_q4, &mut state_q4, num_threads); }
+            let lat_q4 = (t0_q4.elapsed().as_secs_f64() * 1000.0) / iters as f64;
+
+            println!(" * Latencia FP32:  {:>8.2} ms", lat_fp);
+            println!(" * Latencia Q8_0:  {:>8.2} ms (Speedup: {:.2}x)", lat_q8, lat_fp / lat_q8);
+            println!(" * Latencia Q4_0:  {:>8.2} ms (Speedup: {:.2}x)", lat_q4, lat_fp / lat_q4);
+            println!();
         }
     }
 }

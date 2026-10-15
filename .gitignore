@@ -39,6 +39,9 @@ esm2_3b_weights.bin
 # Quantized Weights & External Checkpoints
 *.q8_0.bin
 *.q4_0.bin
+*_q8_0*.bin
+*_q4_0*.bin
+esm2_8m_q*.bin
 *_quantized.bin
 checkpoints/
 models/
