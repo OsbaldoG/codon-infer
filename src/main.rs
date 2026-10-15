@@ -114,6 +114,7 @@ pub fn load_model_weights(
         let mut magic = [0u8; 4];
         if file.read_exact(&mut magic).is_ok() && magic == CODQ_MAGIC {
             let _ = file.rewind();
+            #[allow(clippy::collapsible_if)]
             if let Ok(header) = CodqHeader::read_from(&mut file) {
                 if let Ok(config) = header.to_config() {
                     match header.dtype {
@@ -746,13 +747,7 @@ fn main() -> io::Result<()> {
                 _ => {
                     if let Some(ref out) = output_path_arg {
                         let out_lower = out.to_lowercase();
-                        if out_lower.contains("q4_0") || out_lower.contains("q4") {
-                            true
-                        } else if out_lower.contains("q8_0") || out_lower.contains("q8") {
-                            false
-                        } else {
-                            false
-                        }
+                        out_lower.contains("q4_0") || out_lower.contains("q4")
                     } else {
                         false
                     }

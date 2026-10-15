@@ -1,4 +1,18 @@
-#![allow(unused_unsafe, unsafe_op_in_unsafe_fn)]
+#![allow(
+    unused_unsafe,
+    unsafe_op_in_unsafe_fn,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::needless_range_loop,
+    clippy::missing_safety_doc,
+    clippy::manual_is_multiple_of,
+    clippy::manual_div_ceil,
+    clippy::excessive_precision,
+    clippy::collapsible_if,
+    clippy::manual_strip,
+    clippy::let_and_return,
+    clippy::chunks_exact_to_as_chunks
+)]
 use std::fs::File;
 use std::io::{self, Read, Seek, Write};
 use std::sync::{Arc, Mutex, Condvar, OnceLock};
@@ -208,6 +222,21 @@ pub struct EsmWeights {
 impl EsmWeights {
     pub fn from_file(model_path: &str, config: &EsmConfig) -> io::Result<Self> {
         let mut file = File::open(model_path)?;
+        let mut magic = [0u8; 4];
+        if file.read_exact(&mut magic).is_ok() && magic == CODQ_MAGIC {
+            file.rewind()?;
+            let header = CodqHeader::read_from(&mut file)?;
+            header.validate(config)?;
+            if header.dtype != DTYPE_FP32 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Expected FP32 model in EsmWeights::from_file, found dtype={}", header.dtype),
+                ));
+            }
+            file.seek(io::SeekFrom::Start(64))?;
+        } else {
+            file.rewind()?;
+        }
         let token_embedding_table = read_floats(&mut file, config.vocab_size * config.dim)?;
         let ln_1_weight = read_floats(&mut file, config.n_layers * config.dim)?;
         let ln_1_bias = read_floats(&mut file, config.n_layers * config.dim)?;
@@ -544,8 +573,23 @@ impl EsmWeightsQ8 {
     }
 
     pub fn load_or_convert(model_path: &str, config: &EsmConfig) -> io::Result<Self> {
-        let is_q8_file = model_path.ends_with(".q8") || model_path.ends_with(".q8.bin");
-        if is_q8_file {
+        let is_q8 = if let Ok(mut f) = File::open(model_path) {
+            let mut magic = [0u8; 4];
+            if f.read_exact(&mut magic).is_ok() && magic == CODQ_MAGIC {
+                let _ = f.rewind();
+                if let Ok(hdr) = CodqHeader::read_from(&mut f) {
+                    hdr.dtype == DTYPE_Q8_0
+                } else {
+                    false
+                }
+            } else {
+                model_path.ends_with(".q8") || model_path.ends_with(".q8.bin") || model_path.contains("q8")
+            }
+        } else {
+            model_path.ends_with(".q8") || model_path.ends_with(".q8.bin") || model_path.contains("q8")
+        };
+
+        if is_q8 {
             Self::from_file(model_path, config)
         } else {
             let fp32 = EsmWeights::from_file(model_path, config)?;
@@ -743,7 +787,7 @@ impl BlockQ4_0 {
     pub fn quantize(src: &[f32]) -> Self {
         assert!(src.len() >= 32, "Source length must be at least 32 elements");
         let mut max = 0.0f32;
-        for &v in src {
+        for &v in &src[0..32] {
             if v.abs() > max.abs() {
                 max = v;
             }
@@ -790,6 +834,7 @@ pub fn read_q4_blocks(file: &mut File, num_blocks: usize) -> io::Result<Vec<Bloc
     Ok(blocks)
 }
 
+#[allow(clippy::manual_slice_size_calculation)]
 pub fn write_q4_blocks(file: &mut File, blocks: &[BlockQ4_0]) -> io::Result<()> {
     let byte_slice = unsafe {
         std::slice::from_raw_parts(
@@ -941,11 +986,31 @@ impl EsmWeightsQ4 {
     }
 
     pub fn load_or_convert(model_path: &str, config: &EsmConfig) -> io::Result<Self> {
-        let is_q4_file = model_path.ends_with(".q4")
-            || model_path.ends_with(".q4.bin")
-            || model_path.ends_with(".q4_0")
-            || model_path.ends_with(".q4_0.bin");
-        if is_q4_file {
+        let is_q4 = if let Ok(mut f) = File::open(model_path) {
+            let mut magic = [0u8; 4];
+            if f.read_exact(&mut magic).is_ok() && magic == CODQ_MAGIC {
+                let _ = f.rewind();
+                if let Ok(hdr) = CodqHeader::read_from(&mut f) {
+                    hdr.dtype == DTYPE_Q4_0
+                } else {
+                    false
+                }
+            } else {
+                model_path.ends_with(".q4")
+                    || model_path.ends_with(".q4.bin")
+                    || model_path.ends_with(".q4_0")
+                    || model_path.ends_with(".q4_0.bin")
+                    || model_path.contains("q4")
+            }
+        } else {
+            model_path.ends_with(".q4")
+                || model_path.ends_with(".q4.bin")
+                || model_path.ends_with(".q4_0")
+                || model_path.ends_with(".q4_0.bin")
+                || model_path.contains("q4")
+        };
+
+        if is_q4 {
             Self::from_file(model_path, config)
         } else {
             let fp32 = EsmWeights::from_file(model_path, config)?;
@@ -1023,6 +1088,7 @@ pub fn matmul_q8(out: &mut [f32], x: &[f32], w: &[BlockQ8_0], bias: &[f32], in_d
     }
 }
 
+#[allow(clippy::uninit_vec, clippy::manual_slice_size_calculation)]
 fn read_floats(file: &mut File, num_floats: usize) -> io::Result<Vec<f32>> {
     let mut floats = Vec::<f32>::with_capacity(num_floats);
     unsafe {
@@ -1042,6 +1108,7 @@ fn read_floats(file: &mut File, num_floats: usize) -> io::Result<Vec<f32>> {
     Ok(floats)
 }
 
+#[allow(clippy::manual_slice_size_calculation)]
 fn write_floats(file: &mut File, floats: &[f32]) -> io::Result<()> {
     let byte_slice = unsafe {
         std::slice::from_raw_parts(
@@ -1052,6 +1119,7 @@ fn write_floats(file: &mut File, floats: &[f32]) -> io::Result<()> {
     file.write_all(byte_slice)
 }
 
+#[allow(clippy::uninit_vec, clippy::manual_slice_size_calculation)]
 fn read_q8_blocks(file: &mut File, num_blocks: usize) -> io::Result<Vec<BlockQ8_0>> {
     let mut blocks = Vec::<BlockQ8_0>::with_capacity(num_blocks);
     unsafe {
@@ -1065,6 +1133,7 @@ fn read_q8_blocks(file: &mut File, num_blocks: usize) -> io::Result<Vec<BlockQ8_
     Ok(blocks)
 }
 
+#[allow(clippy::manual_slice_size_calculation)]
 fn write_q8_blocks(file: &mut File, blocks: &[BlockQ8_0]) -> io::Result<()> {
     let byte_slice = unsafe {
         std::slice::from_raw_parts(
@@ -1348,6 +1417,7 @@ impl ThreadPool {
         }
     }
 
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn run_parallel(
         &self,
         num_threads: usize,
@@ -1591,6 +1661,12 @@ pub fn matmul_q8_simd(
     in_dim: usize,
     out_dim: usize,
 ) {
+    assert!(out.len() >= out_dim, "out len {} < out_dim {}", out.len(), out_dim);
+    assert!(bias.len() >= out_dim, "bias len {} < out_dim {}", bias.len(), out_dim);
+    assert!(x.len() >= in_dim, "x len {} < in_dim {}", x.len(), in_dim);
+    assert!(in_dim % 32 == 0, "in_dim {} must be multiple of 32", in_dim);
+    let blocks_per_row = in_dim / 32;
+    assert!(w.len() >= out_dim * blocks_per_row, "w len {} < expected {}", w.len(), out_dim * blocks_per_row);
     #[cfg(target_arch = "x86_64")]
     {
         if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
@@ -1823,6 +1899,12 @@ pub fn matmul_q4_simd(
     in_dim: usize,
     out_dim: usize,
 ) {
+    assert!(out.len() >= out_dim, "out len {} < out_dim {}", out.len(), out_dim);
+    assert!(bias.len() >= out_dim, "bias len {} < out_dim {}", bias.len(), out_dim);
+    assert!(x.len() >= in_dim, "x len {} < in_dim {}", x.len(), in_dim);
+    assert!(in_dim % 32 == 0, "in_dim {} must be multiple of 32", in_dim);
+    let blocks_per_row = in_dim / 32;
+    assert!(w.len() >= out_dim * blocks_per_row, "w len {} < expected {}", w.len(), out_dim * blocks_per_row);
     #[cfg(target_arch = "x86_64")]
     {
         if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
