@@ -2,6 +2,8 @@
 
 > **High-Performance, Zero-Allocation Multi-Scale ESM-2 Protein Language Model Inference Engine & Bioinformatic Pipeline in Pure Rust (v1.4.0).**
 
+[🇪🇸 Read in Spanish (README_ES.md)](README_ES.md)
+
 [![Rust](https://img.shields.io/badge/rust-2024_edition-orange.svg)](https://www.rust-lang.org/)
 [![Version](https://img.shields.io/badge/version-1.4.0-blue.svg)]()
 [![Dependencies](https://img.shields.io/badge/dependencies-0%20(pure%20std)-brightgreen.svg)]()
@@ -97,7 +99,7 @@ Starting with version **v1.4.0**, `codon-infer` provides native, first-class sup
                             (RunState / BidirectionalRunState)
 ```
 
-### 1. Autodetección Paramétrica sin Metadatos (`detect_from_file_len`)
+### 1. Parametric Autodetection without Metadata (`detect_from_file_len`)
 Traditional Python deep learning frameworks require external configuration files (`config.json`, tokenizer configurations, model manifests, etc.) alongside weight tensors. `codon-infer` eliminates this friction through a deterministic byte-length heuristic:
 
 ```rust
@@ -116,7 +118,7 @@ pub fn detect_from_file_len(file_len: u64) -> io::Result<Self> {
 ```
 Any custom weights binary supplied via `--model <PATH>` is identified and validated at boot time in $< 0.1\text{ ms}$, automatically resizing all internal inference buffers, KV-caches, and embedding projections with zero runtime allocation overhead.
 
-### 2. Optimización SIMD y Despacho Dinámico de Atención Heterogénea
+### 2. SIMD Optimization and Heterogeneous Attention Dynamic Dispatch
 In multi-head attention, every head has dimension $d_k = d_{\text{model}} / H$. Because all ESM-2 variants standardize on $H=20$ attention heads, the head dimensions differ across model scales:
 * **8M:** $d_k = 320 / 20 = 16$ floats
 * **35M:** $d_k = 480 / 20 = 24$ floats
@@ -130,23 +132,23 @@ $$\frac{16}{8} = 2 \text{ registers}, \quad \frac{24}{8} = 3 \text{ registers}, 
 * **Value Vector Accumulation ($V \times \text{prob}$):** `accumulate_value_head_avx` broadcasts the scalar probability across an entire vector (`_mm256_set1_ps`) and executes direct vector multiply-accumulate operations (`_mm256_add_ps` + `_mm256_mul_ps`) straight into the output head accumulator.
 * **Scalar Parity Guarantee:** Unit tests (`test_attention_simd_parity_dk_16_24_32`) enforce mathematical equivalence with scalar reference loops under a strict tolerance threshold ($\Delta < 10^{-5}$) across all 3 head dimensions.
 
-### 3. Matriz Técnica Comparativa de Arquitectura y Rendimiento
+### 3. Architectural and Performance Technical Comparison Matrix
 
-| Parámetro / Métrica | ESM-2 8M (`esm2_t6_8M_UR50D`) | ESM-2 35M (`esm2_t12_35M_UR50D`) | ESM-2 150M (`esm2_t30_150M_UR50D`) |
+| Parameter / Metric | ESM-2 8M (`esm2_t6_8M_UR50D`) | ESM-2 35M (`esm2_t12_35M_UR50D`) | ESM-2 150M (`esm2_t30_150M_UR50D`) |
 | :--- | :--- | :--- | :--- |
-| **Capas Transformer ($L$)** | 6 | 12 | 30 |
-| **Dimensión Oculta ($d_{\text{model}}$)** | 320 | 480 | 640 |
-| **Cabezas de Atención ($H$)** | 20 | 20 | 20 |
-| **Dimensión por Cabeza ($d_k$)** | 16 | 24 | 32 |
-| **Registros AVX (`__m256`) por Cabeza** | **2 registers** (16 floats) | **3 registers** (24 floats) | **4 registers** (32 floats) |
-| **Dimensión FFN ($d_{\text{ffn}}$)** | 1,280 | 1,920 | 2,560 |
-| **Vocabulario** | 33 tokens | 33 tokens | 33 tokens |
-| **Parámetros Totales** | 7,511,809 (~7.5M) | 33,524,449 (~33.5M) | 148,011,297 (~148M) |
-| **Tamaño Binario (FP32)** | ~30.0 MB | ~134.1 MB | ~592.5 MB |
-| **Tamaño Binario Cuantizado (`Q8_0`)** | ~11.5 MB | ~48.2 MB | ~178.6 MB |
-| **Residencia en Jerarquía de Caché** | **100% en Caché L3** (32 MB) | Residencia Parcial en L3 (64 MB L3D) | Streaming desde RAM |
-| **Rendimiento Típico CPU (tokens/s)** | **>200 tokens/s** | **~90 – 110 tokens/s** | **~25 – 35 tokens/s** |
-| **Caso de Uso Primario** | In silico DMS rápido, inpainting en tiempo real | DMS de alta resolución, screening de péptidos | Predicción de contactos 3D, diseño de novo |
+| **Transformer Layers ($L$)** | 6 | 12 | 30 |
+| **Hidden Dimension ($d_{\text{model}}$)** | 320 | 480 | 640 |
+| **Attention Heads ($H$)** | 20 | 20 | 20 |
+| **Head Dimension ($d_k$)** | 16 | 24 | 32 |
+| **AVX Registers (`__m256`) per Head** | **2 registers** (16 floats) | **3 registers** (24 floats) | **4 registers** (32 floats) |
+| **FFN Dimension ($d_{\text{ffn}}$)** | 1,280 | 1,920 | 2,560 |
+| **Vocabulary** | 33 tokens | 33 tokens | 33 tokens |
+| **Total Parameters** | 7,511,809 (~7.5M) | 33,524,449 (~33.5M) | 148,011,297 (~148M) |
+| **Binary Size (FP32)** | ~30.0 MB | ~134.1 MB | ~592.5 MB |
+| **Quantized Binary Size (`Q8_0`)** | ~11.5 MB | ~48.2 MB | ~178.6 MB |
+| **Cache Hierarchy Residency** | **100% in L3 Cache** (32 MB) | Partial Residency in L3 (64 MB L3D) | Streaming from RAM |
+| **Typical CPU Throughput (tokens/s)** | **>200 tokens/s** | **~90 – 110 tokens/s** | **~25 – 35 tokens/s** |
+| **Primary Use Case** | Fast in silico DMS, real-time inpainting | High-resolution DMS, peptide screening | 3D contact prediction, de novo design |
 
 ---
 
@@ -382,7 +384,8 @@ codon-infer/
 │   └── mcp_main.rs         # Standalone MCP server executable entrypoint
 ├── AUDIT_REPORT.md         # Comprehensive architectural & mathematical audit report
 ├── LICENSE                 # MIT License
-└── README.md               # Project documentation
+├── README.md               # Main project documentation (English)
+└── README_ES.md            # Complete project documentation (Spanish)
 ```
 
 ---
