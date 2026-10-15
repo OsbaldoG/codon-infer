@@ -465,6 +465,83 @@ impl EsmWeightsQ8 {
     }
 }
 
+// ============================================================================
+// CODON QUANTIZED BINARY HEADER (CODQ) SPECIFICATION (v1.6.0)
+// ============================================================================
+
+pub const CODQ_MAGIC: [u8; 4] = *b"CODQ";
+pub const CODQ_VERSION: u32 = 1;
+
+pub const DTYPE_FP32: u32 = 0;
+pub const DTYPE_Q8_0: u32 = 1;
+pub const DTYPE_Q4_0: u32 = 2;
+
+pub const ARCH_8M: u32 = 0;
+pub const ARCH_35M: u32 = 1;
+pub const ARCH_150M: u32 = 2;
+pub const ARCH_650M: u32 = 3;
+pub const ARCH_3B: u32 = 4;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CodqHeader {
+    pub magic: [u8; 4],
+    pub version: u32,
+    pub dtype: u32,
+    pub arch: u32,
+    pub n_layers: u32,
+    pub dim: u32,
+    pub hidden_dim: u32,
+    pub vocab_size: u32,
+    pub reserved: [u8; 32],
+}
+
+const _: () = assert!(core::mem::size_of::<CodqHeader>() == 64);
+const _: () = assert!(core::mem::align_of::<CodqHeader>() == 4);
+
+// ============================================================================
+// BLOCK Q4_0 DATA STRUCTURE & QUANTIZATION SKELETON
+// ============================================================================
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct BlockQ4_0 {
+    pub d: f32,          // Delta (escala float32)
+    pub qs: [u8; 16],    // 16 bytes = 32 valores cuantizados a 4 bits
+}
+
+const _: () = assert!(core::mem::size_of::<BlockQ4_0>() == 20);
+const _: () = assert!(core::mem::align_of::<BlockQ4_0>() == 4);
+
+impl BlockQ4_0 {
+    pub fn quantize(_src: &[f32]) -> Self {
+        todo!("Subagent A: BlockQ4_0::quantize")
+    }
+
+    #[inline]
+    pub fn dequantize_to(&self, _dst: &mut [f32]) {
+        todo!("Subagent A: BlockQ4_0::dequantize_to")
+    }
+}
+
+pub fn quantize_slice_to_q4(_src: &[f32]) -> Vec<BlockQ4_0> {
+    todo!("Subagent A: quantize_slice_to_q4")
+}
+
+pub struct EsmWeightsQ4 {
+    pub token_embedding_table: Vec<BlockQ4_0>,
+    pub ln_1_weight: Vec<f32>, pub ln_1_bias: Vec<f32>,
+    pub wq: Vec<BlockQ4_0>, pub bq: Vec<f32>,
+    pub wk: Vec<BlockQ4_0>, pub bk: Vec<f32>,
+    pub wv: Vec<BlockQ4_0>, pub bv: Vec<f32>,
+    pub wo: Vec<BlockQ4_0>, pub bo: Vec<f32>,
+    pub ln_2_weight: Vec<f32>, pub ln_2_bias: Vec<f32>,
+    pub fc1_weight: Vec<BlockQ4_0>, pub fc1_bias: Vec<f32>,
+    pub fc2_weight: Vec<BlockQ4_0>, pub fc2_bias: Vec<f32>,
+    pub ln_f_weight: Vec<f32>, pub ln_f_bias: Vec<f32>,
+    pub classifier_weights: Vec<f32>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuantizationMode {
     Fp32,
@@ -1143,6 +1220,44 @@ pub fn matmul_q8_parallel(
         out_dim,
     };
     get_global_pool().run_parallel(num_threads, run_q8_slice, &job as *const _ as *const ());
+}
+
+// ============================================================================
+// MATMUL Q4_0 KERNELS SKELETON
+// ============================================================================
+
+pub fn matmul_q4(
+    _out: &mut [f32],
+    _x: &[f32],
+    _w: &[BlockQ4_0],
+    _bias: &[f32],
+    _in_dim: usize,
+    _out_dim: usize,
+) {
+    todo!("Subagent B: matmul_q4 scalar reference kernel")
+}
+
+pub fn matmul_q4_simd(
+    _out: &mut [f32],
+    _x: &[f32],
+    _w: &[BlockQ4_0],
+    _bias: &[f32],
+    _in_dim: usize,
+    _out_dim: usize,
+) {
+    todo!("Subagent B: matmul_q4_simd runtime dispatch")
+}
+
+pub fn matmul_q4_parallel(
+    _out: &mut [f32],
+    _x: &[f32],
+    _w: &[BlockQ4_0],
+    _bias: &[f32],
+    _in_dim: usize,
+    _out_dim: usize,
+    _num_threads: usize,
+) {
+    todo!("Subagent B: matmul_q4_parallel ThreadPool dispatch")
 }
 
 #[cfg(target_arch = "x86_64")]

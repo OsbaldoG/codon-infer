@@ -4,4 +4,4 @@ version = 4
 
 [[package]]
 name = "codon-infer"
-version = "1.5.0"
+version = "1.6.0-dev"
