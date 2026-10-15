@@ -37,7 +37,17 @@ benchmark_report*.json
 *_pesos.bin
 esm2_35m*.bin
 esm2_150m*.bin
+esm2_650m*.bin
+esm2_3b*.bin
 *_35m_*.bin
 *_150m_*.bin
+*_650m_*.bin
+*_3b_*.bin
 esm2_35m_weights.bin
 esm2_150m_weights.bin
+esm2_650m_weights.bin
+esm2_3b_weights.bin
+
+# Architecture & R&D Notes
+SCALING_ESM2_650M_3B_ANALYSIS.md
+

@@ -1021,6 +1021,8 @@ pub fn discover_available_models() -> Vec<String> {
         "esm2_8m_weights.bin",
         "esm2_35m_weights.bin",
         "esm2_150m_weights.bin",
+        "esm2_650m_weights.bin",
+        "esm2_3b_weights.bin",
     ];
     let mut found = Vec::new();
     for c in &candidates {
@@ -1062,6 +1064,20 @@ pub fn benchmark_model_performance(
             "RAM Streaming Bound (>500 MB)",
             "Memory-Bus Limited",
         ),
+        EsmModelArch::Esm2_650M => (
+            "ESM-2 650M",
+            "esm2_t33_650M_UR50D",
+            650_000_000,
+            "RAM Streaming Bound (>2.4 GB)",
+            "Memory-Bus Limited",
+        ),
+        EsmModelArch::Esm2_3B => (
+            "ESM-2 3B",
+            "esm2_t36_3B_UR50D",
+            3_000_000_000,
+            "NUMA / RAM Streaming (>10 GB)",
+            "Memory-Bus Limited",
+        ),
     };
 
     let weights_size_bytes = std::fs::metadata(model_path).map(|m| m.len()).unwrap_or(0);
@@ -1078,6 +1094,8 @@ pub fn benchmark_model_performance(
         crate::EsmModelArch::Esm2_8M => 40,
         crate::EsmModelArch::Esm2_35M => 20,
         crate::EsmModelArch::Esm2_150M => 8,
+        crate::EsmModelArch::Esm2_650M => 4,
+        crate::EsmModelArch::Esm2_3B => 2,
     };
     let t_ar = Instant::now();
     for i in 0..ar_steps {
@@ -1106,6 +1124,7 @@ pub fn benchmark_model_performance(
         crate::EsmModelArch::Esm2_8M => 12,
         crate::EsmModelArch::Esm2_35M => 6,
         crate::EsmModelArch::Esm2_150M => 2,
+        crate::EsmModelArch::Esm2_650M | crate::EsmModelArch::Esm2_3B => 1,
     };
     let t_bi = Instant::now();
     for _ in 0..bi_iters {
@@ -1542,6 +1561,7 @@ pub fn run_benchmark_cli(
             crate::EsmModelArch::Esm2_8M => 2_500,
             crate::EsmModelArch::Esm2_35M => 1_000,
             crate::EsmModelArch::Esm2_150M => 300,
+            crate::EsmModelArch::Esm2_650M | crate::EsmModelArch::Esm2_3B => 100,
         };
         let rep = run_hardware_stress(total_stress_tokens, &pw, &pc);
         println!("│ Total Processed Tokens:     {:<60} │", rep.total_tokens);

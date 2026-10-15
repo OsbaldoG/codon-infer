@@ -48,16 +48,28 @@ By eliminating Python, PyTorch, C/CUDA runtimes, and external third-party crates
 
 ## 📊 Performance & Benchmarks
 
-Benchmarked on Linux x86_64 (CPU single-thread execution, native vector instructions):
+Benchmarked on Linux x86_64 (CPU single-thread execution, native vector instructions AVX/AVX2+FMA):
 
-| Metric | PyTorch / Python Baseline | `codon-infer` v1.0 (Scalar) | `codon-infer` v1.2 (Dual SIMD) | Cumulative Advantage |
-| :--- | :--- | :--- | :--- | :--- |
-| **Dependencies** | Python, PyTorch, CUDA (~4–7 GB) | Pure `std` (0 crates) | **Pure `std` (0 crates)** | **~99.9% smaller** |
-| **Executable Size** | Multi-gigabyte runtime | ~4.2 MB executable | **~1.5 MB release binary** | **Ultra-portable** |
-| **Model Load Latency** | ~2,500 – 4,000 ms | ~38 – 110 ms | **30 – 50 ms** | **~60x faster** |
-| **Memory Footprint (RAM)** | ~1.5 – 2.5 GB RSS | ~35 MB static RSS | **~35 MB (FP32) / ~12 MB (Q8_0)** | **~50x leaner** |
-| **Inference Throughput** | ~15 – 35 tokens/sec (CPU) | ~128 – 137 tokens/sec | **>200 tokens/sec** | **~6x – 13x faster** |
-| **Memory Allocation** | Continuous GC pauses | Zero runtime allocs | **0 allocations (Deterministic)** | **Real-time hard guarantees** |
+### 1. Contrast vs. Python / PyTorch Baseline
+The architectural migration to pure Rust with deterministic zero-allocation guarantees dramatically outperforms the standard Python/PyTorch ecosystem across all operational metrics:
+
+| Metric | PyTorch / Python Baseline (ESM-2 8M) | `codon-infer` v1.4 (Pure Rust + SIMD) | Engineering Advantage |
+| :--- | :--- | :--- | :--- |
+| **Dependencies** | Python, PyTorch, LibTorch, CUDA (~4–7 GB) | **Pure `std` (0 crates, 0 dynamic dependencies)** | **~99.9% smaller footprint** |
+| **Executable Size** | Multi-gigabyte runtime environment | **~1.5 MB release binary** | **Ultra-portable single binary** |
+| **Model Load Latency** | ~2,500 – 4,000 ms (PyTorch initialization) | **34.8 ms (8M) / 117.4 ms (35M) / 466.8 ms (150M)** | **~60x – 100x faster startup** |
+| **Memory Footprint (RAM)** | ~1.5 – 2.5 GB RSS baseline | **~35 MB static RSS (8M FP32) / ~12 MB (Q8_0)** | **~50x leaner memory consumption** |
+| **Inference Throughput** | ~15 – 35 tokens/sec (CPU single-thread) | **~333.3 tokens/sec (8M) / 84.7 tok/s (35M)** | **~10x – 22x faster execution** |
+| **Memory Allocation** | Continuous GC pauses & tensor churn | **0 heap allocations in inference hot-path** | **Deterministic real-time guarantees** |
+
+### 2. Multi-Scale Real Performance Matrix (ESM-2 8M, 35M, and 150M)
+Measured with `codon-infer benchmark --suite full` under CPU single-thread execution with native SIMD dispatch:
+
+| Model Scale | Layer Depth ($L$) | Hidden Dim ($d$) | Attention Heads ($H \times d_k$) | Weight Load Latency | Autoregressive Throughput | Bidirectional ($L=32$) | Working State Buffer ($L=128$) | Cache Hierarchy & Memory Regime |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **ESM-2 8M** | 6 | 320 | $20 \times 16$ (2 AVX regs) | **34.8 ms** | **~333.3 tokens/s** (3.0 ms/tok) | **~418.8 tokens/s** (76.4 ms) | **911.0 KB** | **100% L3 Resident** ($\le 32$ MB) · Compute-Bound |
+| **ESM-2 35M** | 12 | 480 | $20 \times 24$ (3 AVX regs) | **117.4 ms** | **~84.7 tokens/s** (11.8 ms/tok) | **~89.9 tokens/s** (356.1 ms) | **1,321.2 KB** | **Partial L3 / DDR Streaming** · Balanced Cache/DRAM |
+| **ESM-2 150M** | 30 | 640 | $20 \times 32$ (4 AVX regs) | **466.8 ms** | **~18.9 tokens/s** (53.0 ms/tok) | **~20.2 tokens/s** (1,583.7 ms) | **1,731.5 KB** | **RAM Streaming Bound** ($>500$ MB) · Memory-Bus Limited |
 
 ---
 

@@ -33,6 +33,8 @@ pub enum EsmModelArch {
     Esm2_8M,
     Esm2_35M,
     Esm2_150M,
+    Esm2_650M,
+    Esm2_3B,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +85,30 @@ impl EsmConfig {
         }
     }
 
+    pub fn esm2_650m() -> Self {
+        Self {
+            dim: 1280,
+            hidden_dim: 5120,
+            n_layers: 33,
+            n_heads: 20,
+            vocab_size: 33,
+            max_seq_len: 1024,
+            arch: EsmModelArch::Esm2_650M,
+        }
+    }
+
+    pub fn esm2_3b() -> Self {
+        Self {
+            dim: 2560,
+            hidden_dim: 10240,
+            n_layers: 36,
+            n_heads: 40,
+            vocab_size: 33,
+            max_seq_len: 1024,
+            arch: EsmModelArch::Esm2_3B,
+        }
+    }
+
     #[inline]
     pub fn head_dim(&self) -> usize {
         self.dim / self.n_heads
@@ -93,13 +119,20 @@ impl EsmConfig {
             EsmModelArch::Esm2_8M => "ESM-2 8M (esm2_t6_8M_UR50D)",
             EsmModelArch::Esm2_35M => "ESM-2 35M (esm2_t12_35M_UR50D)",
             EsmModelArch::Esm2_150M => "ESM-2 150M (esm2_t30_150M_UR50D)",
+            EsmModelArch::Esm2_650M => "ESM-2 650M (esm2_t33_650M_UR50D)",
+            EsmModelArch::Esm2_3B => "ESM-2 3B (esm2_t36_3B_UR50D)",
         }
     }
 
     /// Autodetects ESM-2 model architecture from weights file length in bytes.
+    /// Supports FP32 weights binaries as well as future quantized weights representations.
     pub fn detect_from_file_len(file_len: u64) -> io::Result<Self> {
         let floats = file_len / 4;
-        if floats >= 140_000_000 {
+        if floats >= 2_500_000_000 || file_len >= 10_000_000_000 {
+            Ok(Self::esm2_3b())
+        } else if floats >= 600_000_000 || file_len >= 2_400_000_000 {
+            Ok(Self::esm2_650m())
+        } else if floats >= 140_000_000 {
             Ok(Self::esm2_150m())
         } else if floats >= 30_000_000 {
             Ok(Self::esm2_35m())
@@ -109,7 +142,7 @@ impl EsmConfig {
             Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "Unrecognized ESM-2 weights size: {} bytes ({} floats). Expected ~30MB (8M), ~133MB (35M), or ~591MB (150M).",
+                    "Unrecognized ESM-2 weights size: {} bytes ({} floats). Expected ~30MB (8M), ~133MB (35M), ~591MB (150M), ~2.4GB (650M), or ~10GB (3B).",
                     file_len, floats
                 ),
             ))
@@ -387,6 +420,7 @@ impl BidirectionalRunState {
 pub fn active_simd_backend() -> &'static str {
     #[cfg(target_arch = "x86_64")]
     {
+        if std::is_x86_feature_detected!("avx512f") { return "AVX-512 (512-bit Vector Engine)"; }
         if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") { return "AVX2+FMA (256-bit Fused Multiply-Add)"; }
         if std::is_x86_feature_detected!("avx") { return "AVX1 (256-bit Sandy Bridge Vector Engine)"; }
     }
@@ -506,6 +540,23 @@ pub unsafe fn dot_product_head_avx(q: *const f32, k: *const f32, head_dim: usize
             let s3 = _mm256_mul_ps(_mm256_loadu_ps(q.add(24)), _mm256_loadu_ps(k.add(24)));
             hsum256_ps_avx(_mm256_add_ps(_mm256_add_ps(s0, s1), _mm256_add_ps(s2, s3)))
         }
+        64 => {
+            let s0 = _mm256_mul_ps(_mm256_loadu_ps(q), _mm256_loadu_ps(k));
+            let s1 = _mm256_mul_ps(_mm256_loadu_ps(q.add(8)), _mm256_loadu_ps(k.add(8)));
+            let s2 = _mm256_mul_ps(_mm256_loadu_ps(q.add(16)), _mm256_loadu_ps(k.add(16)));
+            let s3 = _mm256_mul_ps(_mm256_loadu_ps(q.add(24)), _mm256_loadu_ps(k.add(24)));
+            let s4 = _mm256_mul_ps(_mm256_loadu_ps(q.add(32)), _mm256_loadu_ps(k.add(32)));
+            let s5 = _mm256_mul_ps(_mm256_loadu_ps(q.add(40)), _mm256_loadu_ps(k.add(40)));
+            let s6 = _mm256_mul_ps(_mm256_loadu_ps(q.add(48)), _mm256_loadu_ps(k.add(48)));
+            let s7 = _mm256_mul_ps(_mm256_loadu_ps(q.add(56)), _mm256_loadu_ps(k.add(56)));
+            let sum01 = _mm256_add_ps(s0, s1);
+            let sum23 = _mm256_add_ps(s2, s3);
+            let sum45 = _mm256_add_ps(s4, s5);
+            let sum67 = _mm256_add_ps(s6, s7);
+            let sum0123 = _mm256_add_ps(sum01, sum23);
+            let sum4567 = _mm256_add_ps(sum45, sum67);
+            hsum256_ps_avx(_mm256_add_ps(sum0123, sum4567))
+        }
         _ => {
             let mut sum = 0.0f32;
             for i in 0..head_dim {
@@ -546,12 +597,70 @@ pub unsafe fn accumulate_value_head_avx(out: *mut f32, v: *const f32, prob: f32,
             _mm256_storeu_ps(out.add(16), o2);
             _mm256_storeu_ps(out.add(24), o3);
         }
+        64 => {
+            let o0 = _mm256_add_ps(_mm256_loadu_ps(out), _mm256_mul_ps(p_vec, _mm256_loadu_ps(v)));
+            let o1 = _mm256_add_ps(_mm256_loadu_ps(out.add(8)), _mm256_mul_ps(p_vec, _mm256_loadu_ps(v.add(8))));
+            let o2 = _mm256_add_ps(_mm256_loadu_ps(out.add(16)), _mm256_mul_ps(p_vec, _mm256_loadu_ps(v.add(16))));
+            let o3 = _mm256_add_ps(_mm256_loadu_ps(out.add(24)), _mm256_mul_ps(p_vec, _mm256_loadu_ps(v.add(24))));
+            let o4 = _mm256_add_ps(_mm256_loadu_ps(out.add(32)), _mm256_mul_ps(p_vec, _mm256_loadu_ps(v.add(32))));
+            let o5 = _mm256_add_ps(_mm256_loadu_ps(out.add(40)), _mm256_mul_ps(p_vec, _mm256_loadu_ps(v.add(40))));
+            let o6 = _mm256_add_ps(_mm256_loadu_ps(out.add(48)), _mm256_mul_ps(p_vec, _mm256_loadu_ps(v.add(48))));
+            let o7 = _mm256_add_ps(_mm256_loadu_ps(out.add(56)), _mm256_mul_ps(p_vec, _mm256_loadu_ps(v.add(56))));
+            _mm256_storeu_ps(out, o0);
+            _mm256_storeu_ps(out.add(8), o1);
+            _mm256_storeu_ps(out.add(16), o2);
+            _mm256_storeu_ps(out.add(24), o3);
+            _mm256_storeu_ps(out.add(32), o4);
+            _mm256_storeu_ps(out.add(40), o5);
+            _mm256_storeu_ps(out.add(48), o6);
+            _mm256_storeu_ps(out.add(56), o7);
+        }
         _ => {
             for i in 0..head_dim {
                 *out.add(i) += prob * *v.add(i);
             }
         }
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+pub unsafe fn dot_product_head_avx512_d64(q: *const f32, k: *const f32) -> f32 {
+    use std::arch::x86_64::*;
+    let q0 = _mm512_loadu_ps(q);
+    let k0 = _mm512_loadu_ps(k);
+    let mut acc0 = _mm512_mul_ps(q0, k0);
+
+    let q1 = _mm512_loadu_ps(q.add(16));
+    let k1 = _mm512_loadu_ps(k.add(16));
+    acc0 = _mm512_fmadd_ps(q1, k1, acc0);
+
+    let q2 = _mm512_loadu_ps(q.add(32));
+    let k2 = _mm512_loadu_ps(k.add(32));
+    acc0 = _mm512_fmadd_ps(q2, k2, acc0);
+
+    let q3 = _mm512_loadu_ps(q.add(48));
+    let k3 = _mm512_loadu_ps(k.add(48));
+    acc0 = _mm512_fmadd_ps(q3, k3, acc0);
+
+    _mm512_reduce_add_ps(acc0)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+pub unsafe fn accumulate_value_head_avx512_d64(out: *mut f32, v: *const f32, prob: f32) {
+    use std::arch::x86_64::*;
+    let p_vec = _mm512_set1_ps(prob);
+
+    let o0 = _mm512_fmadd_ps(p_vec, _mm512_loadu_ps(v), _mm512_loadu_ps(out));
+    let o1 = _mm512_fmadd_ps(p_vec, _mm512_loadu_ps(v.add(16)), _mm512_loadu_ps(out.add(16)));
+    let o2 = _mm512_fmadd_ps(p_vec, _mm512_loadu_ps(v.add(32)), _mm512_loadu_ps(out.add(32)));
+    let o3 = _mm512_fmadd_ps(p_vec, _mm512_loadu_ps(v.add(48)), _mm512_loadu_ps(out.add(48)));
+
+    _mm512_storeu_ps(out, o0);
+    _mm512_storeu_ps(out.add(16), o1);
+    _mm512_storeu_ps(out.add(32), o2);
+    _mm512_storeu_ps(out.add(48), o3);
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -570,18 +679,35 @@ unsafe fn attention_head_avx1(
     inv_scale: f32,
 ) {
     let q_ptr = q_head.as_ptr();
-    for t in 0..=pos {
-        let k_ptr = key_cache.as_ptr().add(layer_kv_base + t * dim + q_offset);
-        let score = dot_product_head_avx(q_ptr, k_ptr, head_dim);
-        *att_head.get_unchecked_mut(t) = score * inv_scale;
+    let has_avx512 = head_dim == 64 && std::is_x86_feature_detected!("avx512f");
+    if has_avx512 {
+        for t in 0..=pos {
+            let k_ptr = key_cache.as_ptr().add(layer_kv_base + t * dim + q_offset);
+            let score = dot_product_head_avx512_d64(q_ptr, k_ptr);
+            *att_head.get_unchecked_mut(t) = score * inv_scale;
+        }
+    } else {
+        for t in 0..=pos {
+            let k_ptr = key_cache.as_ptr().add(layer_kv_base + t * dim + q_offset);
+            let score = dot_product_head_avx(q_ptr, k_ptr, head_dim);
+            *att_head.get_unchecked_mut(t) = score * inv_scale;
+        }
     }
     softmax(&mut att_head[0..=pos]);
     xb2_head.fill(0.0);
     let out_ptr = xb2_head.as_mut_ptr();
-    for t in 0..=pos {
-        let prob = *att_head.get_unchecked(t);
-        let v_ptr = value_cache.as_ptr().add(layer_kv_base + t * dim + q_offset);
-        accumulate_value_head_avx(out_ptr, v_ptr, prob, head_dim);
+    if has_avx512 {
+        for t in 0..=pos {
+            let prob = *att_head.get_unchecked(t);
+            let v_ptr = value_cache.as_ptr().add(layer_kv_base + t * dim + q_offset);
+            accumulate_value_head_avx512_d64(out_ptr, v_ptr, prob);
+        }
+    } else {
+        for t in 0..=pos {
+            let prob = *att_head.get_unchecked(t);
+            let v_ptr = value_cache.as_ptr().add(layer_kv_base + t * dim + q_offset);
+            accumulate_value_head_avx(out_ptr, v_ptr, prob, head_dim);
+        }
     }
 }
 
@@ -660,7 +786,7 @@ pub fn forward(token: usize, pos: usize, config: &EsmConfig, weights: &EsmWeight
     state.x.copy_from_slice(&weights.token_embedding_table[embed_offset..embed_offset + dim]);
     let head_dim = dim / config.n_heads; let inv_scale = 1.0 / (head_dim as f32).sqrt();
     #[cfg(target_arch = "x86_64")]
-    let has_avx = std::is_x86_feature_detected!("avx") && (head_dim == 16 || head_dim == 24 || head_dim == 32);
+    let has_avx = std::is_x86_feature_detected!("avx") && (head_dim == 16 || head_dim == 24 || head_dim == 32 || head_dim == 64);
     for l in 0..config.n_layers {
         let layer_dim_offset = l * dim; let layer_matrix_offset = l * dim * dim;
         layer_norm(&mut state.xb, &state.x, &weights.ln_1_weight[layer_dim_offset..layer_dim_offset + dim], &weights.ln_1_bias[layer_dim_offset..layer_dim_offset + dim]);
@@ -769,7 +895,9 @@ pub fn forward_bidirectional(
         }
 
         #[cfg(target_arch = "x86_64")]
-        let has_avx = std::is_x86_feature_detected!("avx") && (head_dim == 16 || head_dim == 24 || head_dim == 32);
+        let has_avx512 = head_dim == 64 && std::is_x86_feature_detected!("avx512f");
+        #[cfg(target_arch = "x86_64")]
+        let has_avx = std::is_x86_feature_detected!("avx") && (head_dim == 16 || head_dim == 24 || head_dim == 32 || head_dim == 64);
 
         for p in 0..seq_len {
             for h in 0..config.n_heads {
@@ -778,7 +906,15 @@ pub fn forward_bidirectional(
                 let att_head = &mut state.att[h * state.max_len..h * state.max_len + seq_len];
 
                 #[cfg(target_arch = "x86_64")]
-                if has_avx {
+                if has_avx512 {
+                    let q_ptr = q_head.as_ptr();
+                    for t in 0..seq_len {
+                        let k_offset = t * dim + h * head_dim;
+                        let k_ptr = unsafe { state.k.as_ptr().add(k_offset) };
+                        let score = unsafe { dot_product_head_avx512_d64(q_ptr, k_ptr) };
+                        att_head[t] = score * inv_scale;
+                    }
+                } else if has_avx {
                     let q_ptr = q_head.as_ptr();
                     for t in 0..seq_len {
                         let k_offset = t * dim + h * head_dim;
@@ -807,7 +943,15 @@ pub fn forward_bidirectional(
                 let out_head = &mut state.out_att[p * dim + h * head_dim..p * dim + (h + 1) * head_dim];
                 out_head.fill(0.0);
                 #[cfg(target_arch = "x86_64")]
-                if has_avx {
+                if has_avx512 {
+                    let out_ptr = out_head.as_mut_ptr();
+                    for t in 0..seq_len {
+                        let prob = att_head[t];
+                        let v_offset = t * dim + h * head_dim;
+                        let v_ptr = unsafe { state.v.as_ptr().add(v_offset) };
+                        unsafe { accumulate_value_head_avx512_d64(out_ptr, v_ptr, prob); }
+                    }
+                } else if has_avx {
                     let out_ptr = out_head.as_mut_ptr();
                     for t in 0..seq_len {
                         let prob = att_head[t];
@@ -1054,6 +1198,20 @@ mod tests {
         assert_eq!(cfg_150m.n_layers, 30);
         assert_eq!(cfg_150m.head_dim(), 32);
 
+        // 650M ~ 650M floats (2.6GB)
+        let cfg_650m = EsmConfig::detect_from_file_len(2_600_000_000).expect("650M config detection");
+        assert_eq!(cfg_650m.arch, EsmModelArch::Esm2_650M);
+        assert_eq!(cfg_650m.dim, 1280);
+        assert_eq!(cfg_650m.n_layers, 33);
+        assert_eq!(cfg_650m.head_dim(), 64);
+
+        // 3B ~ 3B floats (12GB)
+        let cfg_3b = EsmConfig::detect_from_file_len(12_000_000_000).expect("3B config detection");
+        assert_eq!(cfg_3b.arch, EsmModelArch::Esm2_3B);
+        assert_eq!(cfg_3b.dim, 2560);
+        assert_eq!(cfg_3b.n_layers, 36);
+        assert_eq!(cfg_3b.head_dim(), 64);
+
         // Invalid length
         assert!(EsmConfig::detect_from_file_len(100_000).is_err());
     }
@@ -1062,7 +1220,7 @@ mod tests {
     fn test_attention_simd_parity_dk_16_24_32() {
         #[cfg(target_arch = "x86_64")]
         if std::is_x86_feature_detected!("avx") {
-            for &dk in &[16, 24, 32] {
+            for &dk in &[16, 24, 32, 64] {
                 let q: Vec<f32> = (0..dk).map(|i| (i as f32) * 0.1 - 0.5).collect();
                 let k: Vec<f32> = (0..dk).map(|i| ((i * 7) as f32) * 0.05 - 0.3).collect();
                 let v: Vec<f32> = (0..dk).map(|i| ((i * 13) as f32) * 0.03 - 0.2).collect();
@@ -1101,6 +1259,79 @@ mod tests {
                         i,
                         scalar_out[i],
                         avx_out[i]
+                    );
+                }
+            }
+    #[test]
+    fn test_attention_simd_parity_dk_64() {
+        let dk = 64;
+        let q: Vec<f32> = (0..dk).map(|i| (i as f32) * 0.08 - 2.5).collect();
+        let k: Vec<f32> = (0..dk).map(|i| ((i * 11) as f32) * 0.03 - 1.2).collect();
+        let v: Vec<f32> = (0..dk).map(|i| ((i * 17) as f32) * 0.04 - 0.9).collect();
+
+        // 1. Scalar Reference Dot Product
+        let mut scalar_dot = 0.0f32;
+        for i in 0..dk {
+            scalar_dot += q[i] * k[i];
+        }
+
+        // 2. Scalar Reference Accumulate Value
+        let prob = 0.618f32;
+        let mut scalar_out = vec![2.718f32; dk];
+        for i in 0..dk {
+            scalar_out[i] += prob * v[i];
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            // Verify AVX / AVX2 (8 x __m256)
+            if std::is_x86_feature_detected!("avx") {
+                let avx_dot = unsafe { dot_product_head_avx(q.as_ptr(), k.as_ptr(), dk) };
+                assert!(
+                    (scalar_dot - avx_dot).abs() < 1e-5,
+                    "AVX dot product mismatch for dk=64: scalar={} vs avx={}, diff={}",
+                    scalar_dot,
+                    avx_dot,
+                    (scalar_dot - avx_dot).abs()
+                );
+
+                let mut avx_out = vec![2.718f32; dk];
+                unsafe {
+                    accumulate_value_head_avx(avx_out.as_mut_ptr(), v.as_ptr(), prob, dk);
+                }
+                for i in 0..dk {
+                    assert!(
+                        (scalar_out[i] - avx_out[i]).abs() < 1e-5,
+                        "AVX accumulate mismatch for dk=64 at idx {}: scalar={} vs avx={}",
+                        i,
+                        scalar_out[i],
+                        avx_out[i]
+                    );
+                }
+            }
+
+            // Verify AVX-512 (4 x __m512)
+            if std::is_x86_feature_detected!("avx512f") {
+                let avx512_dot = unsafe { dot_product_head_avx512_d64(q.as_ptr(), k.as_ptr()) };
+                assert!(
+                    (scalar_dot - avx512_dot).abs() < 1e-5,
+                    "AVX-512 dot product mismatch for dk=64: scalar={} vs avx512={}, diff={}",
+                    scalar_dot,
+                    avx512_dot,
+                    (scalar_dot - avx512_dot).abs()
+                );
+
+                let mut avx512_out = vec![2.718f32; dk];
+                unsafe {
+                    accumulate_value_head_avx512_d64(avx512_out.as_mut_ptr(), v.as_ptr(), prob);
+                }
+                for i in 0..dk {
+                    assert!(
+                        (scalar_out[i] - avx512_out[i]).abs() < 1e-5,
+                        "AVX-512 accumulate mismatch for dk=64 at idx {}: scalar={} vs avx512={}",
+                        i,
+                        scalar_out[i],
+                        avx512_out[i]
                     );
                 }
             }
