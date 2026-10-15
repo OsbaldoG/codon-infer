@@ -172,9 +172,26 @@ impl EsmConfig {
     }
 
     /// Opens file on disk and autodetects ESM-2 configuration.
+    /// Inspects CODQ header if present; otherwise falls back to file-length autodetection.
     pub fn detect_from_file(path: &str) -> io::Result<Self> {
-        let metadata = std::fs::metadata(path)?;
-        Self::detect_from_file_len(metadata.len())
+        let mut file = File::open(path)?;
+        let metadata = file.metadata()?;
+        let file_len = metadata.len();
+        if file_len >= 64 {
+            let mut magic = [0u8; 4];
+            if file.read_exact(&mut magic).is_ok() && magic == CODQ_MAGIC {
+                file.seek(io::SeekFrom::Start(0))?;
+                let header = CodqHeader::read_from(&mut file)?;
+                if header.version != CODQ_VERSION {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Unsupported CODQ version: {}", header.version),
+                    ));
+                }
+                return header.to_config();
+            }
+        }
+        Self::detect_from_file_len(file_len)
     }
 }
 
@@ -293,6 +310,31 @@ impl EsmWeights {
             classifier_weights: self.classifier_weights.clone(),
         }
     }
+
+    pub fn quantize_q4(&self) -> EsmWeightsQ4 {
+        EsmWeightsQ4 {
+            token_embedding_table: quantize_slice_to_q4(&self.token_embedding_table),
+            ln_1_weight: self.ln_1_weight.clone(),
+            ln_1_bias: self.ln_1_bias.clone(),
+            wq: quantize_slice_to_q4(&self.wq),
+            bq: self.bq.clone(),
+            wk: quantize_slice_to_q4(&self.wk),
+            bk: self.bk.clone(),
+            wv: quantize_slice_to_q4(&self.wv),
+            bv: self.bv.clone(),
+            wo: quantize_slice_to_q4(&self.wo),
+            bo: self.bo.clone(),
+            ln_2_weight: self.ln_2_weight.clone(),
+            ln_2_bias: self.ln_2_bias.clone(),
+            fc1_weight: quantize_slice_to_q4(&self.fc1_weight),
+            fc1_bias: self.fc1_bias.clone(),
+            fc2_weight: quantize_slice_to_q4(&self.fc2_weight),
+            fc2_bias: self.fc2_bias.clone(),
+            ln_f_weight: self.ln_f_weight.clone(),
+            ln_f_bias: self.ln_f_bias.clone(),
+            classifier_weights: self.classifier_weights.clone(),
+        }
+    }
 }
 
 /// Loads and initializes ESM-2 configuration and weights from file path with automatic architecture detection.
@@ -376,8 +418,55 @@ impl EsmWeightsQ8 {
         Ok(())
     }
 
+    pub fn save_to_file_with_header(&self, path: &str, config: &EsmConfig) -> io::Result<()> {
+        let mut file = File::create(path)?;
+        let header = CodqHeader::new(DTYPE_Q8_0, config);
+        header.write_to(&mut file)?;
+        write_q8_blocks(&mut file, &self.token_embedding_table)?;
+        write_floats(&mut file, &self.ln_1_weight)?;
+        write_floats(&mut file, &self.ln_1_bias)?;
+        write_q8_blocks(&mut file, &self.wq)?;
+        write_floats(&mut file, &self.bq)?;
+        write_q8_blocks(&mut file, &self.wk)?;
+        write_floats(&mut file, &self.bk)?;
+        write_q8_blocks(&mut file, &self.wv)?;
+        write_floats(&mut file, &self.bv)?;
+        write_q8_blocks(&mut file, &self.wo)?;
+        write_floats(&mut file, &self.bo)?;
+        write_floats(&mut file, &self.ln_2_weight)?;
+        write_floats(&mut file, &self.ln_2_bias)?;
+        write_q8_blocks(&mut file, &self.fc1_weight)?;
+        write_floats(&mut file, &self.fc1_bias)?;
+        write_q8_blocks(&mut file, &self.fc2_weight)?;
+        write_floats(&mut file, &self.fc2_bias)?;
+        write_floats(&mut file, &self.ln_f_weight)?;
+        write_floats(&mut file, &self.ln_f_bias)?;
+        write_floats(&mut file, &self.classifier_weights)?;
+        file.flush()?;
+        Ok(())
+    }
+
     pub fn from_file(path: &str, config: &EsmConfig) -> io::Result<Self> {
         let mut file = File::open(path)?;
+        let file_len = file.metadata()?.len();
+        if file_len >= 64 {
+            let mut magic = [0u8; 4];
+            if file.read_exact(&mut magic).is_ok() && magic == CODQ_MAGIC {
+                file.seek(io::SeekFrom::Start(0))?;
+                let header = CodqHeader::read_from(&mut file)?;
+                if header.dtype != DTYPE_Q8_0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Expected Q8_0 dtype ({}), got {}", DTYPE_Q8_0, header.dtype),
+                    ));
+                }
+                header.validate(config)?;
+            } else {
+                file.seek(io::SeekFrom::Start(0))?;
+            }
+        } else {
+            file.seek(io::SeekFrom::Start(0))?;
+        }
         let token_embedding_table = read_q8_blocks(&mut file, config.vocab_size * (config.dim / 32))?;
         let ln_1_weight = read_floats(&mut file, config.n_layers * config.dim)?;
         let ln_1_bias = read_floats(&mut file, config.n_layers * config.dim)?;
@@ -499,6 +588,143 @@ pub struct CodqHeader {
 const _: () = assert!(core::mem::size_of::<CodqHeader>() == 64);
 const _: () = assert!(core::mem::align_of::<CodqHeader>() == 4);
 
+impl CodqHeader {
+    pub fn new(dtype: u32, config: &EsmConfig) -> Self {
+        let arch = match config.arch {
+            EsmModelArch::Esm2_8M => ARCH_8M,
+            EsmModelArch::Esm2_35M => ARCH_35M,
+            EsmModelArch::Esm2_150M => ARCH_150M,
+            EsmModelArch::Esm2_650M => ARCH_650M,
+            EsmModelArch::Esm2_3B => ARCH_3B,
+        };
+        Self {
+            magic: CODQ_MAGIC,
+            version: CODQ_VERSION,
+            dtype,
+            arch,
+            n_layers: config.n_layers as u32,
+            dim: config.dim as u32,
+            hidden_dim: config.hidden_dim as u32,
+            vocab_size: config.vocab_size as u32,
+            reserved: [0u8; 32],
+        }
+    }
+
+    pub fn write_to(&self, file: &mut File) -> io::Result<()> {
+        let byte_slice = unsafe {
+            std::slice::from_raw_parts(
+                self as *const Self as *const u8,
+                std::mem::size_of::<Self>(),
+            )
+        };
+        file.write_all(byte_slice)
+    }
+
+    pub fn read_from(file: &mut File) -> io::Result<Self> {
+        let mut header = std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            let byte_slice = std::slice::from_raw_parts_mut(
+                header.as_mut_ptr() as *mut u8,
+                std::mem::size_of::<Self>(),
+            );
+            file.read_exact(byte_slice)?;
+            let header = header.assume_init();
+            if header.magic != CODQ_MAGIC {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Invalid CODQ magic: {:?}", header.magic),
+                ));
+            }
+            Ok(header)
+        }
+    }
+
+    pub fn validate(&self, config: &EsmConfig) -> io::Result<()> {
+        if self.magic != CODQ_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Invalid CODQ magic: {:?}", self.magic),
+            ));
+        }
+        if self.version != CODQ_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Unsupported CODQ version: {}, expected {}", self.version, CODQ_VERSION),
+            ));
+        }
+        let expected_arch = match config.arch {
+            EsmModelArch::Esm2_8M => ARCH_8M,
+            EsmModelArch::Esm2_35M => ARCH_35M,
+            EsmModelArch::Esm2_150M => ARCH_150M,
+            EsmModelArch::Esm2_650M => ARCH_650M,
+            EsmModelArch::Esm2_3B => ARCH_3B,
+        };
+        if self.arch != expected_arch {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("CODQ arch mismatch: header has {}, expected {}", self.arch, expected_arch),
+            ));
+        }
+        if self.n_layers as usize != config.n_layers
+            || self.dim as usize != config.dim
+            || self.hidden_dim as usize != config.hidden_dim
+            || self.vocab_size as usize != config.vocab_size
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "CODQ dimension mismatch: header (layers={}, dim={}, hidden={}, vocab={}) vs config (layers={}, dim={}, hidden={}, vocab={})",
+                    self.n_layers, self.dim, self.hidden_dim, self.vocab_size,
+                    config.n_layers, config.dim, config.hidden_dim, config.vocab_size
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn to_config(&self) -> io::Result<EsmConfig> {
+        if self.magic != CODQ_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Invalid CODQ magic: {:?}", self.magic),
+            ));
+        }
+        if self.version != CODQ_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Unsupported CODQ version: {}, expected {}", self.version, CODQ_VERSION),
+            ));
+        }
+        let cfg = match self.arch {
+            ARCH_8M => EsmConfig::esm2_8m(),
+            ARCH_35M => EsmConfig::esm2_35m(),
+            ARCH_150M => EsmConfig::esm2_150m(),
+            ARCH_650M => EsmConfig::esm2_650m(),
+            ARCH_3B => EsmConfig::esm2_3b(),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Unknown architecture ID in CODQ header: {}", self.arch),
+                ));
+            }
+        };
+        if self.n_layers as usize != cfg.n_layers
+            || self.dim as usize != cfg.dim
+            || self.hidden_dim as usize != cfg.hidden_dim
+            || self.vocab_size as usize != cfg.vocab_size
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Incoherent dimensions in CODQ header for arch {}: layers={}, dim={}, hidden={}, vocab={}",
+                    self.arch, self.n_layers, self.dim, self.hidden_dim, self.vocab_size
+                ),
+            ));
+        }
+        Ok(cfg)
+    }
+}
+
 // ============================================================================
 // BLOCK Q4_0 DATA STRUCTURE & QUANTIZATION SKELETON
 // ============================================================================
@@ -514,18 +740,64 @@ const _: () = assert!(core::mem::size_of::<BlockQ4_0>() == 20);
 const _: () = assert!(core::mem::align_of::<BlockQ4_0>() == 4);
 
 impl BlockQ4_0 {
-    pub fn quantize(_src: &[f32]) -> Self {
-        todo!("Subagent A: BlockQ4_0::quantize")
+    pub fn quantize(src: &[f32]) -> Self {
+        assert!(src.len() >= 32, "Source length must be at least 32 elements");
+        let mut max = 0.0f32;
+        for &v in src {
+            if v.abs() > max.abs() {
+                max = v;
+            }
+        }
+        let d = if max == 0.0 { 0.0 } else { max / -8.0 };
+        let id = if d == 0.0 { 0.0 } else { 1.0 / d };
+        let mut qs = [0u8; 16];
+        for j in 0..16 {
+            let q_lo = ((src[j] * id).round() as i32 + 8).clamp(0, 15) as u8;
+            let q_hi = ((src[j + 16] * id).round() as i32 + 8).clamp(0, 15) as u8;
+            qs[j] = (q_lo & 0x0F) | ((q_hi & 0x0F) << 4);
+        }
+        Self { d, qs }
     }
 
     #[inline]
-    pub fn dequantize_to(&self, _dst: &mut [f32]) {
-        todo!("Subagent A: BlockQ4_0::dequantize_to")
+    pub fn dequantize_to(&self, dst: &mut [f32]) {
+        assert!(dst.len() >= 32, "Destination length must be at least 32 elements");
+        for j in 0..16 {
+            let q_lo = (self.qs[j] & 0x0F) as i32 - 8;
+            dst[j] = q_lo as f32 * self.d;
+            let q_hi = ((self.qs[j] >> 4) & 0x0F) as i32 - 8;
+            dst[j + 16] = q_hi as f32 * self.d;
+        }
     }
 }
 
-pub fn quantize_slice_to_q4(_src: &[f32]) -> Vec<BlockQ4_0> {
-    todo!("Subagent A: quantize_slice_to_q4")
+pub fn quantize_slice_to_q4(src: &[f32]) -> Vec<BlockQ4_0> {
+    assert!(src.len() % 32 == 0, "Source length must be a multiple of 32");
+    src.chunks_exact(32).map(BlockQ4_0::quantize).collect()
+}
+
+#[allow(clippy::uninit_vec)]
+pub fn read_q4_blocks(file: &mut File, num_blocks: usize) -> io::Result<Vec<BlockQ4_0>> {
+    let mut blocks = Vec::<BlockQ4_0>::with_capacity(num_blocks);
+    unsafe {
+        blocks.set_len(num_blocks);
+        let byte_slice = std::slice::from_raw_parts_mut(
+            blocks.as_mut_ptr() as *mut u8,
+            num_blocks * std::mem::size_of::<BlockQ4_0>(),
+        );
+        file.read_exact(byte_slice)?;
+    }
+    Ok(blocks)
+}
+
+pub fn write_q4_blocks(file: &mut File, blocks: &[BlockQ4_0]) -> io::Result<()> {
+    let byte_slice = unsafe {
+        std::slice::from_raw_parts(
+            blocks.as_ptr() as *const u8,
+            blocks.len() * std::mem::size_of::<BlockQ4_0>(),
+        )
+    };
+    file.write_all(byte_slice)
 }
 
 pub struct EsmWeightsQ4 {
@@ -540,6 +812,146 @@ pub struct EsmWeightsQ4 {
     pub fc2_weight: Vec<BlockQ4_0>, pub fc2_bias: Vec<f32>,
     pub ln_f_weight: Vec<f32>, pub ln_f_bias: Vec<f32>,
     pub classifier_weights: Vec<f32>,
+}
+
+impl EsmWeightsQ4 {
+    pub fn save_to_file(&self, path: &str, config: &EsmConfig) -> io::Result<()> {
+        let mut file = File::create(path)?;
+        let header = CodqHeader::new(DTYPE_Q4_0, config);
+        header.write_to(&mut file)?;
+        write_q4_blocks(&mut file, &self.token_embedding_table)?;
+        write_floats(&mut file, &self.ln_1_weight)?;
+        write_floats(&mut file, &self.ln_1_bias)?;
+        write_q4_blocks(&mut file, &self.wq)?;
+        write_floats(&mut file, &self.bq)?;
+        write_q4_blocks(&mut file, &self.wk)?;
+        write_floats(&mut file, &self.bk)?;
+        write_q4_blocks(&mut file, &self.wv)?;
+        write_floats(&mut file, &self.bv)?;
+        write_q4_blocks(&mut file, &self.wo)?;
+        write_floats(&mut file, &self.bo)?;
+        write_floats(&mut file, &self.ln_2_weight)?;
+        write_floats(&mut file, &self.ln_2_bias)?;
+        write_q4_blocks(&mut file, &self.fc1_weight)?;
+        write_floats(&mut file, &self.fc1_bias)?;
+        write_q4_blocks(&mut file, &self.fc2_weight)?;
+        write_floats(&mut file, &self.fc2_bias)?;
+        write_floats(&mut file, &self.ln_f_weight)?;
+        write_floats(&mut file, &self.ln_f_bias)?;
+        write_floats(&mut file, &self.classifier_weights)?;
+        file.flush()?;
+        Ok(())
+    }
+
+    pub fn from_file(path: &str, config: &EsmConfig) -> io::Result<Self> {
+        let mut file = File::open(path)?;
+        let file_len = file.metadata()?.len();
+        if file_len >= 64 {
+            let mut magic = [0u8; 4];
+            if file.read_exact(&mut magic).is_ok() && magic == CODQ_MAGIC {
+                file.seek(io::SeekFrom::Start(0))?;
+                let header = CodqHeader::read_from(&mut file)?;
+                if header.dtype != DTYPE_Q4_0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Expected Q4_0 dtype ({}), got {}", DTYPE_Q4_0, header.dtype),
+                    ));
+                }
+                header.validate(config)?;
+            } else {
+                file.seek(io::SeekFrom::Start(0))?;
+            }
+        } else {
+            file.seek(io::SeekFrom::Start(0))?;
+        }
+
+        let token_embedding_table = read_q4_blocks(&mut file, config.vocab_size * (config.dim / 32))?;
+        let ln_1_weight = read_floats(&mut file, config.n_layers * config.dim)?;
+        let ln_1_bias = read_floats(&mut file, config.n_layers * config.dim)?;
+        let wq = read_q4_blocks(&mut file, config.n_layers * config.dim * (config.dim / 32))?;
+        let bq = read_floats(&mut file, config.n_layers * config.dim)?;
+        let wk = read_q4_blocks(&mut file, config.n_layers * config.dim * (config.dim / 32))?;
+        let bk = read_floats(&mut file, config.n_layers * config.dim)?;
+        let wv = read_q4_blocks(&mut file, config.n_layers * config.dim * (config.dim / 32))?;
+        let bv = read_floats(&mut file, config.n_layers * config.dim)?;
+        let wo = read_q4_blocks(&mut file, config.n_layers * config.dim * (config.dim / 32))?;
+        let bo = read_floats(&mut file, config.n_layers * config.dim)?;
+        let ln_2_weight = read_floats(&mut file, config.n_layers * config.dim)?;
+        let ln_2_bias = read_floats(&mut file, config.n_layers * config.dim)?;
+        let fc1_weight = read_q4_blocks(&mut file, config.n_layers * config.hidden_dim * (config.dim / 32))?;
+        let fc1_bias = read_floats(&mut file, config.n_layers * config.hidden_dim)?;
+        let fc2_weight = read_q4_blocks(&mut file, config.n_layers * config.dim * (config.hidden_dim / 32))?;
+        let fc2_bias = read_floats(&mut file, config.n_layers * config.dim)?;
+        let ln_f_weight = read_floats(&mut file, config.dim)?;
+        let ln_f_bias = read_floats(&mut file, config.dim)?;
+
+        let current_pos = file.stream_position()?;
+        if current_pos > file_len {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Stream position exceeds file length"));
+        }
+        let remaining_bytes = (file_len - current_pos) as usize;
+        if remaining_bytes % 4 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Unaligned trailing bytes in Q4: {} is not a multiple of 4", remaining_bytes),
+            ));
+        }
+        let remaining_floats = remaining_bytes / 4;
+        let classifier_weights = read_floats(&mut file, remaining_floats)?;
+
+        let final_pos = file.stream_position()?;
+        if final_pos != file_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Q4 Weights file underread: read {} of {} bytes", final_pos, file_len),
+            ));
+        }
+
+        Ok(Self {
+            token_embedding_table,
+            ln_1_weight,
+            ln_1_bias,
+            wq,
+            bq,
+            wk,
+            bk,
+            wv,
+            bv,
+            wo,
+            bo,
+            ln_2_weight,
+            ln_2_bias,
+            fc1_weight,
+            fc1_bias,
+            fc2_weight,
+            fc2_bias,
+            ln_f_weight,
+            ln_f_bias,
+            classifier_weights,
+        })
+    }
+
+    pub fn load_from_file(model_path: &str) -> io::Result<(EsmConfig, Self)> {
+        let config = match EsmConfig::detect_from_file(model_path) {
+            Ok(cfg) => cfg,
+            Err(_) => EsmConfig::esm2_8m(),
+        };
+        let weights = Self::from_file(model_path, &config)?;
+        Ok((config, weights))
+    }
+
+    pub fn load_or_convert(model_path: &str, config: &EsmConfig) -> io::Result<Self> {
+        let is_q4_file = model_path.ends_with(".q4")
+            || model_path.ends_with(".q4.bin")
+            || model_path.ends_with(".q4_0")
+            || model_path.ends_with(".q4_0.bin");
+        if is_q4_file {
+            Self::from_file(model_path, config)
+        } else {
+            let fp32 = EsmWeights::from_file(model_path, config)?;
+            Ok(fp32.quantize_q4())
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3037,6 +3449,258 @@ mod tests {
             "650M Cosine similarity between FP32 and Q8_0 logits is {:.5}, expected > 0.990",
             cos_sim
         );
+    }
+}
+
+#[cfg(test)]
+mod tests_q4_format {
+    use super::*;
+
+    #[test]
+    fn test_q4_0_roundtrip_quantize_dequantize_bound() {
+        // Test varying patterns: linear, sinusoidal, and perturbed grid
+        let mut test_vectors: Vec<[f32; 32]> = Vec::new();
+
+        // Vector 1: Linear sweep [-8.0 .. 7.0]
+        let mut v1 = [0.0f32; 32];
+        for i in 0..32 {
+            v1[i] = -8.0 + (i as f32) * (15.0 / 31.0);
+        }
+        test_vectors.push(v1);
+
+        // Vector 2: Exact grid points with controlled noise
+        let scales = [0.05f32, 1.0f32, 2.5f32, 10.0f32];
+        for &scale in &scales {
+            let mut v = [0.0f32; 32];
+            // Ensure max produces scale d = scale (so max = -8.0 * scale)
+            v[0] = -8.0 * scale;
+            for i in 1..32 {
+                let q_level = ((i % 16) as i32 - 8) as f32; // -8 .. 7
+                let noise = (((i * 11) % 9) as f32 - 4.0) / 10.0 * 0.45 * scale; // in [-0.45*d, 0.45*d]
+                v[i] = q_level * scale + noise;
+            }
+            test_vectors.push(v);
+        }
+
+        // Vector 3: Positive max sweep
+        for &scale in &scales {
+            let mut v = [0.0f32; 32];
+            // Positive max: max = 8.0 * scale => d = -scale
+            v[0] = 8.0 * scale;
+            for i in 1..32 {
+                let q_level = ((i % 16) as i32 - 8) as f32;
+                let noise = (((i * 7) % 9) as f32 - 4.0) / 10.0 * 0.45 * scale;
+                v[i] = q_level * (-scale) + noise;
+            }
+            test_vectors.push(v);
+        }
+
+        for (idx, src) in test_vectors.iter().enumerate() {
+            let block = BlockQ4_0::quantize(src);
+            let mut dst = [0.0f32; 32];
+            block.dequantize_to(&mut dst);
+
+            let bound = block.d.abs() / 2.0 + 1e-5;
+            for i in 0..32 {
+                let err = (src[i] - dst[i]).abs();
+                assert!(
+                    err <= bound,
+                    "Vector {} elem {} (src={}, dst={}, d={}): err {} > bound {}",
+                    idx, i, src[i], dst[i], block.d, err, bound
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_q4_0_exact_nibble_packing() {
+        // Construct exact known values:
+        // Let max = 8.0, so d = 8.0 / -8.0 = -1.0, id = -1.0.
+        // For j in 0..16:
+        // q_lo = j  => src[j] = 8 - j
+        // q_hi = 15 - j => src[j + 16] = j - 7
+        let mut src = [0.0f32; 32];
+        for j in 0..16 {
+            let j_i32 = j as i32;
+            src[j] = (8 - j_i32) as f32;
+            src[j + 16] = (j_i32 - 7) as f32;
+        }
+
+        let block = BlockQ4_0::quantize(&src);
+        assert_eq!(block.d, -1.0);
+
+        for j in 0..16 {
+            let expected_lo = j as u8;
+            let expected_hi = (15 - j) as u8;
+            let expected_byte = expected_lo | (expected_hi << 4);
+            assert_eq!(
+                block.qs[j], expected_byte,
+                "Nibble packing mismatch at byte {}: got 0x{:02X}, expected 0x{:02X}",
+                j, block.qs[j], expected_byte
+            );
+        }
+
+        // Verify exact dequantization back to source floats
+        let mut dst = [0.0f32; 32];
+        block.dequantize_to(&mut dst);
+        for i in 0..32 {
+            assert_eq!(dst[i], src[i], "Dequantized mismatch at index {}", i);
+        }
+    }
+
+    #[test]
+    fn test_q4_0_zero_block() {
+        let zeros = [0.0f32; 32];
+        let block = BlockQ4_0::quantize(&zeros);
+        assert_eq!(block.d, 0.0f32);
+        assert_eq!(block.qs, [0x88; 16]);
+
+        let mut dst = [999.0f32; 32];
+        block.dequantize_to(&mut dst);
+        for i in 0..32 {
+            assert_eq!(dst[i], 0.0f32, "Zero block dequantization mismatch at {}", i);
+        }
+    }
+
+    #[test]
+    fn test_codq_header_valid_corrupt_incoherent() {
+        let config = EsmConfig::esm2_650m();
+        let header = CodqHeader::new(DTYPE_Q4_0, &config);
+
+        // 1. Valid header
+        assert_eq!(header.magic, CODQ_MAGIC);
+        assert_eq!(header.version, CODQ_VERSION);
+        assert_eq!(header.dtype, DTYPE_Q4_0);
+        assert_eq!(header.arch, ARCH_650M);
+        assert_eq!(header.n_layers, 33);
+        assert_eq!(header.dim, 1280);
+        assert_eq!(header.hidden_dim, 5120);
+        assert_eq!(header.vocab_size, 33);
+        assert!(header.validate(&config).is_ok());
+
+        let cfg_detected = header.to_config().expect("Should extract valid config");
+        assert_eq!(cfg_detected, config);
+
+        // 2. Corrupt magic
+        let mut corrupt_magic = header;
+        corrupt_magic.magic = *b"NOPE";
+        assert!(corrupt_magic.validate(&config).is_err());
+        assert!(corrupt_magic.to_config().is_err());
+
+        // 3. Corrupt version
+        let mut corrupt_version = header;
+        corrupt_version.version = 99;
+        assert!(corrupt_version.validate(&config).is_err());
+        assert!(corrupt_version.to_config().is_err());
+
+        // 4. Incoherent dimensions
+        let mut incoherent_dim = header;
+        incoherent_dim.dim = 999;
+        assert!(incoherent_dim.validate(&config).is_err());
+        assert!(incoherent_dim.to_config().is_err());
+
+        let mut incoherent_layers = header;
+        incoherent_layers.n_layers = 42;
+        assert!(incoherent_layers.validate(&config).is_err());
+        assert!(incoherent_layers.to_config().is_err());
+    }
+
+    #[test]
+    fn test_first_block_alignment_at_offset_64() {
+        let temp_path = "target/test_align_q4.bin";
+        let config = EsmConfig::esm2_8m();
+
+        let dummy_q4 = quantize_slice_to_q4(&vec![0.5f32; config.vocab_size * config.dim]);
+        let w = EsmWeightsQ4 {
+            token_embedding_table: dummy_q4.clone(),
+            ln_1_weight: vec![1.0; config.n_layers * config.dim],
+            ln_1_bias: vec![0.0; config.n_layers * config.dim],
+            wq: quantize_slice_to_q4(&vec![0.1; config.n_layers * config.dim * config.dim]),
+            bq: vec![0.0; config.n_layers * config.dim],
+            wk: quantize_slice_to_q4(&vec![0.1; config.n_layers * config.dim * config.dim]),
+            bk: vec![0.0; config.n_layers * config.dim],
+            wv: quantize_slice_to_q4(&vec![0.1; config.n_layers * config.dim * config.dim]),
+            bv: vec![0.0; config.n_layers * config.dim],
+            wo: quantize_slice_to_q4(&vec![0.1; config.n_layers * config.dim * config.dim]),
+            bo: vec![0.0; config.n_layers * config.dim],
+            ln_2_weight: vec![1.0; config.n_layers * config.dim],
+            ln_2_bias: vec![0.0; config.n_layers * config.dim],
+            fc1_weight: quantize_slice_to_q4(&vec![0.1; config.n_layers * config.dim * config.hidden_dim]),
+            fc1_bias: vec![0.0; config.n_layers * config.hidden_dim],
+            fc2_weight: quantize_slice_to_q4(&vec![0.1; config.n_layers * config.hidden_dim * config.dim]),
+            fc2_bias: vec![0.0; config.n_layers * config.dim],
+            ln_f_weight: vec![1.0; config.dim],
+            ln_f_bias: vec![0.0; config.dim],
+            classifier_weights: vec![0.0; config.vocab_size * config.dim],
+        };
+
+        w.save_to_file(temp_path, &config).expect("Must save Q4 file");
+
+        let mut file = File::open(temp_path).expect("Must open saved file");
+        let header = CodqHeader::read_from(&mut file).expect("Must read header");
+        assert_eq!(header.magic, CODQ_MAGIC);
+
+        let stream_pos = file.stream_position().expect("Stream pos");
+        assert_eq!(stream_pos, 64, "First weight block MUST start at offset 64");
+        assert_eq!(stream_pos % 64, 0, "Offset 64 is 64-byte aligned");
+        assert_eq!(stream_pos % (core::mem::align_of::<BlockQ4_0>() as u64), 0, "Aligned to BlockQ4_0");
+
+        let _ = std::fs::remove_file(temp_path);
+    }
+
+    #[test]
+    fn test_no_ambiguity_650m_q4_vs_150m() {
+        // A 650M model in Q4_0 is ~410MB.
+        // Legacy file length detection would map 410MB into 150M range:
+        // [140MB, 450MB) -> Esm2_150M.
+        let file_len_410mb = 410_000_000u64;
+        let legacy_detected = EsmConfig::detect_from_file_len(file_len_410mb).unwrap();
+        assert_eq!(legacy_detected.arch, EsmModelArch::Esm2_150M, "Legacy size detection maps 410MB to 150M");
+
+        // Now create a simulated 410MB file with CODQ header for 650M
+        let temp_path = "target/test_no_ambiguity_650m_q4.bin";
+        {
+            let mut file = File::create(temp_path).expect("Create file");
+            let config_650m = EsmConfig::esm2_650m();
+            let header = CodqHeader::new(DTYPE_Q4_0, &config_650m);
+            header.write_to(&mut file).expect("Write header");
+            // Set file length to 410MB sparsely without disk cost
+            file.set_len(file_len_410mb).expect("Set len");
+        }
+
+        // Autodetection with CODQ header: MUST detect 650M, NOT 150M!
+        let detected = EsmConfig::detect_from_file(temp_path).expect("Must detect from header");
+        assert_eq!(detected.arch, EsmModelArch::Esm2_650M, "CODQ header correctly detects 650M despite 410MB length");
+        assert_ne!(detected.arch, EsmModelArch::Esm2_150M, "CODQ header prevents false 150M detection");
+
+        let _ = std::fs::remove_file(temp_path);
+    }
+
+    #[test]
+    fn test_q4_weights_save_load_roundtrip_8m() {
+        let model_path = if std::path::Path::new("esm2_8m_weights.bin").exists() {
+            "esm2_8m_weights.bin"
+        } else if std::path::Path::new("esm2_weights.bin").exists() {
+            "esm2_weights.bin"
+        } else {
+            return;
+        };
+
+        let config = EsmConfig::esm2_8m();
+        let weights = EsmWeights::from_file(model_path, &config).expect("weights must load");
+        let weights_q4 = weights.quantize_q4();
+
+        let temp_q4_path = "target/test_esm2_8m_roundtrip.q4_0";
+        weights_q4.save_to_file(temp_q4_path, &config).expect("Q4 save must succeed");
+
+        let (loaded_config, loaded_q4) = EsmWeightsQ4::load_from_file(temp_q4_path).expect("Q4 load must succeed");
+        assert_eq!(loaded_config, config);
+        assert_eq!(weights_q4.token_embedding_table.len(), loaded_q4.token_embedding_table.len());
+        assert_eq!(weights_q4.wq.len(), loaded_q4.wq.len());
+        assert_eq!(weights_q4.fc1_weight.len(), loaded_q4.fc1_weight.len());
+        assert_eq!(weights_q4.classifier_weights.len(), loaded_q4.classifier_weights.len());
+
+        let _ = std::fs::remove_file(temp_q4_path);
     }
 }
 
