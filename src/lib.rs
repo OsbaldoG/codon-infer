@@ -1060,6 +1060,85 @@ pub fn compute_rmse(a: &[f32], b: &[f32]) -> f32 {
     (sum_sq / len as f64).sqrt() as f32
 }
 
+pub fn compute_top1_match_rate(logits_ref: &[f32], logits_test: &[f32], vocab_size: usize) -> f32 {
+    if vocab_size == 0 { return 1.0; }
+    let n_tokens = logits_ref.len().min(logits_test.len()) / vocab_size;
+    if n_tokens == 0 { return 1.0; }
+    let mut matches = 0;
+    for t in 0..n_tokens {
+        let slice_ref = &logits_ref[t * vocab_size..(t + 1) * vocab_size];
+        let slice_test = &logits_test[t * vocab_size..(t + 1) * vocab_size];
+        let arg_ref = slice_ref.iter().enumerate().max_by(|x, y| x.1.partial_cmp(y.1).unwrap_or(std::cmp::Ordering::Equal)).map(|x| x.0).unwrap_or(0);
+        let arg_test = slice_test.iter().enumerate().max_by(|x, y| x.1.partial_cmp(y.1).unwrap_or(std::cmp::Ordering::Equal)).map(|x| x.0).unwrap_or(0);
+        if arg_ref == arg_test {
+            matches += 1;
+        }
+    }
+    matches as f32 / n_tokens as f32
+}
+
+pub fn compute_kl_divergence(logits_ref: &[f32], logits_test: &[f32], vocab_size: usize) -> f32 {
+    if vocab_size == 0 { return 0.0; }
+    let n_tokens = logits_ref.len().min(logits_test.len()) / vocab_size;
+    if n_tokens == 0 { return 0.0; }
+    let mut total_kl = 0.0f32;
+
+    for t in 0..n_tokens {
+        let slice_ref = &logits_ref[t * vocab_size..(t + 1) * vocab_size];
+        let slice_test = &logits_test[t * vocab_size..(t + 1) * vocab_size];
+
+        let max_ref = slice_ref.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let max_test = slice_test.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+
+        let mut sum_exp_ref = 0.0f32;
+        let mut sum_exp_test = 0.0f32;
+        for i in 0..vocab_size {
+            sum_exp_ref += (slice_ref[i] - max_ref).exp();
+            sum_exp_test += (slice_test[i] - max_test).exp();
+        }
+
+        let mut kl_t = 0.0f32;
+        for i in 0..vocab_size {
+            let p = ((slice_ref[i] - max_ref).exp() / sum_exp_ref).max(1e-12);
+            let q = ((slice_test[i] - max_test).exp() / sum_exp_test).max(1e-12);
+            kl_t += p * (p.ln() - q.ln());
+        }
+        total_kl += kl_t;
+    }
+    total_kl / n_tokens as f32
+}
+
+pub fn compute_centered_cosine_similarity(a: &[f32], b: &[f32], vocab_size: usize) -> f32 {
+    if vocab_size == 0 { return 1.0; }
+    let n_tokens = a.len().min(b.len()) / vocab_size;
+    if n_tokens == 0 { return 1.0; }
+    let mut sum_cos = 0.0f32;
+    for t in 0..n_tokens {
+        let sa = &a[t * vocab_size..(t + 1) * vocab_size];
+        let sb = &b[t * vocab_size..(t + 1) * vocab_size];
+        let mean_a = sa.iter().sum::<f32>() / vocab_size as f32;
+        let mean_b = sb.iter().sum::<f32>() / vocab_size as f32;
+
+        let mut dot = 0.0f32;
+        let mut norm_a = 0.0f32;
+        let mut norm_b = 0.0f32;
+        for i in 0..vocab_size {
+            let ca = sa[i] - mean_a;
+            let cb = sb[i] - mean_b;
+            dot += ca * cb;
+            norm_a += ca * ca;
+            norm_b += cb * cb;
+        }
+        let denom = (norm_a * norm_b).sqrt();
+        if denom > 1e-12 {
+            sum_cos += dot / denom;
+        } else {
+            sum_cos += 1.0;
+        }
+    }
+    sum_cos / n_tokens as f32
+}
+
 pub fn dequantize_q4_to_vec(blocks: &[BlockQ4_0]) -> Vec<f32> {
     let mut out = vec![0.0f32; blocks.len() * 32];
     for (i, b) in blocks.iter().enumerate() {
@@ -3727,6 +3806,22 @@ mod tests {
         let mut logits = vec![1.0,2.0,3.0]; softmax(&mut logits); assert!((logits.iter().sum::<f32>() - 1.0).abs() < 1e-6);
     }
     #[test] fn test_tokenizer_boundaries() { assert_eq!(Tokenizer::encode("LA"), vec![0,4,5,2]); }
+    #[test]
+    fn test_evaluation_metrics_unit() {
+        let logits_a = [10.0, 5.0, 1.0, 2.0, 8.0, 0.0];
+        // Exact affine scaling: b = 2.0 * a + 3.0 -> centered correlation is 1.0
+        let logits_b = [23.0, 13.0, 5.0, 7.0, 19.0, 3.0];
+        let vocab_size = 3;
+        // Two tokens. Token 1 top is class 0 for both (10.0 vs 23.0). Token 2 top is class 1 for both (8.0 vs 19.0).
+        let top1 = compute_top1_match_rate(&logits_a, &logits_b, vocab_size);
+        assert_eq!(top1, 1.0);
+
+        let kl = compute_kl_divergence(&logits_a, &logits_a, vocab_size);
+        assert!(kl.abs() < 1e-6);
+
+        let cos_cent = compute_centered_cosine_similarity(&logits_a, &logits_b, vocab_size);
+        assert!((cos_cent - 1.0).abs() < 1e-4);
+    }
     #[test] fn test_matmul_avx1_and_dispatch_parity() {
         let in_dim = 320; let out_dim = 64;
         let x: Vec<f32> = (0..in_dim).map(|i|(i as f32)*0.01 - 1.5).collect();
