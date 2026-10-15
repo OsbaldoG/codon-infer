@@ -229,7 +229,34 @@ cd codon-infer
 cargo build --release
 ```
 
-### 2. Ejecución de la Suite de Pruebas
+### 2. Pesos Preentrenados y GitHub Releases
+
+`codon-infer` estandariza los archivos binarios de pesos bajo una nomenclatura limpia y explícita:
+* **ESM-2 8M (`esm2_8m_weights.bin`):** Pre-empaquetado en la raíz del repositorio (~30 MB FP32) para inferencia instantánea sin configuraciones adicionales, desarrollo local y pruebas unitarias rápidas sin descargas externas.
+* **ESM-2 35M (`esm2_35m_weights.bin`):** Modelo de capacidad intermedia (~133 MB FP32), hospedado en [GitHub Releases](https://github.com/OsbaldoG/codon-infer/releases/tag/v1.4.0) para prevenir la sobrecarga del repositorio Git.
+* **ESM-2 150M (`esm2_150m_weights.bin`):** Modelo de alta fidelidad para predicción de contactos y bioinformática con calidad de publicación (~590 MB FP32), hospedado en [GitHub Releases](https://github.com/OsbaldoG/codon-infer/releases/tag/v1.4.0).
+
+#### Descarga Directa de Pesos vía `curl`
+Descargue directamente los pesos binarios deseados en la raíz del repositorio sin necesidad de reconstruirlos en Google Colab:
+```bash
+# Descargar pesos de ESM-2 35M (~133 MB)
+curl -L -o esm2_35m_weights.bin https://github.com/OsbaldoG/codon-infer/releases/download/v1.4.0/esm2_35m_weights.bin
+
+# Descargar pesos de ESM-2 150M (~590 MB)
+curl -L -o esm2_150m_weights.bin https://github.com/OsbaldoG/codon-infer/releases/download/v1.4.0/esm2_150m_weights.bin
+
+# O utilizar el script automatizado:
+./scripts/download_weights.sh 35m
+./scripts/download_weights.sh 150m
+```
+
+> [!TIP]
+> Si prefiere exportar pesos personalizados o reentrenados directamente desde Hugging Face Transformers o Meta `fair-esm`, puede emplear el script en Python incluido:
+> ```bash
+> python3 scripts/export_weights.py --model 35M
+> ```
+
+### 3. Ejecución de la Suite de Pruebas
 Valide las primitivas numéricas, la paridad de vectorización SIMD, el parser FASTA y los formatos de exportación:
 ```bash
 cargo test
@@ -263,7 +290,7 @@ test mcp::tests::test_mcp_dispatch_with_weights_if_available ... ok
 test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; finished in 7.45s
 ```
 
-### 3. Subcomandos y Pipelines Bioinformáticos
+### 4. Subcomandos y Pipelines Bioinformáticos
 
 Todos los subcomandos aceptan la bandera global `--model <RUTA>`. `codon-infer` detecta automáticamente si el archivo binario corresponde a **ESM-2 8M**, **35M** o **150M** (en precisión completa FP32 o cuantizado `Q8_0`) y autoconfigura los kernels vectoriales correspondientes.
 
@@ -274,8 +301,8 @@ Ejecuta síntesis de secuencias peptídicas *de novo* o extensión de motivos fu
 codon-infer generate --sequence "MCMPCFTTDHQMARKCDD" --temperature 0.7 --max-tokens 40
 
 # Multi-escala: Ejecución con ESM-2 35M o 150M
-codon-infer generate --model esm2_35m.bin --sequence "MCMPCFTTDHQMARKCDD" --temperature 0.7
-codon-infer generate --model esm2_150m.bin --sequence "MCMPCFTTDHQMARKCDD" --temperature 0.7
+codon-infer generate --model esm2_35m_weights.bin --sequence "MCMPCFTTDHQMARKCDD" --temperature 0.7
+codon-infer generate --model esm2_150m_weights.bin --sequence "MCMPCFTTDHQMARKCDD" --temperature 0.7
 ```
 
 #### B. Inpainting Bidireccional y Reconstrucción de Motivos (`inpaint`)
@@ -285,7 +312,7 @@ Reconstruye posiciones faltantes, mutadas o enmascaradas en sitios activos (indi
 codon-infer inpaint --sequence "MCMPC*TTDHQMARKCDD"
 
 # Con pesos de mayor capacidad ESM-2 35M:
-codon-infer inpaint --model esm2_35m.bin --sequence "MCMPC*TTDHQMARKCDD"
+codon-infer inpaint --model esm2_35m_weights.bin --sequence "MCMPC*TTDHQMARKCDD"
 ```
 
 #### C. Escaneo Mutacional Profundo *In Silico* (`dms`)
@@ -295,21 +322,21 @@ Ejecuta saturación mutagénica punto a punto con mapas de calor térmicos TrueC
 codon-infer dms --fasta proteins.fasta --window 128 --export-csv dms_matrix.csv --export-json dms_report.json
 
 # Escaneo de máxima precisión con ESM-2 150M:
-codon-infer dms --model esm2_150m.bin --fasta target.fasta --window 128 --export-csv dms_150m.csv
+codon-infer dms --model esm2_150m_weights.bin --fasta target.fasta --window 128 --export-csv dms_150m.csv
 ```
 
 #### D. Predicción de Contactos Estructurales Residuales (`contacts`)
 Calcula acoplamientos epistáticos mediante mapas de atención multi-cabeza (con corrección APC) e identifica puentes disulfuro putativos:
 ```bash
 # Predicción de contactos 3D con ESM-2 150M para precisión de publicación:
-codon-infer contacts --model esm2_150m.bin --fasta proteins.fasta --export-csv contacts.csv --export-json contacts.json
+codon-infer contacts --model esm2_150m_weights.bin --fasta proteins.fasta --export-csv contacts.csv --export-json contacts.json
 ```
 
 #### E. Suite de Benchmarks de Hardware y Validación Biológica (`benchmark`)
 Ejecuta la suite integral de estrés de microarquitectura y validación biológica sobre cualquier escala de modelo:
 ```bash
 codon-infer benchmark --suite full
-codon-infer benchmark --model esm2_35m.bin --suite full
+codon-infer benchmark --model esm2_35m_weights.bin --suite full
 ```
 
 Suites disponibles:
@@ -321,14 +348,14 @@ Suites disponibles:
 * `stress`: Prueba de estabilidad continua de 10,000 tokens bajo sobrecarga de caché.
 * `scaling`: Benchmark de escalamiento de longitud de contexto ($L = 32 \to 256$) evaluando latencia y memoria.
 
-### 4. Servidor Model Context Protocol (MCP)
+### 5. Servidor Model Context Protocol (MCP)
 `codon-infer-mcp` expone la totalidad de las capacidades bioinformáticas como herramientas nativas para agentes LLM (Claude Desktop, Cursor, Gemini, etc.) sobre stdio mediante JSON-RPC:
 ```bash
 # Iniciar con los pesos por defecto de ESM-2 8M
 cargo run --release --bin codon-infer-mcp
 
 # Iniciar con pesos de mayor capacidad ESM-2 35M o 150M
-cargo run --release --bin codon-infer-mcp -- --model esm2_35m.bin
+cargo run --release --bin codon-infer-mcp -- --model esm2_35m_weights.bin
 ```
 
 #### Herramientas Expuestas vía MCP:
@@ -346,7 +373,7 @@ cargo run --release --bin codon-infer-mcp -- --model esm2_35m.bin
 | :--- | :--- | :--- |
 | `-h`, `--help` | Muestra el panel de ayuda con la guía de subcomandos | - |
 | `-V`, `--version` | Muestra la versión y el motor vectorial SIMD activo | - |
-| `--model <RUTA>` | Ruta al binario personalizado de pesos ESM-2 en FP32 o Q8_0 | `esm2_weights.bin` |
+| `--model <RUTA>` | Ruta al binario personalizado de pesos ESM-2 en FP32 o Q8_0 | `esm2_8m_weights.bin` |
 | `--color <auto\|always\|never>` | Controla el estilizado de la terminal mediante ANSI TrueColor | `auto` |
 | `--no-color` | Desactiva terminantemente los códigos de escape ANSI (estándar NO_COLOR) | `false` |
 
@@ -373,7 +400,10 @@ codon-infer/
 │   └── config.toml         # Banderas de compilación nativa (-C target-cpu=native)
 ├── .gitignore              # Filtro de artefactos generados y copias de seguridad
 ├── Cargo.toml              # Especificación cero dependencias (v1.4.0, edición 2024)
-├── esm2_weights.bin        # Pesos FP32 de ESM-2 8M (7.51M parámetros, ~30 MB)
+├── esm2_8m_weights.bin     # Pesos FP32 de ESM-2 8M (7.51M parámetros, ~30 MB)
+├── scripts/
+│   ├── download_weights.sh # Descargador veloz de pesos desde GitHub Releases
+│   └── export_weights.py   # Exportador de pesos desde HuggingFace y fair-esm
 ├── src/
 │   ├── lib.rs              # Núcleo del motor: matmul SIMD dual, RoPE split-half, Q8_0, EsmLMHead
 │   ├── main.rs             # Despachador de CLI y parser de argumentos de subcomandos

@@ -451,7 +451,11 @@ mod tests {
 
     #[test]
     fn test_mcp_dispatch_with_weights_if_available() {
-        let model_path = "esm2_weights.bin";
+        let model_path = if std::path::Path::new("esm2_8m_weights.bin").exists() {
+            "esm2_8m_weights.bin"
+        } else {
+            "esm2_weights.bin"
+        };
         let config = EsmConfig::esm2_8m();
         let weights = match EsmWeights::from_file(model_path, &config) {
             Ok(w) => w,

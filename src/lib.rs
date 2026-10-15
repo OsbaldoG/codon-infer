@@ -925,11 +925,15 @@ mod tests {
 
     #[test]
     fn test_forward_pass_with_weights_if_available() {
-        if !std::path::Path::new("esm2_weights.bin").exists() {
+        let model_path = if std::path::Path::new("esm2_8m_weights.bin").exists() {
+            "esm2_8m_weights.bin"
+        } else if std::path::Path::new("esm2_weights.bin").exists() {
+            "esm2_weights.bin"
+        } else {
             return;
-        }
+        };
         let config = EsmConfig::esm2_8m();
-        let weights = EsmWeights::from_file("esm2_weights.bin", &config).expect("weights should load");
+        let weights = EsmWeights::from_file(model_path, &config).expect("weights should load");
         let mut state = RunState::new(&config);
         forward(1, 0, &config, &weights, &mut state);
         assert!(!state.logits[0].is_nan());
@@ -955,11 +959,15 @@ mod tests {
 
     #[test]
     fn test_forward_bidirectional_if_available() {
-        if !std::path::Path::new("esm2_weights.bin").exists() {
+        let model_path = if std::path::Path::new("esm2_8m_weights.bin").exists() {
+            "esm2_8m_weights.bin"
+        } else if std::path::Path::new("esm2_weights.bin").exists() {
+            "esm2_weights.bin"
+        } else {
             return;
-        }
+        };
         let config = EsmConfig::esm2_8m();
-        let weights = EsmWeights::from_file("esm2_weights.bin", &config).expect("weights should load");
+        let weights = EsmWeights::from_file(model_path, &config).expect("weights should load");
         let mut bi_state = BidirectionalRunState::new(&config, 32);
         let tokens = Tokenizer::encode("MCMP*TTD");
         forward_bidirectional(&tokens, &config, &weights, &mut bi_state);
@@ -970,11 +978,15 @@ mod tests {
 
     #[test]
     fn test_bidirectional_logits_entropy() {
-        if !std::path::Path::new("esm2_weights.bin").exists() {
+        let model_path = if std::path::Path::new("esm2_8m_weights.bin").exists() {
+            "esm2_8m_weights.bin"
+        } else if std::path::Path::new("esm2_weights.bin").exists() {
+            "esm2_weights.bin"
+        } else {
             return;
-        }
+        };
         let config = EsmConfig::esm2_8m();
-        let weights = EsmWeights::from_file("esm2_weights.bin", &config).expect("weights should load");
+        let weights = EsmWeights::from_file(model_path, &config).expect("weights should load");
         let mut bi_state = BidirectionalRunState::new(&config, 32);
         let tokens = Tokenizer::encode("MCMP*TTD");
         forward_bidirectional(&tokens, &config, &weights, &mut bi_state);

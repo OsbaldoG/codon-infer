@@ -227,7 +227,34 @@ cd codon-infer
 cargo build --release
 ```
 
-### 2. Run Test Suite
+### 2. Pretrained Weights & GitHub Releases
+
+`codon-infer` standardizes model binary files on clean, explicit nomenclature:
+* **ESM-2 8M (`esm2_8m_weights.bin`):** Pre-packaged in the repository root (~30 MB FP32) for instant out-of-the-box inference, local development, and rapid unit testing without external downloads.
+* **ESM-2 35M (`esm2_35m_weights.bin`):** Higher capacity model (~133 MB FP32), hosted in [GitHub Releases](https://github.com/OsbaldoG/codon-infer/releases/tag/v1.4.0) to prevent Git repository bloat.
+* **ESM-2 150M (`esm2_150m_weights.bin`):** Publication-grade structural contact and high-fidelity model (~590 MB FP32), hosted in [GitHub Releases](https://github.com/OsbaldoG/codon-infer/releases/tag/v1.4.0).
+
+#### Download Weights via `curl`
+Directly download the desired scaled binary model into your repository root:
+```bash
+# Download ESM-2 35M weights (~133 MB)
+curl -L -o esm2_35m_weights.bin https://github.com/OsbaldoG/codon-infer/releases/download/v1.4.0/esm2_35m_weights.bin
+
+# Download ESM-2 150M weights (~590 MB)
+curl -L -o esm2_150m_weights.bin https://github.com/OsbaldoG/codon-infer/releases/download/v1.4.0/esm2_150m_weights.bin
+
+# Or use the automated helper script:
+./scripts/download_weights.sh 35m
+./scripts/download_weights.sh 150m
+```
+
+> [!TIP]
+> You can also export custom weights directly from HuggingFace Transformers or Meta `fair-esm` using the provided Python utility:
+> ```bash
+> python3 scripts/export_weights.py --model 35M
+> ```
+
+### 3. Run Test Suite
 Verify numerical primitives, SIMD vectorization parity, FASTA parser, and export formats:
 ```bash
 cargo test
@@ -261,7 +288,7 @@ test mcp::tests::test_mcp_dispatch_with_weights_if_available ... ok
 test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; finished in 7.45s
 ```
 
-### 3. Subcommands & Bioinformatic Pipelines
+### 4. Subcommands & Bioinformatic Pipelines
 
 All subcommands support the global `--model <PATH>` flag. `codon-infer` automatically detects whether the binary corresponds to **ESM-2 8M**, **35M**, or **150M** (FP32 or quantized `Q8_0`) and configures the hardware kernels accordingly.
 
@@ -272,8 +299,8 @@ Execute de novo sequence generation or motif extension:
 codon-infer generate --sequence "MCMPCFTTDHQMARKCDD" --temperature 0.7 --max-tokens 40
 
 # Multi-scale: Run with ESM-2 35M or 150M
-codon-infer generate --model esm2_35m.bin --sequence "MCMPCFTTDHQMARKCDD" --temperature 0.7
-codon-infer generate --model esm2_150m.bin --sequence "MCMPCFTTDHQMARKCDD" --temperature 0.7
+codon-infer generate --model esm2_35m_weights.bin --sequence "MCMPCFTTDHQMARKCDD" --temperature 0.7
+codon-infer generate --model esm2_150m_weights.bin --sequence "MCMPCFTTDHQMARKCDD" --temperature 0.7
 ```
 
 #### B. Bidirectional Inpainting & Motif Infilling (`inpaint`)
@@ -283,7 +310,7 @@ Reconstruct missing, ambiguous, or masked active-site motifs (marked with `*` or
 codon-infer inpaint --sequence "MCMPC*TTDHQMARKCDD"
 
 # With higher capacity ESM-2 35M weights:
-codon-infer inpaint --model esm2_35m.bin --sequence "MCMPC*TTDHQMARKCDD"
+codon-infer inpaint --model esm2_35m_weights.bin --sequence "MCMPC*TTDHQMARKCDD"
 ```
 
 #### C. In Silico Deep Mutational Scanning (`dms`)
@@ -293,21 +320,21 @@ Perform comprehensive single-point saturation mutagenesis with TrueColor thermal
 codon-infer dms --fasta proteins.fasta --window 128 --export-csv dms_matrix.csv --export-json dms_report.json
 
 # High-fidelity scanning with ESM-2 150M:
-codon-infer dms --model esm2_150m.bin --fasta target.fasta --window 128 --export-csv dms_150m.csv
+codon-infer dms --model esm2_150m_weights.bin --fasta target.fasta --window 128 --export-csv dms_150m.csv
 ```
 
 #### D. Zero-Shot Structural Contact Prediction (`contacts`)
 Compute epistatic residue couplings using multi-head attention contact maps (APC-corrected) and identify putative disulfide bonds:
 ```bash
 # Predict 3D contact pairs with ESM-2 150M for publication-grade precision:
-codon-infer contacts --model esm2_150m.bin --fasta proteins.fasta --export-csv contacts.csv --export-json contacts.json
+codon-infer contacts --model esm2_150m_weights.bin --fasta proteins.fasta --export-csv contacts.csv --export-json contacts.json
 ```
 
 #### E. Hardware & Biological Benchmark Suite (`benchmark`)
 Execute the full hardware stress and biological validation suite across any model size:
 ```bash
 codon-infer benchmark --suite full
-codon-infer benchmark --model esm2_35m.bin --suite full
+codon-infer benchmark --model esm2_35m_weights.bin --suite full
 ```
 
 Available suites:
@@ -319,14 +346,14 @@ Available suites:
 * `stress`: 10,000-token continuous inference cache-thrashing stability test.
 * `scaling`: Context length scaling ($L = 32 \to 256$) memory and latency benchmark.
 
-### 4. Model Context Protocol (MCP) Server
+### 5. Model Context Protocol (MCP) Server
 `codon-infer-mcp` exposes the entire bioinformatic engine as native tools for LLM agents (Claude Desktop, Cursor, Gemini, etc.) over stdio JSON-RPC:
 ```bash
 # Launch with default ESM-2 8M weights
 cargo run --release --bin codon-infer-mcp
 
 # Launch with higher-capacity ESM-2 35M or 150M weights
-cargo run --release --bin codon-infer-mcp -- --model esm2_35m.bin
+cargo run --release --bin codon-infer-mcp -- --model esm2_35m_weights.bin
 ```
 
 #### Tools Exposed over MCP:
@@ -344,8 +371,8 @@ cargo run --release --bin codon-infer-mcp -- --model esm2_35m.bin
 | :--- | :--- | :--- |
 | `-h`, `--help` | Display help banner with subcommand guide | - |
 | `-V`, `--version` | Display version and active SIMD vector engine | - |
-| `--model <PATH>` | Custom ESM-2 raw FP32 weights binary | `esm2_weights.bin` |
-| `--color <auto\|always\|never>` | Control ANSI TrueColor terminal styling | `auto` |
+| `--model <PATH>` | Custom ESM-2 raw FP32 weights binary | `esm2_8m_weights.bin` |
+| `--color <auto|always|never>` | Control ANSI TrueColor terminal styling | `auto` |
 | `--no-color` | Strictly disable ANSI terminal escapes (NO_COLOR standard) | `false` |
 
 ### Pipeline Options
@@ -371,7 +398,10 @@ codon-infer/
 │   └── config.toml         # Native CPU optimization flags (-C target-cpu=native)
 ├── .gitignore              # Clean repository filter (build artifacts & backups ignored)
 ├── Cargo.toml              # Zero-dependency specification (v1.4.0, edition 2024)
-├── esm2_weights.bin        # ESM-2 8M FP32 weights (7.51M parameters, ~30 MB)
+├── esm2_8m_weights.bin     # ESM-2 8M FP32 weights (7.51M parameters, ~30 MB)
+├── scripts/
+│   ├── download_weights.sh # Fast GitHub Releases weights downloader
+│   └── export_weights.py   # HuggingFace & fair-esm weight exporter
 ├── src/
 │   ├── lib.rs              # Core engine: dual SIMD matmul, RoPE split-half, Q8_0, EsmLMHead
 │   ├── main.rs             # CLI dispatcher & subcommand argument parser

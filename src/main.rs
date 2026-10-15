@@ -39,7 +39,7 @@ fn print_help(theme: &TerminalTheme) {
     println!("\nGLOBAL OPTIONS:");
     println!("    -h, --help               Print help information");
     println!("    -V, --version            Print engine version and active vector acceleration");
-    println!("    --model <PATH>           Path to weights binary (default: esm2_weights.bin)");
+    println!("    --model <PATH>           Path to weights binary (default: esm2_8m_weights.bin)");
     println!("    --color <auto|always|never> Control ANSI TrueColor terminal styling");
     println!("    --no-color               Disable all colored terminal escapes (NO_COLOR standard)");
     println!("\nSUBCOMMAND EXAMPLES:");
@@ -110,10 +110,12 @@ fn main() -> io::Result<()> {
     let theme = TerminalTheme::detect(color_arg.as_deref(), no_color_flag);
 
     // Default model weights path
-    let mut model_path = if std::path::Path::new("esm2_weights.bin").exists() {
+    let mut model_path = if std::path::Path::new("esm2_8m_weights.bin").exists() {
+        "esm2_8m_weights.bin".to_string()
+    } else if std::path::Path::new("esm2_weights.bin").exists() {
         "esm2_weights.bin".to_string()
     } else {
-        "esm2_pesos.bin".to_string()
+        "esm2_8m_weights.bin".to_string()
     };
 
     // Subcommand dispatch

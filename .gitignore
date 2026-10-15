@@ -32,7 +32,11 @@ codon-infer-mcp
 dms_output.*
 contacts_output.*
 
-# Large multi-model weights binaries (>100MB)
+# Large multi-model weights binaries (>30MB)
 *_pesos.bin
 esm2_35m*.bin
 esm2_150m*.bin
+*_35m_*.bin
+*_150m_*.bin
+esm2_35m_weights.bin
+esm2_150m_weights.bin
