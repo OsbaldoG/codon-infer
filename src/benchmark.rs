@@ -1863,7 +1863,7 @@ pub fn run_multi_model_benchmark_suite(
     theme: &TerminalTheme,
     export_json_path: Option<&str>,
 ) -> io::Result<MultiModelBenchmarkReport> {
-    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let threads = crate::detect_optimal_threads();
     run_benchmark_cli(model_paths, suite_filter, theme, export_json_path, threads, false)
 }
 
@@ -1877,7 +1877,7 @@ pub fn run_full_benchmark_suite(
     if model_paths.is_empty() {
         model_paths.push("esm2_8m_weights.bin".to_string());
     }
-    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let threads = crate::detect_optimal_threads();
     let _ = run_benchmark_cli(&model_paths, suite_filter, &theme, None, threads, false);
 }
 

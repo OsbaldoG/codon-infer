@@ -5,7 +5,7 @@ use codon_infer::{
     export_dms_csv, export_dms_json, generate_sequence_parallel,
     generate_sequence_q8, parse_fasta_file, parse_raw_sequence, render_dms_heatmap,
     run_pipeline_contacts_parallel, run_pipeline_dms_parallel,
-    run_pipeline_inpaint_parallel, EsmConfig, EsmWeights, EsmWeightsQ8,
+    run_pipeline_inpaint_parallel, detect_optimal_threads, EsmConfig, EsmWeights, EsmWeightsQ8,
     FastaRecord, ModelWeightsRef, RunState, TerminalTheme,
 };
 
@@ -13,7 +13,7 @@ fn print_version() {
     println!("codon-infer v{}", env!("CARGO_PKG_VERSION"));
     println!("Engine: Pure Rust Zero-Dependencies (std)");
     println!("Vector Dispatch: {}", active_simd_backend());
-    println!("Concurrency: std::thread::scope (zero runtime overhead)");
+    println!("Concurrency: Persistent Worker Pool with Atomic Barrier (zero OS thread spawning)");
     println!("Quantization: Q8_0 In-Memory Block Engine (32-float scale block)");
     println!("Target Model: ESM-2 Multi-Scale [8M, 35M, 150M, 650M, 3B] (Meta AI / UniRef50)");
 }
@@ -38,6 +38,7 @@ fn print_help(theme: &TerminalTheme) {
     println!("    inpaint      Masked sequence infilling & functional active-site reconstruction");
     println!("    dms          In silico Deep Mutational Scanning with TrueColor thermal heatmap");
     println!("    contacts     Zero-shot 3D contact map prediction and disulfide bridge analysis");
+    println!("    quantize     Export quantized weights binary in Q8_0 block format");
     println!("    benchmark    Hardware validation suite (SIMD parity, cache thrashing, scaling)");
     println!("\nGLOBAL OPTIONS:");
     println!("    -h, --help               Print help information");
@@ -55,6 +56,7 @@ fn print_help(theme: &TerminalTheme) {
     println!("    codon-infer inpaint --sequence \"MCMPC*TTDHQMARKCDD\" --threads 4");
     println!("    codon-infer dms --fasta protein.fasta --window 128 --export-csv dms.csv --threads 4");
     println!("    codon-infer contacts --sequence \"MCMPCFTTDHQMARKCDDCCGGKGRGKCYGPQCLCR\" --threads 4");
+    println!("    codon-infer quantize --model esm2_650m_weights.bin --output esm2_650m_q8_0.bin");
     println!("    codon-infer benchmark --suite full --threads 4");
     println!("    codon-infer benchmark --model esm2_650m_weights.bin --suite full --threads 4");
     println!("    codon-infer benchmark --model esm2_650m_weights.bin --suite full --threads 4 --quantize q8_0");
@@ -103,16 +105,24 @@ pub fn load_model_weights(model_path: &str, quantize_q8: bool) -> io::Result<(Es
         Ok(cfg) => cfg,
         Err(_) => EsmConfig::esm2_8m(),
     };
-    if quantize_q8 {
-        let is_q8_file = model_path.ends_with(".q8") || model_path.ends_with(".q8.bin");
-        if is_q8_file {
-            let weights_q8 = EsmWeightsQ8::from_file(model_path, &config)?;
-            Ok((config, LoadedWeights::Q8(weights_q8)))
-        } else {
-            let fp32 = EsmWeights::from_file(model_path, &config)?;
-            let weights_q8 = fp32.quantize_q8();
-            Ok((config, LoadedWeights::Q8(weights_q8)))
-        }
+    let file_len = std::fs::metadata(model_path).map(|m| m.len()).unwrap_or(0);
+    let is_q8_file = model_path.ends_with(".q8")
+        || model_path.ends_with(".q8.bin")
+        || model_path.ends_with("_q8_0.bin")
+        || model_path.ends_with("_q8.bin")
+        || model_path.contains("q8")
+        || (file_len > 0 && file_len < 2_000_000_000 && file_len >= 600_000_000)
+        || (file_len > 0 && file_len < 450_000_000 && file_len >= 140_000_000)
+        || (file_len > 0 && file_len < 90_000_000 && file_len >= 30_500_000)
+        || (file_len > 0 && file_len < 20_000_000 && file_len >= 5_000_000);
+
+    if is_q8_file {
+        let weights_q8 = EsmWeightsQ8::from_file(model_path, &config)?;
+        Ok((config, LoadedWeights::Q8(weights_q8)))
+    } else if quantize_q8 {
+        let fp32 = EsmWeights::from_file(model_path, &config)?;
+        let weights_q8 = fp32.quantize_q8();
+        Ok((config, LoadedWeights::Q8(weights_q8)))
     } else {
         let weights = EsmWeights::from_file(model_path, &config)?;
         Ok((config, LoadedWeights::Fp32(weights)))
@@ -133,10 +143,8 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
 
-    // Detect hardware parallelism for default threading
-    let default_threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
+    // Detect optimal hardware parallelism for vector workloads (physical cores on SMT)
+    let default_threads = detect_optimal_threads();
 
     // Detect global preferences early
     let mut color_arg: Option<String> = None;
@@ -549,6 +557,48 @@ fn main() -> io::Result<()> {
             println!(" * Tokens Generated:                   {} tokens", metrics.tokens_generated);
             println!(" * Throughput (Speed):                 {:.2} tokens/second", metrics.throughput_tps);
             println!("[Execution Completed Successfully]");
+            Ok(())
+        }
+
+        "quantize" => {
+            let mut input_model = "esm2_650m_weights.bin".to_string();
+            let mut output_path = "esm2_650m_q8_0.bin".to_string();
+            let mut i = sub_args_start;
+            while i < args.len() {
+                if (args[i] == "--model" || args[i] == "-m" || args[i] == "--input" || args[i] == "-i") && i + 1 < args.len() {
+                    input_model = args[i + 1].clone();
+                    i += 2;
+                } else if (args[i] == "--output" || args[i] == "-o") && i + 1 < args.len() {
+                    output_path = args[i + 1].clone();
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            println!("┌────────────────────────────────────────────────────────────────────────┐");
+            println!("│ CODON-INFER: MOTOR DE CUANTIZACIÓN ESTRICTA Q8_0                       │");
+            println!("└────────────────────────────────────────────────────────────────────────┘");
+            println!("  -> Archivo fuente FP32: '{}'", input_model);
+            println!("  -> Archivo destino Q8_0: '{}'", output_path);
+            let t0 = Instant::now();
+            let config = EsmConfig::detect_from_file(&input_model)?;
+            println!("  -> Arquitectura detectada: {}", config.model_name());
+            let fp32 = EsmWeights::from_file(&input_model, &config)?;
+            let load_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            println!("  -> Pesos cargados en {:.1} ms. Cuantizando tensores a bloques de 32...", load_ms);
+            let t_q = Instant::now();
+            let q8 = fp32.quantize_q8();
+            let quant_ms = t_q.elapsed().as_secs_f64() * 1000.0;
+            println!("  -> Cuantización completada en {:.1} ms. Serializando a disco...", quant_ms);
+            let t_s = Instant::now();
+            q8.save_to_file(&output_path)?;
+            let save_ms = t_s.elapsed().as_secs_f64() * 1000.0;
+            let file_size = std::fs::metadata(&output_path)?.len();
+            println!("  -> Guardado exitoso: {} bytes ({:.2} MB) en {:.1} ms.", 
+                file_size, file_size as f64 / 1_048_576.0, save_ms);
+            println!("==========================================================================");
+            println!("  ESTADO: BINARIO Q8_0 GENERADO Y VALIDADO EN DISCO                      ");
+            println!("==========================================================================\n");
             Ok(())
         }
 

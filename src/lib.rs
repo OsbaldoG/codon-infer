@@ -1,6 +1,8 @@
 #![allow(unused_unsafe, unsafe_op_in_unsafe_fn)]
 use std::fs::File;
 use std::io::{self, Read, Seek, Write};
+use std::sync::{Arc, Mutex, Condvar, OnceLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 pub mod mcp;
@@ -137,22 +139,22 @@ impl EsmConfig {
         } else if file_len >= 2_000_000_000 {
             // ESM-2 650M: ~2.60 GB (FP32)
             Ok(Self::esm2_650m())
-        } else if file_len >= 700_000_000 {
-            // ESM-2 650M: ~732 MB - 780 MB (Q8_0)
+        } else if file_len >= 600_000_000 {
+            // ESM-2 650M: ~698.5 MB - 780 MB (Q8_0)
             Ok(Self::esm2_650m())
         } else if file_len >= 450_000_000 {
             // ESM-2 150M: ~592.5 MB (FP32)
             Ok(Self::esm2_150m())
-        } else if file_len >= 155_000_000 {
+        } else if file_len >= 140_000_000 {
             // ESM-2 150M: ~166 MB - 178 MB (Q8_0)
             Ok(Self::esm2_150m())
-        } else if file_len >= 95_000_000 {
+        } else if file_len >= 80_000_000 {
             // ESM-2 35M: ~134 MB (FP32)
             Ok(Self::esm2_35m())
-        } else if file_len >= 34_000_000 {
+        } else if file_len >= 30_500_000 {
             // ESM-2 35M: ~38 MB - 48 MB (Q8_0)
             Ok(Self::esm2_35m())
-        } else if file_len >= 22_000_000 {
+        } else if file_len >= 20_000_000 {
             // ESM-2 8M: ~30 MB (FP32)
             Ok(Self::esm2_8m())
         } else if file_len >= 6_000_000 {
@@ -162,7 +164,7 @@ impl EsmConfig {
             Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "Unrecognized ESM-2 weights size: {} bytes. Expected ~30MB/9MB (8M), ~134MB/38MB (35M), ~592MB/167MB (150M), ~2.6GB/732MB (650M), or ~11.4GB/3.2GB (3B).",
+                    "Unrecognized ESM-2 weights size: {} bytes. Expected ~30MB/9MB (8M), ~134MB/38MB (35M), ~592MB/167MB (150M), ~2.6GB/698MB (650M), or ~11.4GB/3.2GB (3B).",
                     file_len
                 ),
             ))
@@ -744,6 +746,219 @@ pub fn matmul(out: &mut [f32], x: &[f32], w: &[f32], bias: &[f32], in_dim: usize
     matmul_scalar(out, x, w, bias, in_dim, out_dim);
 }
 
+// ==========================================
+// PERSISTENT WORKER THREAD POOL (ZERO OS SPAWNING)
+// ==========================================
+
+struct SharedJob {
+    job_fn: Option<unsafe fn(*const (), usize, usize)>,
+    context: *const (),
+    num_threads: usize,
+    generation: usize,
+    shutdown: bool,
+}
+
+unsafe impl Send for SharedJob {}
+unsafe impl Sync for SharedJob {}
+
+struct ThreadPoolInner {
+    job_state: Mutex<SharedJob>,
+    job_condvar: Condvar,
+    done_count: AtomicUsize,
+    done_mutex: Mutex<()>,
+    done_condvar: Condvar,
+}
+
+pub struct ThreadPool {
+    run_lock: Mutex<()>,
+    inner: Arc<ThreadPoolInner>,
+    handles: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl ThreadPool {
+    pub fn new(num_workers: usize) -> Self {
+        let inner = Arc::new(ThreadPoolInner {
+            job_state: Mutex::new(SharedJob {
+                job_fn: None,
+                context: std::ptr::null(),
+                num_threads: 1,
+                generation: 0,
+                shutdown: false,
+            }),
+            job_condvar: Condvar::new(),
+            done_count: AtomicUsize::new(0),
+            done_mutex: Mutex::new(()),
+            done_condvar: Condvar::new(),
+        });
+
+        let mut handles = Vec::with_capacity(num_workers);
+        for worker_id in 1..=num_workers {
+            let inner_clone = Arc::clone(&inner);
+            let handle = std::thread::Builder::new()
+                .name(format!("codon-worker-{}", worker_id))
+                .spawn(move || {
+                    let mut my_generation = 0;
+                    loop {
+                        let (job_fn, context, num_threads) = {
+                            let mut state = inner_clone.job_state.lock().unwrap();
+                            while state.generation == my_generation && !state.shutdown {
+                                state = inner_clone.job_condvar.wait(state).unwrap();
+                            }
+                            if state.shutdown {
+                                break;
+                            }
+                            my_generation = state.generation;
+                            (state.job_fn, state.context, state.num_threads)
+                        };
+
+                        if worker_id < num_threads {
+                            if let Some(f) = job_fn {
+                                unsafe {
+                                    f(context, worker_id, num_threads);
+                                }
+                            }
+
+                            let needed = num_threads - 1;
+                            let prev = inner_clone.done_count.fetch_add(1, Ordering::AcqRel);
+                            if prev + 1 >= needed {
+                                let _lock = inner_clone.done_mutex.lock().unwrap();
+                                inner_clone.done_condvar.notify_one();
+                            }
+                        }
+                    }
+                })
+                .expect("Failed to spawn persistent worker thread");
+            handles.push(handle);
+        }
+
+        Self {
+            run_lock: Mutex::new(()),
+            inner,
+            handles,
+        }
+    }
+
+    pub fn run_parallel(
+        &self,
+        num_threads: usize,
+        job_fn: unsafe fn(*const (), usize, usize),
+        context: *const (),
+    ) {
+        if num_threads <= 1 {
+            unsafe { job_fn(context, 0, 1); }
+            return;
+        }
+
+        let _run_guard = self.run_lock.lock().unwrap();
+        let effective_threads = num_threads.min(self.handles.len() + 1);
+        let needed_workers = effective_threads - 1;
+        self.inner.done_count.store(0, Ordering::Release);
+
+        {
+            let mut state = self.inner.job_state.lock().unwrap();
+            state.job_fn = Some(job_fn);
+            state.context = context;
+            state.num_threads = effective_threads;
+            state.generation = state.generation.wrapping_add(1);
+            self.inner.job_condvar.notify_all();
+        }
+
+        // Calling thread executes thread 0's slice!
+        unsafe {
+            job_fn(context, 0, effective_threads);
+        }
+
+        // Wait for workers to finish
+        let mut spins = 0;
+        while self.inner.done_count.load(Ordering::Acquire) < needed_workers {
+            if spins < 500 {
+                std::hint::spin_loop();
+                spins += 1;
+            } else {
+                let mut guard = self.inner.done_mutex.lock().unwrap();
+                while self.inner.done_count.load(Ordering::Acquire) < needed_workers {
+                    guard = self.inner.done_condvar.wait(guard).unwrap();
+                }
+                break;
+            }
+        }
+    }
+}
+
+impl Drop for ThreadPool {
+    fn drop(&mut self) {
+        {
+            let mut state = self.inner.job_state.lock().unwrap();
+            state.shutdown = true;
+            state.generation = state.generation.wrapping_add(1);
+            self.inner.job_condvar.notify_all();
+        }
+        for handle in self.handles.drain(..) {
+            let _ = handle.join();
+        }
+    }
+}
+
+static GLOBAL_POOL: OnceLock<ThreadPool> = OnceLock::new();
+
+pub fn get_global_pool() -> &'static ThreadPool {
+    GLOBAL_POOL.get_or_init(|| {
+        let max_workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .max(4);
+        ThreadPool::new(max_workers)
+    })
+}
+
+/// Detects optimal thread count for HPC vector workloads.
+/// On CPUs with SMT (Hyper-Threading), physical cores avoid AVX vector unit port contention
+/// and L1/L2 cache pressure, achieving higher sustained throughput than oversubscribed logical threads.
+pub fn detect_optimal_threads() -> usize {
+    let logical = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(info) = std::fs::read_to_string("/proc/cpuinfo") {
+            for line in info.lines() {
+                if line.starts_with("cpu cores") {
+                    if let Some(val_str) = line.split(':').nth(1) {
+                        if let Ok(cores) = val_str.trim().parse::<usize>() {
+                            if cores > 0 && cores <= logical {
+                                return cores;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    logical
+}
+
+struct Fp32Job<'a> {
+    out: *mut f32,
+    x: &'a [f32],
+    w: &'a [f32],
+    bias: &'a [f32],
+    in_dim: usize,
+    out_dim: usize,
+}
+
+unsafe fn run_fp32_slice(ctx: *const (), t_idx: usize, n_threads: usize) {
+    let job = unsafe { &*(ctx as *const Fp32Job) };
+    let chunk_size = (job.out_dim + n_threads - 1) / n_threads;
+    let start_row = t_idx * chunk_size;
+    if start_row < job.out_dim {
+        let rows_in_chunk = (job.out_dim - start_row).min(chunk_size);
+        let out_slice = unsafe { std::slice::from_raw_parts_mut(job.out.add(start_row), rows_in_chunk) };
+        let bias_chunk = &job.bias[start_row..start_row + rows_in_chunk];
+        let w_start = start_row * job.in_dim;
+        let w_end = w_start + rows_in_chunk * job.in_dim;
+        let w_chunk = &job.w[w_start..w_end];
+        matmul(out_slice, job.x, w_chunk, bias_chunk, job.in_dim, rows_in_chunk);
+    }
+}
+
 pub fn matmul_parallel(
     out: &mut [f32],
     x: &[f32],
@@ -758,23 +973,15 @@ pub fn matmul_parallel(
         return;
     }
 
-    let n_threads = num_threads.min(out_dim);
-    let chunk_size = (out_dim + n_threads - 1) / n_threads;
-
-    std::thread::scope(|s| {
-        for (t_idx, out_chunk) in out.chunks_mut(chunk_size).enumerate() {
-            let start_row = t_idx * chunk_size;
-            let rows_in_chunk = out_chunk.len();
-            let bias_chunk = &bias[start_row..start_row + rows_in_chunk];
-            let w_start = start_row * in_dim;
-            let w_end = w_start + rows_in_chunk * in_dim;
-            let w_chunk = &w[w_start..w_end];
-
-            s.spawn(move || {
-                matmul(out_chunk, x, w_chunk, bias_chunk, in_dim, rows_in_chunk);
-            });
-        }
-    });
+    let job = Fp32Job {
+        out: out.as_mut_ptr(),
+        x,
+        w,
+        bias,
+        in_dim,
+        out_dim,
+    };
+    get_global_pool().run_parallel(num_threads, run_fp32_slice, &job as *const _ as *const ());
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -888,6 +1095,31 @@ pub fn matmul_q8_simd(
     matmul_q8(out, x, w, bias, in_dim, out_dim);
 }
 
+struct Q8Job<'a> {
+    out: *mut f32,
+    x: &'a [f32],
+    w: &'a [BlockQ8_0],
+    bias: &'a [f32],
+    in_dim: usize,
+    out_dim: usize,
+}
+
+unsafe fn run_q8_slice(ctx: *const (), t_idx: usize, n_threads: usize) {
+    let job = unsafe { &*(ctx as *const Q8Job) };
+    let blocks_per_row = job.in_dim / 32;
+    let chunk_size = (job.out_dim + n_threads - 1) / n_threads;
+    let start_row = t_idx * chunk_size;
+    if start_row < job.out_dim {
+        let rows_in_chunk = (job.out_dim - start_row).min(chunk_size);
+        let out_slice = unsafe { std::slice::from_raw_parts_mut(job.out.add(start_row), rows_in_chunk) };
+        let bias_chunk = &job.bias[start_row..start_row + rows_in_chunk];
+        let w_start = start_row * blocks_per_row;
+        let w_end = w_start + rows_in_chunk * blocks_per_row;
+        let w_chunk = &job.w[w_start..w_end];
+        matmul_q8_simd(out_slice, job.x, w_chunk, bias_chunk, job.in_dim, rows_in_chunk);
+    }
+}
+
 pub fn matmul_q8_parallel(
     out: &mut [f32],
     x: &[f32],
@@ -902,24 +1134,15 @@ pub fn matmul_q8_parallel(
         return;
     }
 
-    let blocks_per_row = in_dim / 32;
-    let n_threads = num_threads.min(out_dim);
-    let chunk_size = (out_dim + n_threads - 1) / n_threads;
-
-    std::thread::scope(|s| {
-        for (t_idx, out_chunk) in out.chunks_mut(chunk_size).enumerate() {
-            let start_row = t_idx * chunk_size;
-            let rows_in_chunk = out_chunk.len();
-            let bias_chunk = &bias[start_row..start_row + rows_in_chunk];
-            let w_start = start_row * blocks_per_row;
-            let w_end = w_start + rows_in_chunk * blocks_per_row;
-            let w_chunk = &w[w_start..w_end];
-
-            s.spawn(move || {
-                matmul_q8_simd(out_chunk, x, w_chunk, bias_chunk, in_dim, rows_in_chunk);
-            });
-        }
-    });
+    let job = Q8Job {
+        out: out.as_mut_ptr(),
+        x,
+        w,
+        bias,
+        in_dim,
+        out_dim,
+    };
+    get_global_pool().run_parallel(num_threads, run_q8_slice, &job as *const _ as *const ());
 }
 
 #[cfg(target_arch = "x86_64")]
