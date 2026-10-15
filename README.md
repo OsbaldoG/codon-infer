@@ -435,7 +435,6 @@ codon-infer/
 │   ├── benchmark.rs        # Automated bioinformatic & hardware stress suite
 │   ├── mcp.rs              # Zero-dependency stdio JSON-RPC MCP server
 │   └── mcp_main.rs         # Standalone MCP server executable entrypoint
-├── AUDIT_REPORT.md         # Comprehensive architectural & mathematical audit report
 ├── LICENSE                 # MIT License
 ├── README.md               # Main project documentation (English)
 └── README_ES.md            # Complete project documentation (Spanish)
