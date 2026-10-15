@@ -1,6 +1,6 @@
 #![allow(unused_unsafe, unsafe_op_in_unsafe_fn)]
 use std::fs::File;
-use std::io::{self, Read};
+use std::io::{self, Read, Seek};
 use std::time::Instant;
 
 pub mod mcp;
@@ -207,12 +207,28 @@ impl EsmWeights {
         let ln_f_bias = read_floats(&mut file, config.dim)?;
 
         // Dynamically read remaining bytes until EOF for classifier_weights (EsmLMHead)
-        let mut remaining_bytes = Vec::new();
-        file.read_to_end(&mut remaining_bytes)?;
-        let classifier_weights: Vec<f32> = remaining_bytes
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
-            .collect();
+        let current_pos = file.stream_position()?;
+        let file_len = file.metadata()?.len();
+        if current_pos > file_len {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Stream position exceeds file length"));
+        }
+        let remaining_bytes = (file_len - current_pos) as usize;
+        if remaining_bytes % 4 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Unaligned trailing bytes: {} is not a multiple of 4", remaining_bytes),
+            ));
+        }
+        let remaining_floats = remaining_bytes / 4;
+        let classifier_weights = read_floats(&mut file, remaining_floats)?;
+
+        let final_pos = file.stream_position()?;
+        if final_pos != file_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Weights file underread: read {} of {} bytes", final_pos, file_len),
+            ));
+        }
 
         Ok(Self {
             token_embedding_table,
@@ -347,9 +363,21 @@ pub fn matmul_q8(out: &mut [f32], x: &[f32], w: &[BlockQ8_0], bias: &[f32], in_d
 }
 
 fn read_floats(file: &mut File, num_floats: usize) -> io::Result<Vec<f32>> {
-    let mut buffer = vec![0u8; num_floats * 4]; file.read_exact(&mut buffer)?;
-    let mut floats = Vec::with_capacity(num_floats);
-    for chunk in buffer.chunks_exact(4) { floats.push(f32::from_le_bytes(chunk.try_into().unwrap())); }
+    let mut floats = Vec::<f32>::with_capacity(num_floats);
+    unsafe {
+        floats.set_len(num_floats);
+        let byte_slice = std::slice::from_raw_parts_mut(
+            floats.as_mut_ptr() as *mut u8,
+            num_floats * std::mem::size_of::<f32>(),
+        );
+        file.read_exact(byte_slice)?;
+    }
+    #[cfg(target_endian = "big")]
+    {
+        for f in floats.iter_mut() {
+            *f = f32::from_bits(f.to_bits().swap_bytes());
+        }
+    }
     Ok(floats)
 }
 
@@ -847,8 +875,37 @@ pub fn forward(token: usize, pos: usize, config: &EsmConfig, weights: &EsmWeight
         for i in 0..dim { state.x[i] += state.xb[i]; }
     }
     layer_norm(&mut state.xb, &state.x, &weights.ln_f_weight, &weights.ln_f_bias);
-    const ZERO_BIAS: [f32; 33] = [0.0; 33];
-    matmul(&mut state.logits, &state.xb, &weights.token_embedding_table, &ZERO_BIAS, dim, config.vocab_size);
+    project_lm_head(&mut state.logits, &state.xb, weights, config, &mut state.hb, &mut state.hb2);
+}
+
+pub fn project_lm_head(
+    logits: &mut [f32],
+    x_norm: &[f32],
+    weights: &EsmWeights,
+    config: &EsmConfig,
+    dense_buf: &mut [f32],
+    ln_buf: &mut [f32],
+) {
+    let dim = config.dim;
+    let required_len = 3 * dim + dim * dim + config.vocab_size * dim + config.vocab_size;
+    if weights.classifier_weights.len() >= required_len {
+        let lm_ln_w = &weights.classifier_weights[0..dim];
+        let lm_ln_b = &weights.classifier_weights[dim..2 * dim];
+        let lm_dense_w = &weights.classifier_weights[2 * dim..2 * dim + dim * dim];
+        let lm_dense_b = &weights.classifier_weights[2 * dim + dim * dim..3 * dim + dim * dim];
+        let lm_dec_w = &weights.classifier_weights[3 * dim + dim * dim..3 * dim + dim * dim + config.vocab_size * dim];
+        let lm_dec_b = &weights.classifier_weights[3 * dim + dim * dim + config.vocab_size * dim..3 * dim + dim * dim + config.vocab_size * dim + config.vocab_size];
+
+        let dense_out = &mut dense_buf[0..dim];
+        matmul(dense_out, x_norm, lm_dense_w, lm_dense_b, dim, dim);
+        let gelu_out = &mut ln_buf[0..dim];
+        gelu(gelu_out, dense_out);
+        layer_norm(dense_out, gelu_out, lm_ln_w, lm_ln_b);
+        matmul(logits, dense_out, lm_dec_w, lm_dec_b, dim, config.vocab_size);
+    } else {
+        const ZERO_BIAS: [f32; 33] = [0.0; 33];
+        matmul(logits, x_norm, &weights.token_embedding_table, &ZERO_BIAS, dim, config.vocab_size);
+    }
 }
 
 pub fn log_softmax_canonical(logits: &[f32]) -> [f32; 33] {
@@ -1022,12 +1079,11 @@ pub fn forward_bidirectional(
         }
     }
 
-    const ZERO_BIAS: [f32; 33] = [0.0; 33];
     for p in 0..seq_len {
         let xp = &state.x[p * dim..(p + 1) * dim];
         layer_norm(&mut state.xb, xp, &weights.ln_f_weight, &weights.ln_f_bias);
         let logits_p = &mut state.logits[p * config.vocab_size..(p + 1) * config.vocab_size];
-        matmul(logits_p, &state.xb, &weights.token_embedding_table, &ZERO_BIAS, dim, config.vocab_size);
+        project_lm_head(logits_p, &state.xb, weights, config, &mut state.hb, &mut state.hb2);
     }
 }
 
