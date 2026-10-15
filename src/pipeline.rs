@@ -6,7 +6,7 @@ use crate::{
 use crate::benchmark::{ContactPair, CANONICAL_AAS};
 use crate::export::DmsPositionRow;
 use crate::fasta::FastaRecord;
-use crate::ui::{format_aa, format_dms_cell, format_sequence, ProgressBar, TerminalTheme};
+use crate::ui::{aa_category, format_aa, format_dms_cell, format_sequence, ProgressBar, TerminalTheme};
 
 /// Result of a Deep Mutational Scanning (DMS) pipeline run.
 pub struct DmsPipelineResult {
@@ -207,15 +207,25 @@ pub fn render_dms_heatmap(result: &DmsPipelineResult, max_display_rows: usize, t
     println!("└──────────────────────────────────────────────────────────────────────────────────────────┘\n");
 }
 
-/// Executes zero-shot structural contact prediction & disulfide bridge analysis.
-pub fn run_pipeline_contacts(
+/// Result of structural contact prediction and disulfide analysis.
+#[derive(Debug, Clone)]
+pub struct ContactsPipelineResult {
+    pub protein_id: String,
+    pub sequence_length: usize,
+    pub cys_indices: Vec<usize>,
+    pub cys_enrichment_ratio: f32,
+    pub top_contacts: Vec<ContactPair>,
+}
+
+/// Computes zero-shot structural contact prediction & disulfide bridge analysis without stdout printing.
+pub fn compute_pipeline_contacts(
     record: &FastaRecord,
     min_separation: usize,
     top_l_factor: f32,
+    max_k: Option<usize>,
     config: &EsmConfig,
     weights: &EsmWeights,
-    theme: &TerminalTheme,
-) -> (Vec<ContactPair>, f32, Vec<usize>) {
+) -> ContactsPipelineResult {
     let seq = &record.sequence;
     let n = seq.len();
     assert!(n >= 4, "Sequence too short for contact prediction");
@@ -296,11 +306,19 @@ pub fn run_pipeline_contacts(
     }
 
     all_pairs.sort_by(|a, b| b.apc_score.partial_cmp(&a.apc_score).unwrap_or(std::cmp::Ordering::Equal));
-    let top_k = ((n as f32 * top_l_factor).round() as usize).clamp(5, 50).min(all_pairs.len());
+    let top_k = if let Some(k) = max_k {
+        k.min(all_pairs.len())
+    } else {
+        ((n as f32 * top_l_factor).round() as usize).clamp(5, 50).min(all_pairs.len())
+    };
     let top_contacts: Vec<ContactPair> = all_pairs.into_iter().take(top_k).collect();
 
     let top_cys_count = top_contacts.iter().filter(|c| c.is_cys_cys).count();
-    let top_cys_density = top_cys_count as f32 / top_contacts.len() as f32;
+    let top_cys_density = if !top_contacts.is_empty() {
+        top_cys_count as f32 / top_contacts.len() as f32
+    } else {
+        0.0
+    };
     let bg_cys_density = if total_candidates_count > 0 {
         cys_pairs_count as f32 / total_candidates_count as f32
     } else {
@@ -313,21 +331,32 @@ pub fn run_pipeline_contacts(
         1.0
     };
 
+    ContactsPipelineResult {
+        protein_id: record.id.clone(),
+        sequence_length: n,
+        cys_indices,
+        cys_enrichment_ratio: enrichment,
+        top_contacts,
+    }
+}
+
+/// Renders the contacts table to stdout with terminal theme formatting.
+pub fn render_contacts_table(result: &ContactsPipelineResult, theme: &TerminalTheme) {
     println!("\n╔═══════════════════════════════════════════════════════════════════════════════════════════╗");
     println!("║       CODON-INFER: ZERO-SHOT STRUCTURAL CONTACT & DISULFIDE DETECTION (APC)               ║");
     println!("╚═══════════════════════════════════════════════════════════════════════════════════════════╝");
-    println!("  * Target ID:                 {}", record.id);
-    println!("  * Sequence Length:           {} amino acids", n);
-    let cys_str: Vec<String> = cys_indices.iter().map(|&idx| format!("C{}", idx + 1)).collect();
+    println!("  * Target ID:                 {}", result.protein_id);
+    println!("  * Sequence Length:           {} amino acids", result.sequence_length);
+    let cys_str: Vec<String> = result.cys_indices.iter().map(|&idx| format!("C{}", idx + 1)).collect();
     println!("  * Cysteines Identified:      {}", if cys_str.is_empty() { "None".to_string() } else { cys_str.join(", ") });
-    println!("  * Contact Density Ratio:     {:.2}x disulfide enrichment vs background", enrichment);
+    println!("  * Contact Density Ratio:     {:.2}x disulfide enrichment vs background", result.cys_enrichment_ratio);
     println!();
 
     println!("┌──────┬───────────┬───────────┬────────────┬───────────┬──────────────────────────────────┐");
     println!("│ Rank │ Residue 1 │ Residue 2 │ Separation │ APC Score │ Contact Classification           │");
     println!("├──────┼───────────┼───────────┼────────────┼───────────┼──────────────────────────────────┤");
 
-    for (rank, cp) in top_contacts.iter().enumerate() {
+    for (rank, cp) in result.top_contacts.iter().enumerate() {
         let sep = (cp.pos2 as isize - cp.pos1 as isize).abs();
         let ctype = if cp.is_cys_cys {
             "\x1b[38;2;245;158;11m★ Disulfide Bridge Candidate\x1b[0m"
@@ -341,17 +370,55 @@ pub fn run_pipeline_contacts(
             rank + 1, cp.pos1 + 1, r1_colored, cp.pos2 + 1, r2_colored, sep, cp.apc_score, ctype);
     }
     println!("└──────┴───────────┴───────────┴────────────┴───────────┴──────────────────────────────────┘\n");
-
-    (top_contacts, enrichment, cys_indices)
 }
 
-/// Executes inpainting on a masked sequence and renders candidate distributions.
-pub fn run_pipeline_inpaint(
+/// Executes zero-shot structural contact prediction & disulfide bridge analysis.
+pub fn run_pipeline_contacts(
     record: &FastaRecord,
+    min_separation: usize,
+    top_l_factor: f32,
     config: &EsmConfig,
     weights: &EsmWeights,
     theme: &TerminalTheme,
-) {
+) -> (Vec<ContactPair>, f32, Vec<usize>) {
+    let result = compute_pipeline_contacts(record, min_separation, top_l_factor, None, config, weights);
+    render_contacts_table(&result, theme);
+    (result.top_contacts, result.cys_enrichment_ratio, result.cys_indices)
+}
+
+/// Candidate amino acid prediction at a masked position.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InpaintCandidate {
+    pub amino_acid: char,
+    pub probability_pct: f32,
+    pub category: &'static str,
+}
+
+/// Single reconstructed masked site.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InpaintSite {
+    pub position: usize,       // 1-based position in sequence
+    pub token_idx: usize,      // Token index in model sequence (<cls> is 0)
+    pub native_char: char,     // Usually '*'
+    pub predicted_char: char,  // Highest probability amino acid
+    pub candidates: Vec<InpaintCandidate>, // Top-5 or canonical candidates
+}
+
+/// Result of an inpainting pipeline run.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InpaintPipelineResult {
+    pub protein_id: String,
+    pub original_sequence: String,
+    pub reconstructed_sequence: String,
+    pub sites: Vec<InpaintSite>,
+}
+
+/// Computes inpainting on a masked sequence without stdout printing.
+pub fn compute_pipeline_inpaint(
+    record: &FastaRecord,
+    config: &EsmConfig,
+    weights: &EsmWeights,
+) -> InpaintPipelineResult {
     let seq = &record.sequence;
     let tokens = Tokenizer::encode(seq);
     let mut state = BidirectionalRunState::new(config, tokens.len());
@@ -364,15 +431,70 @@ pub fn run_pipeline_inpaint(
         }
     }
 
+    let mut reconstructed_tokens = tokens.clone();
+    let mut sites = Vec::with_capacity(mask_indices.len());
+
+    for &mask_idx in &mask_indices {
+        let logits = &state.logits[mask_idx * config.vocab_size..(mask_idx + 1) * config.vocab_size];
+        let log_probs = log_softmax_canonical(logits);
+
+        let mut all_cands: Vec<(usize, f32)> = (4..=23)
+            .map(|id| (id, log_probs[id]))
+            .collect();
+        all_cands.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        let best_id = all_cands[0].0;
+        reconstructed_tokens[mask_idx] = best_id;
+        let pred_char = Tokenizer::decode(best_id).unwrap_or('?');
+
+        let top5: Vec<InpaintCandidate> = all_cands
+            .iter()
+            .take(5)
+            .map(|&(id, lp)| {
+                let c = Tokenizer::decode(id).unwrap_or('?');
+                InpaintCandidate {
+                    amino_acid: c,
+                    probability_pct: lp.exp() * 100.0,
+                    category: aa_category(c),
+                }
+            })
+            .collect();
+
+        sites.push(InpaintSite {
+            position: mask_idx, // 1-based index in sequence (since tokens[0] is <cls>)
+            token_idx: mask_idx,
+            native_char: '*',
+            predicted_char: pred_char,
+            candidates: top5,
+        });
+    }
+
+    let mut reconstructed_seq = String::with_capacity(tokens.len());
+    for &t in &reconstructed_tokens[1..reconstructed_tokens.len() - 1] {
+        if let Some(c) = Tokenizer::decode(t) {
+            reconstructed_seq.push(c);
+        }
+    }
+
+    InpaintPipelineResult {
+        protein_id: record.id.clone(),
+        original_sequence: seq.clone(),
+        reconstructed_sequence: reconstructed_seq,
+        sites,
+    }
+}
+
+/// Renders inpainting result table to stdout.
+pub fn render_inpaint_result(result: &InpaintPipelineResult, theme: &TerminalTheme) {
     println!("\n╔═══════════════════════════════════════════════════════════════════════════════════════════╗");
     println!("║              CODON-INFER: BIDIRECTIONAL INPAINTING & MOTIF RECONSTRUCTION                 ║");
     println!("╚═══════════════════════════════════════════════════════════════════════════════════════════╝");
-    println!("  * Input Target ID:       {}", record.id);
-    println!("  * Input Sequence:        {}", format_sequence(seq, theme));
-    println!("  * Masked Positions:      {} site(s) requiring reconstruction", mask_indices.len());
+    println!("  * Input Target ID:       {}", result.protein_id);
+    println!("  * Input Sequence:        {}", format_sequence(&result.original_sequence, theme));
+    println!("  * Masked Positions:      {} site(s) requiring reconstruction", result.sites.len());
     println!();
 
-    if mask_indices.is_empty() {
+    if result.sites.is_empty() {
         println!("  [NOTE] No masked tokens ('*' or '<mask_1>') detected in input sequence.");
         println!("  To inpaint a protein, insert '*' at residues to reconstruct, e.g. 'MCMP*TTD'.\n");
         return;
@@ -382,39 +504,29 @@ pub fn run_pipeline_inpaint(
     println!("│ Position │ Native │ Pred   │ Top-5 Candidate Probabilities & Physicochemical Class       │");
     println!("├──────────┼────────┼────────┼─────────────────────────────────────────────────────────────┤");
 
-    let mut reconstructed_tokens = tokens.clone();
-
-    for &mask_idx in &mask_indices {
-        let logits = &state.logits[mask_idx * config.vocab_size..(mask_idx + 1) * config.vocab_size];
-        let log_probs = log_softmax_canonical(logits);
-
-        let mut candidates: Vec<(usize, f32)> = (4..=23)
-            .map(|id| (id, log_probs[id]))
-            .collect();
-        candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-
-        let best_id = candidates[0].0;
-        reconstructed_tokens[mask_idx] = best_id;
-        let pred_char = Tokenizer::decode(best_id).unwrap_or('?');
-
+    for site in &result.sites {
         let mut top5_str = String::new();
-        for &(id, lp) in candidates.iter().take(5) {
-            let c = Tokenizer::decode(id).unwrap_or('?');
-            let p = lp.exp() * 100.0;
-            top5_str.push_str(&format!("{}({:.1}%) ", format_aa(c, theme), p));
+        for cand in site.candidates.iter().take(5) {
+            top5_str.push_str(&format!("{}({:.1}%) ", format_aa(cand.amino_acid, theme), cand.probability_pct));
         }
 
-        let pred_colored = format_aa(pred_char, theme);
+        let pred_colored = format_aa(site.predicted_char, theme);
         println!("│ Site {:>3} │   *    │   {}    │ {:<59} │",
-            mask_idx, pred_colored, top5_str);
+            site.position, pred_colored, top5_str);
     }
     println!("└──────────┴────────┴────────┴─────────────────────────────────────────────────────────────┘");
-
-    let mut reconstructed_seq = String::new();
-    for &t in &reconstructed_tokens[1..reconstructed_tokens.len() - 1] {
-        if let Some(c) = Tokenizer::decode(t) {
-            reconstructed_seq.push(c);
-        }
-    }
-    println!("  * Reconstructed Protein: {}\n", format_sequence(&reconstructed_seq, theme));
+    println!("  * Reconstructed Protein: {}\n", format_sequence(&result.reconstructed_sequence, theme));
 }
+
+/// Executes inpainting on a masked sequence and renders candidate distributions.
+pub fn run_pipeline_inpaint(
+    record: &FastaRecord,
+    config: &EsmConfig,
+    weights: &EsmWeights,
+    theme: &TerminalTheme,
+) -> InpaintPipelineResult {
+    let result = compute_pipeline_inpaint(record, config, weights);
+    render_inpaint_result(&result, theme);
+    result
+}
+

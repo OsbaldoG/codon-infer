@@ -159,20 +159,29 @@ cargo test
 ```
 Expected output:
 ```text
-running 16 tests
-test fasta::tests::test_parse_raw_sequence ... ok
-test fasta::tests::test_parse_single_fasta ... ok
-test fasta::tests::test_parse_multi_fasta ... ok
-test export::tests::test_csv_export_format ... ok
+running 20 tests
+test export::tests::test_json_string_serializers ... ok
+test export::tests::test_dms_row_and_csv_generation ... ok
+test fasta::tests::test_parse_raw_sequence_fallback ... ok
+test fasta::tests::test_parse_simple_fasta ... ok
 test mcp::tests::test_mcp_json_parser_and_formatter ... ok
+test mcp::tests::test_mcp_resolve_record_fallback ... ok
+test fasta::tests::test_parse_multi_fasta_with_masks ... ok
+test mcp::tests::test_mcp_tools_list_schema ... ok
+test tests::test_forward_pass_with_weights_if_available ... ok
 test tests::test_layer_norm_stability ... ok
+test tests::test_log_softmax_canonical ... ok
+test tests::test_mask_token_encoding_and_decoding ... ok
+test tests::test_matmul_avx1_and_dispatch_parity ... ok
 test tests::test_q8_0_quantization_roundtrip ... ok
+test tests::test_simd_benchmark_parity_run ... ok
 test tests::test_softmax_sum_to_one ... ok
 test tests::test_tokenizer_boundaries ... ok
-test tests::test_matmul_avx1_and_dispatch_parity ... ok
-test tests::test_forward_pass_with_weights_if_available ... ok
-...
-test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; finished in 1.05s
+test tests::test_forward_bidirectional_if_available ... ok
+test tests::test_bidirectional_logits_entropy ... ok
+test mcp::tests::test_mcp_dispatch_with_weights_if_available ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; finished in 7.21s
 ```
 
 ### 3. Subcommands & Bioinformatic Pipelines
@@ -215,6 +224,18 @@ Available suites:
 * `inpainting`: Multi-position bidirectional masked sequence infilling.
 * `stress`: 10,000-token continuous inference cache-thrashing stability test.
 * `scaling`: Context length scaling ($L = 32 \to 256$) memory and latency benchmark.
+
+### 4. Model Context Protocol (MCP) Server
+`codon-infer-mcp` exposes the entire bioinformatic engine as native tools for LLM agents (Claude Desktop, Cursor, Gemini, etc.) over stdio JSON-RPC:
+```bash
+cargo run --release --bin codon-infer-mcp
+```
+
+#### Tools Exposed over MCP:
+* `generate_protein`: Autoregressive sequence generation given `prompt`, `temperature`, `max_tokens`.
+* `codon_infer_inpaint`: Reconstructs masked residues (`*`) returning top-5 amino acid candidates with probabilities and physicochemical classifications.
+* `codon_infer_dms`: Runs in silico saturation mutagenesis from raw sequence or FASTA path, returning critical catalytic sites ($\Delta \log P \le -3.8$) and mutational tolerances.
+* `codon_infer_contacts`: Computes epistatic contact pairs (APC) and identifies putative disulfide bridges (`Cys-Cys`).
 
 ---
 

@@ -12,8 +12,15 @@ pub mod pipeline;
 
 pub use ui::TerminalTheme;
 pub use fasta::{FastaRecord, parse_fasta_file, parse_raw_sequence};
-pub use export::{DmsPositionRow, export_dms_csv, export_dms_json, export_contacts_csv, export_contacts_json};
-pub use pipeline::{run_pipeline_dms, run_pipeline_inpaint, run_pipeline_contacts, render_dms_heatmap};
+pub use export::{
+    DmsPositionRow, export_dms_csv, export_dms_json, export_contacts_csv, export_contacts_json,
+    dms_to_json_string, contacts_to_json_string, inpaint_to_json_string,
+};
+pub use pipeline::{
+    run_pipeline_dms, run_pipeline_inpaint, run_pipeline_contacts, render_dms_heatmap,
+    compute_pipeline_inpaint, compute_pipeline_contacts, InpaintPipelineResult, InpaintSite,
+    InpaintCandidate, ContactsPipelineResult,
+};
 
 #[derive(Debug, Clone)]
 pub struct EsmConfig {
