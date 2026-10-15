@@ -146,8 +146,12 @@ $$\frac{16}{8} = 2 \text{ registers}, \quad \frac{24}{8} = 3 \text{ registers}, 
 | **Total Parameters** | 7,511,809 (~7.5M) | 33,524,449 (~33.5M) | 148,011,297 (~148M) |
 | **Binary Size (FP32)** | ~30.0 MB | ~134.1 MB | ~592.5 MB |
 | **Quantized Binary Size (`Q8_0`)** | ~11.5 MB | ~48.2 MB | ~178.6 MB |
-| **Cache Hierarchy Residency** | **100% in L3 Cache** (32 MB) | Partial Residency in L3 (64 MB L3D) | Streaming from RAM |
-| **Typical CPU Throughput (tokens/s)** | **>200 tokens/s** | **~90 – 110 tokens/s** | **~25 – 35 tokens/s** |
+| **Weight Load Latency** | **34 – 38 ms** | **117 – 122 ms** | **466 – 487 ms** |
+| **Autoregressive Throughput (Generate)** | **>315 tokens/s** (~3.1 ms/tok) | **~80 – 85 tokens/s** (~11.8 ms/tok) | **~18 – 20 tokens/s** (~53.0 ms/tok) |
+| **Bidirectional Throughput (Inpaint)** | **>400 tokens/s** (~76 ms / $L=32$) | **~85 – 90 tokens/s** (~356 ms / $L=32$) | **~18 – 21 tokens/s** (~1,580 ms / $L=32$) |
+| **Working State Memory ($L=128$)** | **~911 KB** | **~1,321 KB** | **~1,732 KB** |
+| **Cache Hierarchy Residency** | **100% in L3 Cache** ($\le 32$ MB) | Partial Residency in L3 / DDR | Streaming from RAM ($> 500$ MB) |
+| **Memory Bandwidth Demand** | **Compute-Bound (AVX/SIMD)** | **Balanced Cache/DRAM** | **Memory-Bus Limited** |
 | **Primary Use Case** | Fast in silico DMS, real-time inpainting | High-resolution DMS, peptide screening | 3D contact prediction, de novo design |
 
 ---
@@ -333,18 +337,25 @@ codon-infer contacts --model esm2_150m_weights.bin --fasta proteins.fasta --expo
 #### E. Hardware & Biological Benchmark Suite (`benchmark`)
 Execute the full hardware stress and biological validation suite across any model size:
 ```bash
+# Execute comparative cross-model benchmark across all discovered weights (8M, 35M, 150M):
 codon-infer benchmark --suite full
+
+# Benchmark a specific model variant:
 codon-infer benchmark --model esm2_35m_weights.bin --suite full
+
+# Export structured performance report for CI/CD pipelines:
+codon-infer benchmark --suite full --export-json benchmark_report.json
 ```
 
 Available suites:
-* `simd`: AVX2+FMA vs AVX1 numerical parity and matrix-vector microbenchmarks across $d_k \in \{16, 24, 32\}$.
+* `full`: Multi-model comparative evaluation (weight loading latency, tokens/s throughput, working memory, cache profile) plus algorithmic tests.
+* `simd`: Multi-scale AVX2+FMA vs AVX1 numerical parity and matrix-vector microbenchmarks across projection dimensions ($320 \to 1280$, $480 \to 1920$, $640 \to 2560$) and head dimensions $d_k \in \{16, 24, 32\}$.
 * `mlm`: Evolutionary pseudo-perplexity and wild-type vs disruptive mutation penalties.
 * `dms`: Deep mutational scanning calibration on bacterial catalytic peptidase motifs.
 * `contacts`: Structural contact prediction and Cys-Cys spatial proximity scoring.
 * `inpainting`: Multi-position bidirectional masked sequence infilling.
-* `stress`: 10,000-token continuous inference cache-thrashing stability test.
-* `scaling`: Context length scaling ($L = 32 \to 256$) memory and latency benchmark.
+* `stress`: Dynamic context continuous inference cache-thrashing stability test with slice Q8 quantization.
+* `scaling`: Context length scaling ($L = 32 \to 256$) memory and latency benchmark adapting to model depth.
 
 ### 5. Model Context Protocol (MCP) Server
 `codon-infer-mcp` exposes the entire bioinformatic engine as native tools for LLM agents (Claude Desktop, Cursor, Gemini, etc.) over stdio JSON-RPC:
@@ -381,12 +392,12 @@ cargo run --release --bin codon-infer-mcp -- --model esm2_35m_weights.bin
 | `--sequence <STR>` | `generate`, `inpaint`, `dms`, `contacts` | Direct input amino acid sequence | `"M"` |
 | `--fasta <PATH>` | `inpaint`, `dms`, `contacts` | Path to FASTA file (or `-` for stdin) | - |
 | `--export-csv <PATH>`| `dms`, `contacts` | Destination path for rectangular matrix / table | - |
-| `--export-json <PATH>`| `dms`, `contacts` | Destination path for structured JSON analysis | - |
+| `--export-json <PATH>`| `dms`, `contacts`, `benchmark` | Destination path for structured JSON analysis / report | - |
 | `--window <USIZE>` | `dms` | Sliding window context size for long proteins | `128` |
 | `--stride <USIZE>` | `dms` | Sliding window stride step size | `64` |
 | `--temperature <F32>`| `generate` | Sampling temperature (0.0 = greedy argmax) | `0.7` |
 | `--max-tokens <USIZE>`| `generate` | Maximum new residues to generate | `1024` |
-| `--suite <STR>` | `benchmark` | Benchmark suite to execute | `"full"` |
+| `--suite <STR>` | `benchmark` | Benchmark suite (full, simd, mlm, dms, contacts, inpainting, stress, scaling) | `"full"` |
 
 ---
 

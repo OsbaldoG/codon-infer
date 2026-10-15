@@ -148,8 +148,12 @@ $$\frac{16}{8} = 2 \text{ registros}, \quad \frac{24}{8} = 3 \text{ registros}, 
 | **Parámetros Totales** | 7,511,809 (~7.5M) | 33,524,449 (~33.5M) | 148,011,297 (~148M) |
 | **Tamaño Binario (FP32)** | ~30.0 MB | ~134.1 MB | ~592.5 MB |
 | **Tamaño Binario Cuantizado (`Q8_0`)** | ~11.5 MB | ~48.2 MB | ~178.6 MB |
-| **Residencia en Jerarquía de Caché** | **100% en Caché L3** (32 MB) | Residencia Parcial en L3 (64 MB L3D) | Transmisión (*streaming*) desde RAM |
-| **Rendimiento Típico CPU (tokens/s)** | **>200 tokens/s** | **~90 – 110 tokens/s** | **~25 – 35 tokens/s** |
+| **Latencia de Carga de Pesos** | **34 – 38 ms** | **117 – 122 ms** | **466 – 487 ms** |
+| **Throughput Autorregresivo (Generate)** | **>315 tokens/s** (~3.1 ms/tok) | **~80 – 85 tokens/s** (~11.8 ms/tok) | **~18 – 20 tokens/s** (~53.0 ms/tok) |
+| **Throughput Bidireccional (Inpaint)** | **>400 tokens/s** (~76 ms / $L=32$) | **~85 – 90 tokens/s** (~356 ms / $L=32$) | **~18 – 21 tokens/s** (~1,580 ms / $L=32$) |
+| **Memoria de Estado de Trabajo ($L=128$)** | **~911 KB** | **~1,321 KB** | **~1,732 KB** |
+| **Residencia en Jerarquía de Caché** | **100% en Caché L3** ($\le 32$ MB) | Residencia Parcial en L3 / DDR | Transmisión (*streaming*) desde RAM ($> 500$ MB) |
+| **Demanda de Ancho de Banda de Memoria** | **Limitado por Cómputo (AVX/SIMD)** | **Balanceado Caché/DRAM** | **Limitado por Bus de Memoria** |
 | **Caso de Uso Primario** | DMS *in silico* ultrarrápido, inpainting en tiempo real | DMS de alta resolución, cribado de péptidos | Predicción de contactos 3D, diseño *de novo* |
 
 ---
@@ -335,18 +339,25 @@ codon-infer contacts --model esm2_150m_weights.bin --fasta proteins.fasta --expo
 #### E. Suite de Benchmarks de Hardware y Validación Biológica (`benchmark`)
 Ejecuta la suite integral de estrés de microarquitectura y validación biológica sobre cualquier escala de modelo:
 ```bash
+# Ejecutar benchmark comparativo entre todas las variantes de pesos descubiertas (8M, 35M, 150M):
 codon-infer benchmark --suite full
+
+# Evaluar una variante de modelo específica:
 codon-infer benchmark --model esm2_35m_weights.bin --suite full
+
+# Exportar reporte estructurado de rendimiento para análisis e integración continua (CI/CD):
+codon-infer benchmark --suite full --export-json benchmark_report.json
 ```
 
 Suites disponibles:
-* `simd`: Paridad numérica AVX2+FMA vs AVX1 y microbenchmarks matriz-vector en $d_k \in \{16, 24, 32\}$.
+* `full`: Evaluación comparativa multi-modelo (latencia de carga, throughput en tokens/s, memoria de trabajo, perfil de caché) más pruebas algorítmicas completas.
+* `simd`: Microbenchmarks multi-escala matriz-vector y paridad numérica AVX2+FMA vs AVX1 a través de dimensiones de proyección ($320 \to 1280$, $480 \to 1920$, $640 \to 2560$) y dimensiones de cabeza $d_k \in \{16, 24, 32\}$.
 * `mlm`: Pseudo-perplejidad evolutiva y penalizaciones comparativas entre tipo salvaje y mutaciones disruptivas.
 * `dms`: Calibración de escaneo mutacional profundo en motivos catalíticos de peptidasas bacterianas.
 * `contacts`: Predicción de contactos espaciales y puntuación de proximidad Cys-Cys.
 * `inpainting`: Reconstrucción posicional múltiple en secuencias enmascaradas bidireccionales.
-* `stress`: Prueba de estabilidad continua de 10,000 tokens bajo sobrecarga de caché.
-* `scaling`: Benchmark de escalamiento de longitud de contexto ($L = 32 \to 256$) evaluando latencia y memoria.
+* `stress`: Prueba de estabilidad continua bajo sobrecarga de caché con cuantización dinámica de rebanadas Q8.
+* `scaling`: Benchmark de escalamiento de longitud de contexto ($L = 32 \to 256$) adaptativo a la profundidad de capas del modelo.
 
 ### 5. Servidor Model Context Protocol (MCP)
 `codon-infer-mcp` expone la totalidad de las capacidades bioinformáticas como herramientas nativas para agentes LLM (Claude Desktop, Cursor, Gemini, etc.) sobre stdio mediante JSON-RPC:
@@ -383,12 +394,12 @@ cargo run --release --bin codon-infer-mcp -- --model esm2_35m_weights.bin
 | `--sequence <CADENA>` | `generate`, `inpaint`, `dms`, `contacts` | Secuencia de aminoácidos suministrada de forma directa | `"M"` |
 | `--fasta <RUTA>` | `inpaint`, `dms`, `contacts` | Ruta al archivo FASTA (o `-` para leer de stdin) | - |
 | `--export-csv <RUTA>`| `dms`, `contacts` | Ruta de destino para la matriz rectangular o tabla CSV | - |
-| `--export-json <RUTA>`| `dms`, `contacts` | Ruta de destino para el informe estructurado en JSON | - |
+| `--export-json <RUTA>`| `dms`, `contacts`, `benchmark` | Ruta de destino para el informe estructurado en JSON | - |
 | `--window <USIZE>` | `dms` | Tamaño de ventana deslizante para proteínas largas | `128` |
 | `--stride <USIZE>` | `dms` | Paso de desplazamiento de la ventana deslizante | `64` |
 | `--temperature <F32>`| `generate` | Temperatura de muestreo (0.0 = búsqueda voraz argmax) | `0.7` |
 | `--max-tokens <USIZE>`| `generate` | Número máximo de nuevos residuos a generar | `1024` |
-| `--suite <CADENA>` | `benchmark` | Suite específica de benchmark a ejecutar | `"full"` |
+| `--suite <CADENA>` | `benchmark` | Suite específica de benchmark (full, simd, mlm, dms, contacts, inpainting, stress, scaling) | `"full"` |
 
 ---
 

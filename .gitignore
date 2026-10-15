@@ -31,6 +31,7 @@ codon-infer-mcp
 *_output.json
 dms_output.*
 contacts_output.*
+benchmark_report*.json
 
 # Large multi-model weights binaries (>30MB)
 *_pesos.bin

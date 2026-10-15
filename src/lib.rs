@@ -21,6 +21,12 @@ pub use pipeline::{
     compute_pipeline_inpaint, compute_pipeline_contacts, InpaintPipelineResult, InpaintSite,
     InpaintCandidate, ContactsPipelineResult,
 };
+pub use benchmark::{
+    ModelBenchmarkMetrics, MultiModelBenchmarkReport, MultiScaleSimdReport,
+    benchmark_model_performance, discover_available_models, export_benchmark_json,
+    render_comparative_table, run_benchmark_cli, run_multi_model_benchmark_suite,
+    run_simd_benchmark, run_multi_scale_simd_benchmark,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EsmModelArch {
@@ -182,6 +188,16 @@ impl EsmWeights {
         })
     }
 
+    /// Loads and initializes ESM-2 configuration and weights from file path with automatic architecture detection.
+    pub fn load_from_file(model_path: &str) -> io::Result<(EsmConfig, Self)> {
+        let config = match EsmConfig::detect_from_file(model_path) {
+            Ok(cfg) => cfg,
+            Err(_) => EsmConfig::esm2_8m(),
+        };
+        let weights = Self::from_file(model_path, &config)?;
+        Ok((config, weights))
+    }
+
     pub fn quantize_q8(&self) -> EsmWeightsQ8 {
         EsmWeightsQ8 {
             token_embedding_table: quantize_slice_to_q8(&self.token_embedding_table),
@@ -206,6 +222,11 @@ impl EsmWeights {
             classifier_weights: self.classifier_weights.clone(),
         }
     }
+}
+
+/// Loads and initializes ESM-2 configuration and weights from file path with automatic architecture detection.
+pub fn load_model_from_file(model_path: &str) -> io::Result<(EsmConfig, EsmWeights)> {
+    EsmWeights::load_from_file(model_path)
 }
 
 #[repr(C)]

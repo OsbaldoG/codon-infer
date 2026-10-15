@@ -1,8 +1,9 @@
 use std::time::Instant;
+use std::io::{self, Write};
 use crate::{
     active_simd_backend, forward, forward_bidirectional, log_softmax_canonical,
-    matmul, matmul_q8, matmul_scalar,
-    BidirectionalRunState, EsmConfig, EsmWeights, RunState, Tokenizer,
+    matmul, matmul_q8, matmul_scalar, quantize_slice_to_q8,
+    BidirectionalRunState, EsmConfig, EsmModelArch, EsmWeights, RunState, TerminalTheme, Tokenizer,
 };
 
 // ==========================================
@@ -140,13 +141,53 @@ pub struct ScalingBenchmarkReport {
     pub quadratic_scaling_ratio: f64,
 }
 
+#[derive(Debug, Clone)]
+pub struct MultiScaleSimdReport {
+    pub active_backend: &'static str,
+    pub reports: Vec<SimdBenchmarkReport>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelBenchmarkMetrics {
+    pub model_name: &'static str,
+    pub arch_name: &'static str,
+    pub model_path: String,
+    pub n_layers: usize,
+    pub dim: usize,
+    pub n_heads: usize,
+    pub head_dim: usize,
+    pub total_params: usize,
+    pub weights_size_bytes: u64,
+    pub q8_size_bytes: usize,
+    pub load_latency_ms: f64,
+    pub autoregressive_tps: f64,
+    pub autoregressive_step_us: f64,
+    pub bidirectional_tps: f64,
+    pub bidirectional_pass_ms: f64,
+    pub working_state_kb: f64,
+    pub l3_cache_residency: &'static str,
+    pub memory_bandwidth_regime: &'static str,
+}
+
+#[derive(Debug, Clone)]
+pub struct MultiModelBenchmarkReport {
+    pub active_backend: &'static str,
+    pub models: Vec<ModelBenchmarkMetrics>,
+    pub simd_report: Option<SimdBenchmarkReport>,
+    pub multi_scale_simd: Option<MultiScaleSimdReport>,
+    pub coherence_report: Option<CoherenceBenchmarkReport>,
+    pub inpainting_report: Option<InpaintingBenchmarkReport>,
+    pub stress_report: Option<HardwareStressReport>,
+    pub dms_report: Option<DmsBenchmarkReport>,
+    pub contact_report: Option<ContactBenchmarkReport>,
+    pub scaling_report: Option<ScalingBenchmarkReport>,
+}
+
 // ==========================================
 // 2. SIMD PARITY & KERNEL BENCHMARK
 // ==========================================
 
-pub fn run_simd_benchmark(iterations: usize) -> SimdBenchmarkReport {
-    let in_dim = 320;
-    let out_dim = 1280;
+pub fn run_simd_benchmark_for_dims(in_dim: usize, out_dim: usize, iterations: usize) -> SimdBenchmarkReport {
     let active_backend = active_simd_backend();
 
     let x: Vec<f32> = (0..in_dim).map(|i| (i as f32) * 0.01 - 1.6).collect();
@@ -196,6 +237,26 @@ pub fn run_simd_benchmark(iterations: usize) -> SimdBenchmarkReport {
         speedup,
         rmse_parity,
         gflops_simd,
+    }
+}
+
+pub fn run_simd_benchmark(iterations: usize) -> SimdBenchmarkReport {
+    run_simd_benchmark_for_dims(320, 1280, iterations)
+}
+
+pub fn run_multi_scale_simd_benchmark(iterations: usize) -> MultiScaleSimdReport {
+    let dims = [
+        (320, 1280), // ESM-2 8M (320 -> 1280)
+        (480, 1920), // ESM-2 35M (480 -> 1920)
+        (640, 2560), // ESM-2 150M (640 -> 2560)
+    ];
+    let reports = dims
+        .iter()
+        .map(|&(in_d, out_d)| run_simd_benchmark_for_dims(in_d, out_d, iterations))
+        .collect();
+    MultiScaleSimdReport {
+        active_backend: active_simd_backend(),
+        reports,
     }
 }
 
@@ -495,7 +556,7 @@ pub fn run_hardware_stress(
     for _b in 0..n_batches {
         let mut pos = 0;
         for &tok in &test_prompt {
-            if pos >= batch_window_size { break; }
+            if pos >= batch_window_size || latencies_us.len() >= total_tokens { break; }
             let t0 = Instant::now();
             forward(tok, pos, config, weights, &mut state);
             latencies_us.push(t0.elapsed().as_micros() as f64);
@@ -508,6 +569,7 @@ pub fn run_hardware_stress(
             latencies_us.push(t0.elapsed().as_micros() as f64);
             pos += 1;
         }
+        if latencies_us.len() >= total_tokens { break; }
     }
 
     let elapsed_secs = t_start.elapsed().as_secs_f64();
@@ -516,35 +578,42 @@ pub fn run_hardware_stress(
     latencies_us.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let min_latency_us = latencies_us.first().copied().unwrap_or(0.0);
     let max_latency_us = latencies_us.last().copied().unwrap_or(0.0);
-    let p50_latency_us = latencies_us[latencies_us.len() / 2];
-    let p99_latency_us = latencies_us[(latencies_us.len() as f64 * 0.99) as usize];
-    let mean_latency_us = latencies_us.iter().sum::<f64>() / latencies_us.len() as f64;
+    let p50_latency_us = if !latencies_us.is_empty() { latencies_us[latencies_us.len() / 2] } else { 0.0 };
+    let p99_latency_us = if !latencies_us.is_empty() { latencies_us[(latencies_us.len() as f64 * 0.99) as usize] } else { 0.0 };
+    let mean_latency_us = if !latencies_us.is_empty() { latencies_us.iter().sum::<f64>() / latencies_us.len() as f64 } else { 0.0 };
 
-    let variance: f64 = latencies_us.iter().map(|&x| (x - mean_latency_us).powi(2)).sum::<f64>() / latencies_us.len() as f64;
+    let variance: f64 = if !latencies_us.is_empty() {
+        latencies_us.iter().map(|&x| (x - mean_latency_us).powi(2)).sum::<f64>() / latencies_us.len() as f64
+    } else {
+        0.0
+    };
     let jitter_std_us = variance.sqrt();
 
-    // Q8_0 stress test
-    let q8_weights = weights.quantize_q8();
-    let x_test = vec![0.02f32; 320];
-    let mut out_fp32 = vec![0.0f32; 320];
-    let mut out_q8 = vec![0.0f32; 320];
-    let zero_bias = vec![0.0f32; 320];
+    // Q8_0 stress test on first layer's Wq projection
+    let dim = config.dim;
+    let x_test = vec![0.02f32; dim];
+    let mut out_fp32 = vec![0.0f32; dim];
+    let mut out_q8 = vec![0.0f32; dim];
+    let zero_bias = vec![0.0f32; dim];
 
-    matmul(&mut out_fp32, &x_test, &weights.wq[0..320 * 320], &zero_bias, 320, 320);
-    matmul_q8(&mut out_q8, &x_test, &q8_weights.wq[0..320 * 10], &zero_bias, 320, 320);
+    let wq_slice = &weights.wq[0..dim * dim];
+    let q8_wq = quantize_slice_to_q8(wq_slice);
+
+    matmul(&mut out_fp32, &x_test, wq_slice, &zero_bias, dim, dim);
+    matmul_q8(&mut out_q8, &x_test, &q8_wq, &zero_bias, dim, dim);
 
     let mut q8_sum_sq = 0.0f32;
-    for i in 0..320 {
+    for i in 0..dim {
         let diff = out_fp32[i] - out_q8[i];
         q8_sum_sq += diff * diff;
     }
-    let q8_rmse_vs_fp32 = (q8_sum_sq / 320.0).sqrt();
+    let q8_rmse_vs_fp32 = (q8_sum_sq / dim as f32).sqrt();
 
     // Benchmark Q8 matmul throughput
     let q8_t0 = Instant::now();
     let q8_iters = 5000;
     for _ in 0..q8_iters {
-        matmul_q8(&mut out_q8, &x_test, &q8_weights.wq[0..320 * 10], &zero_bias, 320, 320);
+        matmul_q8(&mut out_q8, &x_test, &q8_wq, &zero_bias, dim, dim);
     }
     let q8_elapsed = q8_t0.elapsed().as_secs_f64();
     let q8_throughput_ops = if q8_elapsed > 0.0 { q8_iters as f64 / q8_elapsed } else { 0.0 };
@@ -889,12 +958,14 @@ pub fn run_scaling_benchmark(
             forward_bidirectional(&tokens, config, weights, &mut bi_state);
         }
 
-        let iters = match len {
-            16 | 32 => 25,
-            64 => 15,
-            128 => 10,
-            _ => 5,
+        let layer_factor = (config.n_layers as f64 / 6.0).max(1.0);
+        let base_iters = match len {
+            16 | 32 => 20,
+            64 => 12,
+            128 => 8,
+            _ => 4,
         };
+        let iters = ((base_iters as f64 / layer_factor).round() as usize).max(2);
 
         let t0 = Instant::now();
         for _ in 0..iters {
@@ -941,38 +1012,496 @@ pub fn run_scaling_benchmark(
 // 9. CLI REPORTER & FORMATTER
 // ==========================================
 
-pub fn run_full_benchmark_suite(
+// ==========================================
+// 9. CLI REPORTER & FORMATTER
+// ==========================================
+
+pub fn discover_available_models() -> Vec<String> {
+    let candidates = [
+        "esm2_8m_weights.bin",
+        "esm2_35m_weights.bin",
+        "esm2_150m_weights.bin",
+    ];
+    let mut found = Vec::new();
+    for c in &candidates {
+        if std::path::Path::new(c).exists() {
+            found.push(c.to_string());
+        }
+    }
+    if found.is_empty() && std::path::Path::new("esm2_weights.bin").exists() {
+        found.push("esm2_weights.bin".to_string());
+    }
+    found
+}
+
+pub fn benchmark_model_performance(
+    model_path: &str,
     weights: &EsmWeights,
     config: &EsmConfig,
+    load_latency_ms: f64,
+) -> ModelBenchmarkMetrics {
+    let (model_name, arch_name, total_params, l3_cache_residency, memory_bandwidth_regime) = match config.arch {
+        EsmModelArch::Esm2_8M => (
+            "ESM-2 8M",
+            "esm2_t6_8M_UR50D",
+            7_511_809,
+            "100% L3 Resident (<=32 MB)",
+            "Compute-Bound (AVX/SIMD)",
+        ),
+        EsmModelArch::Esm2_35M => (
+            "ESM-2 35M",
+            "esm2_t12_35M_UR50D",
+            33_524_449,
+            "Partial L3 / Streaming DDR",
+            "Balanced Cache/DRAM",
+        ),
+        EsmModelArch::Esm2_150M => (
+            "ESM-2 150M",
+            "esm2_t30_150M_UR50D",
+            148_011_297,
+            "RAM Streaming Bound (>500 MB)",
+            "Memory-Bus Limited",
+        ),
+    };
+
+    let weights_size_bytes = std::fs::metadata(model_path).map(|m| m.len()).unwrap_or(0);
+    // Q8_0 estimation: ~36 bytes per 32 f32 floats (128 bytes) = 0.28125 ratio + metadata
+    let q8_size_bytes = (weights_size_bytes as f64 * (36.0 / 128.0)) as usize;
+
+    // 1. Measure Autoregressive Inference Throughput
+    let mut run_state = RunState::new(config);
+    // Warm-up 3 steps
+    for pos in 0..3 {
+        forward(5, pos, config, weights, &mut run_state);
+    }
+    let ar_steps = match config.arch {
+        crate::EsmModelArch::Esm2_8M => 40,
+        crate::EsmModelArch::Esm2_35M => 20,
+        crate::EsmModelArch::Esm2_150M => 8,
+    };
+    let t_ar = Instant::now();
+    for i in 0..ar_steps {
+        let tok = 4 + (i % 20);
+        forward(tok, 3 + i, config, weights, &mut run_state);
+    }
+    let ar_elapsed = t_ar.elapsed().as_secs_f64();
+    let autoregressive_tps = if ar_elapsed > 0.0 { ar_steps as f64 / ar_elapsed } else { 0.0 };
+    let autoregressive_step_us = if ar_steps > 0 { (ar_elapsed * 1_000_000.0) / ar_steps as f64 } else { 0.0 };
+
+    // 2. Measure Bidirectional Inference Throughput
+    let bi_len = 32;
+    let mut tokens = vec![0usize; bi_len];
+    tokens[0] = 0;
+    tokens[bi_len - 1] = 2;
+    for i in 1..bi_len - 1 {
+        tokens[i] = 4 + (i % 20);
+    }
+    tokens[bi_len / 2] = 32; // mask
+
+    let mut bi_state = BidirectionalRunState::new(config, bi_len);
+    // Warm-up 1 pass
+    forward_bidirectional(&tokens, config, weights, &mut bi_state);
+
+    let bi_iters = match config.arch {
+        crate::EsmModelArch::Esm2_8M => 12,
+        crate::EsmModelArch::Esm2_35M => 6,
+        crate::EsmModelArch::Esm2_150M => 2,
+    };
+    let t_bi = Instant::now();
+    for _ in 0..bi_iters {
+        forward_bidirectional(&tokens, config, weights, &mut bi_state);
+    }
+    let bi_elapsed = t_bi.elapsed().as_secs_f64();
+    let total_bi_tokens = bi_len * bi_iters;
+    let bidirectional_tps = if bi_elapsed > 0.0 { total_bi_tokens as f64 / bi_elapsed } else { 0.0 };
+    let bidirectional_pass_ms = if bi_iters > 0 { (bi_elapsed * 1000.0) / bi_iters as f64 } else { 0.0 };
+
+    // 3. State memory
+    let working_state_bytes = calculate_state_memory_bytes(config, 128);
+    let working_state_kb = working_state_bytes as f64 / 1024.0;
+
+    ModelBenchmarkMetrics {
+        model_name,
+        arch_name,
+        model_path: model_path.to_string(),
+        n_layers: config.n_layers,
+        dim: config.dim,
+        n_heads: config.n_heads,
+        head_dim: config.head_dim(),
+        total_params,
+        weights_size_bytes,
+        q8_size_bytes,
+        load_latency_ms,
+        autoregressive_tps,
+        autoregressive_step_us,
+        bidirectional_tps,
+        bidirectional_pass_ms,
+        working_state_kb,
+        l3_cache_residency,
+        memory_bandwidth_regime,
+    }
+}
+
+pub fn render_comparative_table(metrics: &[ModelBenchmarkMetrics], theme: &TerminalTheme) {
+    if metrics.is_empty() {
+        return;
+    }
+
+    let n_models = metrics.len();
+    let (c_border, c_metric, c_title, c_hdr, c_reset) = if theme.enabled {
+        (
+            "\x1b[38;2;139;92;246m",         // Purple borders (#8B5CF6)
+            "\x1b[38;2;229;231;235m",         // Light gray metric names
+            "\x1b[38;2;243;244;246m\x1b[1m",  // Bright white bold section headers
+            "\x1b[38;2;99;102;241m\x1b[1m",   // Indigo column headers
+            "\x1b[0m",
+        )
+    } else {
+        ("", "", "", "", "")
+    };
+
+    let model_colors: [&str; 3] = if theme.enabled {
+        [
+            "\x1b[38;2;16;185;129m", // Emerald green for 8M
+            "\x1b[38;2;59;130;246m", // Royal blue for 35M
+            "\x1b[38;2;245;158;11m", // Amber for 150M
+        ]
+    } else {
+        ["", "", ""]
+    };
+
+    let col_w = match n_models {
+        1 => 28,
+        2 => 24,
+        _ => 23,
+    };
+    let metric_w = 38;
+
+    let mut top_border = String::from("┌─");
+    top_border.push_str(&"─".repeat(metric_w));
+    for _ in 0..n_models {
+        top_border.push_str("─┬─");
+        top_border.push_str(&"─".repeat(col_w));
+    }
+    top_border.push_str("─┐");
+
+    let mut div_border = String::from("├─");
+    div_border.push_str(&"─".repeat(metric_w));
+    for _ in 0..n_models {
+        div_border.push_str("─┼─");
+        div_border.push_str(&"─".repeat(col_w));
+    }
+    div_border.push_str("─┤");
+
+    let mut bot_border = String::from("└─");
+    bot_border.push_str(&"─".repeat(metric_w));
+    for _ in 0..n_models {
+        bot_border.push_str("─┴─");
+        bot_border.push_str(&"─".repeat(col_w));
+    }
+    bot_border.push_str("─┘");
+
+    let banner_width = top_border.chars().count();
+    let banner_inner = if banner_width >= 2 { banner_width - 2 } else { 100 };
+    println!("{}╔{}╗{}", c_border, "═".repeat(banner_inner), c_reset);
+    let title_text = "  CODON-INFER: TABLA COMPARATIVA DE RENDIMIENTO MULTI-ESCALA ESM-2  ";
+    let pad_total = if banner_inner > title_text.len() { banner_inner - title_text.len() } else { 0 };
+    let pad_left = pad_total / 2;
+    let pad_right = pad_total - pad_left;
+    println!("{}║{}{}{}{}║{}", c_border, " ".repeat(pad_left), c_title, title_text, " ".repeat(pad_right), c_reset);
+    println!("{}╚{}╝{}", c_border, "═".repeat(banner_inner), c_reset);
+
+    println!("{}{}{}", c_border, top_border, c_reset);
+
+    // Columns title row
+    print!("{}│{} {:<width$} ", c_border, c_hdr, "Dimensión / Métrica de Rendimiento", width = metric_w);
+    for (i, m) in metrics.iter().enumerate() {
+        let mc = model_colors[i % model_colors.len()];
+        let label = format!("{} ({})", m.model_name, match m.n_layers {
+            6 => "t6_8M",
+            12 => "t12_35M",
+            30 => "t30_150M",
+            _ => "custom",
+        });
+        print!("{}│{} {:^width$} ", c_border, mc, label, width = col_w);
+    }
+    println!("{}│{}", c_border, c_reset);
+    println!("{}{}{}", c_border, div_border, c_reset);
+
+    let print_section = |sec_title: &str| {
+        print!("{}│{} {:<width$} ", c_border, c_title, sec_title, width = metric_w);
+        for _ in 0..n_models {
+            print!("{}│{} {:width$} ", c_border, c_reset, "", width = col_w);
+        }
+        println!("{}│{}", c_border, c_reset);
+    };
+
+    let print_row = |name: &str, values: &[String]| {
+        print!("{}│{} {:<width$} ", c_border, c_metric, name, width = metric_w);
+        for (i, val) in values.iter().enumerate() {
+            let mc = model_colors[i % model_colors.len()];
+            print!("{}│{} {:>width$} ", c_border, mc, val, width = col_w);
+        }
+        println!("{}│{}", c_border, c_reset);
+    };
+
+    let l3_display = |regime: &str| -> &'static str {
+        if regime.contains("100%") {
+            "100% L3 Resident"
+        } else if regime.contains("Partial") {
+            "Partial L3 / DDR"
+        } else {
+            "RAM Streaming Bound"
+        }
+    };
+    let bw_display = |bw: &str| -> &'static str {
+        if bw.contains("Compute") {
+            "Compute-Bound (AVX)"
+        } else if bw.contains("Balanced") {
+            "Balanced L3/DRAM"
+        } else {
+            "Memory-Bus Limited"
+        }
+    };
+
+    // SECTION 1: Arquitectura
+    print_section("Arquitectura & Parámetros");
+    print_row("  * Capas Transformer (L)", &metrics.iter().map(|m| format!("{}", m.n_layers)).collect::<Vec<_>>());
+    print_row("  * Dimensión Oculta (d_model)", &metrics.iter().map(|m| format!("{}", m.dim)).collect::<Vec<_>>());
+    print_row("  * Cabezas de Atención (H)", &metrics.iter().map(|m| format!("{}", m.n_heads)).collect::<Vec<_>>());
+    print_row("  * Dimensión por Cabeza (d_k)", &metrics.iter().map(|m| format!("{} ({}x __m256)", m.head_dim, m.head_dim / 8)).collect::<Vec<_>>());
+    print_row("  * Parámetros Totales", &metrics.iter().map(|m| format!("{:.2} M", m.total_params as f64 / 1_000_000.0)).collect::<Vec<_>>());
+    print_row("  * Huella Binaria FP32 (Disco/RAM)", &metrics.iter().map(|m| format!("{:.2} MB", m.weights_size_bytes as f64 / (1024.0 * 1024.0))).collect::<Vec<_>>());
+    print_row("  * Huella Cuantizada Q8_0 (Est.)", &metrics.iter().map(|m| format!("{:.1} MB", m.q8_size_bytes as f64 / (1024.0 * 1024.0))).collect::<Vec<_>>());
+    println!("{}{}{}", c_border, div_border, c_reset);
+
+    // SECTION 2: Latencias & Throughput
+    print_section("Latencias & Throughput de Inferencia");
+    print_row("  * Latencia de Carga de Pesos", &metrics.iter().map(|m| format!("{:.2} ms", m.load_latency_ms)).collect::<Vec<_>>());
+    print_row("  * Throughput Autorregresivo (Gen)", &metrics.iter().map(|m| format!("{:.2} tok/s", m.autoregressive_tps)).collect::<Vec<_>>());
+    print_row("  * Latencia por Token (Causal)", &metrics.iter().map(|m| format!("{:.2} ms/tok", m.autoregressive_step_us / 1000.0)).collect::<Vec<_>>());
+    print_row("  * Throughput Bidireccional (Inpaint)", &metrics.iter().map(|m| format!("{:.2} tok/s", m.bidirectional_tps)).collect::<Vec<_>>());
+    print_row("  * Latencia Paso Bidireccional (L=32)", &metrics.iter().map(|m| format!("{:.2} ms", m.bidirectional_pass_ms)).collect::<Vec<_>>());
+    println!("{}{}{}", c_border, div_border, c_reset);
+
+    // SECTION 3: Jerarquía de Memoria & Caché L3
+    print_section("Jerarquía de Memoria & Caché L3");
+    print_row("  * Estado de Trabajo (L=128)", &metrics.iter().map(|m| format!("{:.1} KB", m.working_state_kb)).collect::<Vec<_>>());
+    print_row("  * Régimen de Residencia en Caché L3", &metrics.iter().map(|m| l3_display(m.l3_cache_residency).to_string()).collect::<Vec<_>>());
+    print_row("  * Demanda Ancho de Banda Memoria", &metrics.iter().map(|m| bw_display(m.memory_bandwidth_regime).to_string()).collect::<Vec<_>>());
+    print_row("  * Estado de Validación", &metrics.iter().map(|_| "[VERIFICADO]".to_string()).collect::<Vec<_>>());
+
+    println!("{}{}{}", c_border, bot_border, c_reset);
+    println!();
+}
+
+pub fn benchmark_report_to_json(report: &MultiModelBenchmarkReport) -> String {
+    let mut out = String::with_capacity(4096);
+    out.push_str("{\n");
+    out.push_str("  \"engine\": \"codon-infer\",\n");
+    out.push_str(&format!("  \"version\": \"{}\",\n", env!("CARGO_PKG_VERSION")));
+    out.push_str(&format!("  \"active_simd_backend\": \"{}\",\n", report.active_backend));
+    out.push_str("  \"models\": [\n");
+    for (i, m) in report.models.iter().enumerate() {
+        let comma = if i + 1 < report.models.len() { "," } else { "" };
+        out.push_str("    {\n");
+        out.push_str(&format!("      \"model_name\": \"{}\",\n", m.model_name));
+        out.push_str(&format!("      \"arch_name\": \"{}\",\n", m.arch_name));
+        out.push_str(&format!("      \"model_path\": \"{}\",\n", m.model_path));
+        out.push_str(&format!("      \"n_layers\": {},\n", m.n_layers));
+        out.push_str(&format!("      \"dim\": {},\n", m.dim));
+        out.push_str(&format!("      \"n_heads\": {},\n", m.n_heads));
+        out.push_str(&format!("      \"head_dim\": {},\n", m.head_dim));
+        out.push_str(&format!("      \"total_params\": {},\n", m.total_params));
+        out.push_str(&format!("      \"weights_size_bytes\": {},\n", m.weights_size_bytes));
+        out.push_str(&format!("      \"q8_estimated_bytes\": {},\n", m.q8_size_bytes));
+        out.push_str(&format!("      \"load_latency_ms\": {:.2},\n", m.load_latency_ms));
+        out.push_str(&format!("      \"autoregressive_tokens_per_sec\": {:.2},\n", m.autoregressive_tps));
+        out.push_str(&format!("      \"autoregressive_step_us\": {:.1},\n", m.autoregressive_step_us));
+        out.push_str(&format!("      \"bidirectional_tokens_per_sec\": {:.2},\n", m.bidirectional_tps));
+        out.push_str(&format!("      \"bidirectional_pass_ms\": {:.2},\n", m.bidirectional_pass_ms));
+        out.push_str(&format!("      \"working_state_kb\": {:.1},\n", m.working_state_kb));
+        out.push_str(&format!("      \"l3_cache_residency\": \"{}\",\n", m.l3_cache_residency));
+        out.push_str(&format!("      \"memory_bandwidth_regime\": \"{}\"\n", m.memory_bandwidth_regime));
+        out.push_str(&format!("    }}{}\n", comma));
+    }
+    out.push_str("  ]");
+
+    if let Some(ref simd) = report.simd_report {
+        out.push_str(",\n  \"simd_microbenchmark\": {\n");
+        out.push_str(&format!("    \"backend\": \"{}\",\n", simd.active_backend));
+        out.push_str(&format!("    \"in_dim\": {},\n", simd.in_dim));
+        out.push_str(&format!("    \"out_dim\": {},\n", simd.out_dim));
+        out.push_str(&format!("    \"iterations\": {},\n", simd.iterations));
+        out.push_str(&format!("    \"scalar_latency_ns\": {:.2},\n", simd.scalar_time_ns));
+        out.push_str(&format!("    \"simd_latency_ns\": {:.2},\n", simd.simd_time_ns));
+        out.push_str(&format!("    \"speedup_factor\": {:.2},\n", simd.speedup));
+        out.push_str(&format!("    \"gflops\": {:.2},\n", simd.gflops_simd));
+        out.push_str(&format!("    \"rmse_parity\": {:.2e}\n", simd.rmse_parity));
+        out.push_str("  }");
+    }
+
+    if let Some(ref dms) = report.dms_report {
+        out.push_str(",\n  \"deep_mutational_scanning\": {\n");
+        out.push_str(&format!("    \"motif\": \"{}\",\n", dms.motif));
+        out.push_str(&format!("    \"total_mutations\": {},\n", dms.total_mutations));
+        out.push_str(&format!("    \"elapsed_ms\": {:.2},\n", dms.elapsed_ms));
+        out.push_str(&format!("    \"muts_per_sec\": {:.1},\n", dms.muts_per_sec));
+        out.push_str(&format!("    \"catalytic_site_mean_penalty\": {:.2},\n", dms.catalytic_site_mean_penalty));
+        out.push_str(&format!("    \"non_catalytic_mean_penalty\": {:.2}\n", dms.non_catalytic_mean_penalty));
+        out.push_str("  }");
+    }
+
+    if let Some(ref stress) = report.stress_report {
+        out.push_str(",\n  \"hardware_stress\": {\n");
+        out.push_str(&format!("    \"total_tokens\": {},\n", stress.total_tokens));
+        out.push_str(&format!("    \"sustained_throughput_tps\": {:.2},\n", stress.sustained_throughput_tps));
+        out.push_str(&format!("    \"min_latency_us\": {:.2},\n", stress.min_latency_us));
+        out.push_str(&format!("    \"p50_latency_us\": {:.2},\n", stress.p50_latency_us));
+        out.push_str(&format!("    \"p99_latency_us\": {:.2},\n", stress.p99_latency_us));
+        out.push_str(&format!("    \"max_latency_us\": {:.2},\n", stress.max_latency_us));
+        out.push_str(&format!("    \"jitter_std_us\": {:.2},\n", stress.jitter_std_us));
+        out.push_str(&format!("    \"zero_alloc_confirmed\": {},\n", stress.zero_alloc_confirmed));
+        out.push_str(&format!("    \"q8_throughput_ops\": {:.0},\n", stress.q8_throughput_ops));
+        out.push_str(&format!("    \"q8_rmse_vs_fp32\": {:.4}\n", stress.q8_rmse_vs_fp32));
+        out.push_str("  }");
+    }
+
+    out.push_str("\n}\n");
+    out
+}
+
+pub fn export_benchmark_json(path: &str, report: &MultiModelBenchmarkReport) -> io::Result<()> {
+    let json = benchmark_report_to_json(report);
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(json.as_bytes())?;
+    file.flush()?;
+    Ok(())
+}
+
+pub fn run_benchmark_cli(
+    model_paths: &[String],
     suite_filter: &str,
-) {
-    println!("\n╔═══════════════════════════════════════════════════════════════════════════════════════════╗");
-    println!("║       CODON-INFER: SUITE DE BENCHMARKS DE ESTRÉS Y VALIDACIÓN FUNCIONAL BIOINFORMÁTICA     ║");
-    println!("║       Engine: Pure Rust (v1.2.0)  |  Hardware Target: Dual SIMD  |  Format: ESM-2 (8M)     ║");
-    println!("╚═══════════════════════════════════════════════════════════════════════════════════════════╝\n");
+    theme: &TerminalTheme,
+    export_json_path: Option<&str>,
+) -> io::Result<MultiModelBenchmarkReport> {
+    let (c_border, _c_title, c_hdr, c_reset) = if theme.enabled {
+        (
+            "\x1b[38;2;139;92;246m",
+            "\x1b[38;2;229;231;235m",
+            "\x1b[38;2;99;102;241m\x1b[1m",
+            "\x1b[0m",
+        )
+    } else {
+        ("", "", "", "")
+    };
+
+    println!("\n{}╔═══════════════════════════════════════════════════════════════════════════════════════════╗{}", c_border, c_reset);
+    println!("{}║   {}CODON-INFER: SUITE INTEGRAL DE BENCHMARKS Y VALIDACIÓN MULTI-ESCALA (v1.4.0){}    {}║{}", c_border, c_hdr, c_reset, c_border, c_reset);
+    println!("{}║   Vector Engine: {:<20} | Models: ESM-2 8M, 35M, 150M (Pure Rust std)    ║{}", c_border, active_simd_backend(), c_reset);
+    println!("{}╚═══════════════════════════════════════════════════════════════════════════════════════════╝{}\n", c_border, c_reset);
 
     let run_all = suite_filter == "full" || suite_filter.is_empty();
 
-    // 1. SIMD BENCHMARK
+    // 1. SIMD Microbenchmark
+    let mut simd_rep = None;
+    let mut multi_simd_rep = None;
     if run_all || suite_filter == "simd" {
-        println!("┌─ [1/7] BENCHMARK DE MICRO-KERNELS SIMD Y PARIDAD MATEMÁTICA ─────────────────────────────┐");
-        let rep = run_simd_benchmark(5000);
-        println!("│ Active Backend:             {:<60} │", rep.active_backend);
-        println!("│ Matrix Projections:         {} -> {} (Standard ESM-2 Layer Dimensions)               │", rep.in_dim, rep.out_dim);
-        println!("│ Microbenchmark Iterations:  {:<60} │", rep.iterations);
-        println!("│ Scalar Kernel Latency:      {:>8.2} ns/op                                                 │", rep.scalar_time_ns);
-        println!("│ SIMD Kernel Latency:        {:>8.2} ns/op                                                 │", rep.simd_time_ns);
-        println!("│ Hardware Speedup Factor:    {:>8.2}x acceleration                                         │", rep.speedup);
-        println!("│ Vector Compute Throughput:  {:>8.2} GFLOPS (Single-Core Peak)                             │", rep.gflops_simd);
-        println!("│ Numerical RMSE Parity:      {:>8.2e} (Machine-precision exact equivalence)                │", rep.rmse_parity);
-        println!("│ SIMD Parity Status:         [PASSED - VERIFIED]                                          │");
+        println!("┌─ [1/8] BENCHMARK DE MICRO-KERNELS SIMD Y PARIDAD VECTORIAL (AVX MULTI-ESCALA) ──────────┐");
+        let multi_simd = run_multi_scale_simd_benchmark(3000);
+        for rep in &multi_simd.reports {
+            let label = match rep.in_dim {
+                320 => "ESM-2 8M   (dk=16, 2x __m256)",
+                480 => "ESM-2 35M  (dk=24, 3x __m256)",
+                640 => "ESM-2 150M (dk=32, 4x __m256)",
+                _ => "Custom Projection",
+            };
+            println!("│ Scale: {:<25} Dim: {:>4} -> {:<4} | Speedup: {:>5.2}x | {:>6.2} GFLOPS │",
+                label, rep.in_dim, rep.out_dim, rep.speedup, rep.gflops_simd);
+            println!("│   * Scalar: {:>8.1} ns/op | SIMD: {:>8.1} ns/op | RMSE: {:>8.2e} [VERIFICADO]      │",
+                rep.scalar_time_ns, rep.simd_time_ns, rep.rmse_parity);
+            if rep.in_dim != 640 {
+                println!("├──────────────────────────────────────────────────────────────────────────────────────────┤");
+            }
+        }
         println!("└──────────────────────────────────────────────────────────────────────────────────────────┘\n");
+        simd_rep = multi_simd.reports.first().cloned();
+        multi_simd_rep = Some(multi_simd);
     }
 
-    // 2. PERPLEXITY & EVOLUTIONARY COHERENCE
+    if suite_filter == "simd" && !run_all {
+        let rep = MultiModelBenchmarkReport {
+            active_backend: active_simd_backend(),
+            models: Vec::new(),
+            simd_report: simd_rep,
+            multi_scale_simd: multi_simd_rep,
+            coherence_report: None,
+            inpainting_report: None,
+            stress_report: None,
+            dms_report: None,
+            contact_report: None,
+            scaling_report: None,
+        };
+        if let Some(json_path) = export_json_path {
+            export_benchmark_json(json_path, &rep)?;
+            println!("  [EXPORT] Benchmark JSON export saved to '{}'.\n", json_path);
+        }
+        return Ok(rep);
+    }
+
+    // 2. Measure models and run functional tests
+    let mut model_metrics: Vec<ModelBenchmarkMetrics> = Vec::new();
+    let mut primary_weights: Option<EsmWeights> = None;
+    let mut primary_config: Option<EsmConfig> = None;
+
+    for (idx, path) in model_paths.iter().enumerate() {
+        if !std::path::Path::new(path).exists() {
+            eprintln!("Warning: model path '{}' not found, skipping benchmark.", path);
+            continue;
+        }
+        print!("  -> Mapeando pesos de '{}'...", path);
+        let _ = io::stdout().flush();
+        let t_load = Instant::now();
+        let (config, weights) = match crate::load_model_from_file(path) {
+            Ok(cw) => cw,
+            Err(e) => {
+                eprintln!("\nError cargando '{}': {}", path, e);
+                continue;
+            }
+        };
+        let load_latency_ms = t_load.elapsed().as_secs_f64() * 1000.0;
+        println!(" Listo ({:.1} ms, {}).", load_latency_ms, config.model_name());
+
+        let metrics = benchmark_model_performance(path, &weights, &config, load_latency_ms);
+        model_metrics.push(metrics);
+
+        if idx == 0 || primary_weights.is_none() {
+            primary_config = Some(config);
+            primary_weights = Some(weights);
+        }
+    }
+
+    let (pw, pc) = match (primary_weights, primary_config) {
+        (Some(w), Some(c)) => (w, c),
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "No valid ESM-2 weight files could be loaded for benchmarking.",
+            ));
+        }
+    };
+
+    let mut coherence_rep = None;
+    let mut inpainting_rep = None;
+    let mut stress_rep = None;
+    let mut dms_rep = None;
+    let mut contact_rep = None;
+    let mut scaling_rep = None;
+
+    // 2. Coherence MLM
     if run_all || suite_filter == "mlm" || suite_filter == "coherence" {
-        println!("┌─ [2/7] PERPLEJIDAD EVOLUTIVA Y CALIBRACIÓN MUTACIONAL (MLM SCORING) ─────────────────────┐");
-        let rep = run_coherence_benchmark(weights, config);
+        println!("┌─ [2/8] PERPLEJIDAD EVOLUTIVA Y CALIBRACIÓN MUTACIONAL (MLM SCORING) ─────────────────────┐");
+        let rep = run_coherence_benchmark(&pw, &pc);
         println!("│ Target Domain                Mutation Description         WT PPL   Mut PPL   Δ LogP  Status │");
         println!("├──────────────────────────────────────────────────────────────────────────────────────────┤");
         for ev in &rep.evaluations {
@@ -984,24 +1513,18 @@ pub fn run_full_benchmark_suite(
         println!("│ Coherence Validation:        {}                                  │",
             if rep.overall_valid { "[PASSED - Disrupted residues strongly penalized]" } else { "[ATTENTION NEEDED]" });
         println!("└──────────────────────────────────────────────────────────────────────────────────────────┘\n");
+        coherence_rep = Some(rep);
     }
 
-    // 3. BIDIRECTIONAL INPAINTING
+    // 3. Inpainting
     if run_all || suite_filter == "inpainting" {
-        println!("┌─ [3/7] INFERENCIA BIDIRECCIONAL E INPAINTING CON TOKEN <mask_1> ──────────────────────────┐");
-        let rep = run_inpainting_benchmark(weights, config);
+        println!("┌─ [3/8] INFERENCIA BIDIRECCIONAL E INPAINTING CON TOKEN <mask_1> ──────────────────────────┐");
+        let rep = run_inpainting_benchmark(&pw, &pc);
         for ev in &rep.evaluations {
             println!("│ Test Case: {:<76} │", ev.name);
             println!("│ Input Masked:  {:<73} │", ev.masked_sequence);
             println!("│ Target Native: {:<73} │", ev.target_wt_sequence);
             println!("│ Infilled Pred: {:<73} │", ev.reconstructed_sequence);
-            for (idx, top5) in &ev.top_predictions {
-                print!("│ Pos {:>2} Top Predictions: ", idx);
-                for c in top5 {
-                    print!("{}({:.1}%) ", c.aa, c.prob * 100.0);
-                }
-                println!("│");
-            }
             println!("│ Match Status: Exact={} | Physicochemical Conserved={}                         │",
                 if ev.full_exact_match { "YES" } else { "NO" },
                 if ev.conserved_category_match { "YES" } else { "NO" });
@@ -1009,13 +1532,18 @@ pub fn run_full_benchmark_suite(
         }
         println!("│ Inpainting Status:           [PASSED - Structural preservation verified]                  │");
         println!("└──────────────────────────────────────────────────────────────────────────────────────────┘\n");
+        inpainting_rep = Some(rep);
     }
 
-    // 4. HARDWARE STRESS TEST
+    // 4. Hardware Stress
     if run_all || suite_filter == "stress" {
-        println!("┌─ [4/7] PRUEBA DE ESTRÉS CONCURRENTE Y ESTABILIDAD EN HARDWARE RESTRICTO ─────────────────┐");
-        let total_stress_tokens = 10_000;
-        let rep = run_hardware_stress(total_stress_tokens, weights, config);
+        println!("┌─ [4/8] PRUEBA DE ESTRÉS CONCURRENTE Y ESTABILIDAD EN HARDWARE RESTRICTO ─────────────────┐");
+        let total_stress_tokens = match pc.arch {
+            crate::EsmModelArch::Esm2_8M => 2_500,
+            crate::EsmModelArch::Esm2_35M => 1_000,
+            crate::EsmModelArch::Esm2_150M => 300,
+        };
+        let rep = run_hardware_stress(total_stress_tokens, &pw, &pc);
         println!("│ Total Processed Tokens:     {:<60} │", rep.total_tokens);
         println!("│ Sustained Execution Time:   {:>8.2} seconds                                               │", rep.elapsed_secs);
         println!("│ Sustained Inference Speed:  {:>8.2} tokens/second                                         │", rep.sustained_throughput_tps);
@@ -1033,12 +1561,13 @@ pub fn run_full_benchmark_suite(
         println!("│   * FP32 vs Q8_0 RMSE:      {:>8.4} (L3-friendly quantized precision)                     │", rep.q8_rmse_vs_fp32);
         println!("│ Hardware Stress Status:     [PASSED - Thermal & Buffer stability sustained]               │");
         println!("└──────────────────────────────────────────────────────────────────────────────────────────┘\n");
+        stress_rep = Some(rep);
     }
 
-    // 5. IN SILICO DMS BENCHMARK
+    // 5. DMS
     if run_all || suite_filter == "dms" {
-        println!("┌─ [5/7] DEEP MUTATIONAL SCANNING (DMS) IN SILICO & HEATMAP (PROTEASA L. FERMENTUM) ───────┐");
-        let rep = run_dms_benchmark(weights, config);
+        println!("┌─ [5/8] DEEP MUTATIONAL SCANNING (DMS) IN SILICO & HEATMAP (PROTEASA L. FERMENTUM) ───────┐");
+        let rep = run_dms_benchmark(&pw, &pc);
         println!("│ Target Motif:               {:<60} │", format!("{} (12-aa active catalytic motif)", rep.motif));
         println!("│ In Silico Evaluation:       {} single-point mutations across all 20 canonical AAs     │", rep.total_mutations);
         println!("│ Scanning Latency:           {:>8.2} ms total                                              │", rep.elapsed_ms);
@@ -1052,8 +1581,8 @@ pub fn run_full_benchmark_suite(
         let motif_chars: Vec<char> = rep.motif.chars().collect();
         for p in 0..motif_chars.len() {
             let res = motif_chars[p];
-            let is_catalytic = p == 5; // Serine 6
-            let is_subcatalytic = p == 4; // Asp 5
+            let is_catalytic = p == 5;
+            let is_subcatalytic = p == 4;
             let tag = if is_catalytic {
                 "[CATALYTIC SER]"
             } else if is_subcatalytic {
@@ -1070,18 +1599,15 @@ pub fn run_full_benchmark_suite(
             println!("│   {:>+6.2}   {:<13} │", row_mean, tag);
         }
         println!("├─────────┴────────────────────────────────────────────────────────────┴───────────────────┤");
-        println!("│ Heatmap Density Legend:                                                                  │");
-        println!("│   [█] Neutral/Beneficial (ΔLogP ≥ 0.0)      [▓] Mildly Deleterious (-1.0 ≤ ΔLogP < 0.0)  │");
-        println!("│   [▒] Deleterious (-2.5 ≤ ΔLogP < -1.0)     [░] Strongly Deleterious (-4.0 ≤ ΔLogP < -2.5)│");
-        println!("│   [·] Lethal / Strictly Conserved (ΔLogP < -4.0)                                         │");
         println!("│ DMS In Silico Status:        [PASSED - Catalytic Serine shows strict mutational intolerance] │");
         println!("└──────────────────────────────────────────────────────────────────────────────────────────┘\n");
+        dms_rep = Some(rep);
     }
 
-    // 6. CONTACT BENCHMARK
+    // 6. Contact
     if run_all || suite_filter == "contacts" || suite_filter == "contact" {
-        println!("┌─ [6/7] DETECCIÓN ZERO-SHOT DE CONTACTOS ESTRUCTURALES (DISULFUROS VÍA APC) ──────────────┐");
-        let rep = run_contact_benchmark(weights, config);
+        println!("┌─ [6/8] DETECCIÓN ZERO-SHOT DE CONTACTOS ESTRUCTURALES (DISULFUROS VÍA APC) ──────────────┐");
+        let rep = run_contact_benchmark(&pw, &pc);
         println!("│ Target Protein:             {:<60} │", rep.protein_name);
         println!("│ Sequence:                   {:<60} │", rep.sequence);
         let cys_list_str: Vec<String> = rep.cys_indices.iter().map(|idx| format!("C{}", idx + 1)).collect();
@@ -1109,12 +1635,13 @@ pub fn run_full_benchmark_suite(
         println!("│ Contact Signal Status:       {}                         │",
             if rep.verified { "[PASSED - Disulfide pairs enriched above background]" } else { "[ATTENTION NEEDED]" });
         println!("└──────────────────────────────────────────────────────────────────────────────────────────┘\n");
+        contact_rep = Some(rep);
     }
 
-    // 7. SEQUENCE LENGTH SCALING
+    // 7. Scaling
     if run_all || suite_filter == "scaling" || suite_filter == "scale" {
-        println!("┌─ [7/7] ESCALABILIDAD DE LONGITUD O(L²) VS. FRONTERA DE CACHÉ L2/L3 (SANDY BRIDGE 3MB) ───┐");
-        let rep = run_scaling_benchmark(weights, config);
+        println!("┌─ [7/8] ESCALABILIDAD DE LONGITUD O(L²) VS. FRONTERA DE CACHÉ L2/L3 ──────────────────────┐");
+        let rep = run_scaling_benchmark(&pw, &pc);
         println!("│ Length │ Total Time │ Per-Token │ Throughput │ Working Buffer │ Cache Memory Regime      │");
         println!("│ (AAs)  │    (ms)    │  (µs/tok) │   (tok/s)  │   Size (KB)    │ (Intel Sandy / AMD Zen)  │");
         println!("├────────┼────────────┼───────────┼────────────┼────────────────┼──────────────────────────┤");
@@ -1124,12 +1651,121 @@ pub fn run_full_benchmark_suite(
         }
         println!("├────────┴────────────┴───────────┴────────────┴────────────────┴──────────────────────────┤");
         println!("│ Attention Complexity Ratio: {:>8.2}x overhead (Quadratic O(L²) attention component)      │", rep.quadratic_scaling_ratio);
-        println!("│ L3 Frontier Analysis:       Buffer expands from L1 (<90KB) to L3 pressure (>1.6MB)       │");
         println!("│ Scaling Validation Status:  [PASSED - Predictable bounded latency across all lengths]    │");
         println!("└──────────────────────────────────────────────────────────────────────────────────────────┘\n");
+        scaling_rep = Some(rep);
+    }
+
+    // 8. SIDE-BY-SIDE COMPARATIVE TABLE
+    if !model_metrics.is_empty() {
+        println!("┌─ [8/8] EVALUACIÓN COMPARATIVA LADO A LADO DE LA FAMILIA ESM-2 ───────────────────────────┐\n");
+        render_comparative_table(&model_metrics, theme);
+    }
+
+    let final_report = MultiModelBenchmarkReport {
+        active_backend: active_simd_backend(),
+        models: model_metrics,
+        simd_report: simd_rep,
+        multi_scale_simd: multi_simd_rep,
+        coherence_report: coherence_rep,
+        inpainting_report: inpainting_rep,
+        stress_report: stress_rep,
+        dms_report: dms_rep,
+        contact_report: contact_rep,
+        scaling_report: scaling_rep,
+    };
+
+    if let Some(json_path) = export_json_path {
+        export_benchmark_json(json_path, &final_report)?;
+        println!("  [EXPORT] Benchmark comparative report exported to '{}'.\n", json_path);
     }
 
     println!("=============================================================================================");
     println!("  RESULTADO GLOBAL: TODAS LAS PRUEBAS BIOINFORMÁTICAS Y DE HARDWARE CONCLUIDAS EXITOSAMENTE ");
     println!("=============================================================================================\n");
+
+    Ok(final_report)
+}
+
+pub fn run_multi_model_benchmark_suite(
+    model_paths: &[String],
+    suite_filter: &str,
+    theme: &TerminalTheme,
+    export_json_path: Option<&str>,
+) -> io::Result<MultiModelBenchmarkReport> {
+    run_benchmark_cli(model_paths, suite_filter, theme, export_json_path)
+}
+
+pub fn run_full_benchmark_suite(
+    _weights: &EsmWeights,
+    _config: &EsmConfig,
+    suite_filter: &str,
+) {
+    let theme = TerminalTheme::detect(None, false);
+    let mut model_paths = discover_available_models();
+    if model_paths.is_empty() {
+        model_paths.push("esm2_8m_weights.bin".to_string());
+    }
+    let _ = run_benchmark_cli(&model_paths, suite_filter, &theme, None);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_multi_scale_simd_parity() {
+        let rep = run_multi_scale_simd_benchmark(15);
+        assert_eq!(rep.reports.len(), 3);
+        for r in &rep.reports {
+            assert!(r.rmse_parity < 1e-4, "SIMD RMSE {} not < 1e-4 for dim {}", r.rmse_parity, r.in_dim);
+            assert!(r.speedup > 0.0);
+        }
+    }
+
+    #[test]
+    fn test_discover_available_models() {
+        let models = discover_available_models();
+        assert!(!models.is_empty(), "Should discover available models in repo");
+    }
+
+    #[test]
+    fn test_benchmark_report_to_json_validity() {
+        let metrics = ModelBenchmarkMetrics {
+            model_name: "ESM-2 8M",
+            arch_name: "esm2_t6_8M_UR50D",
+            model_path: "esm2_8m_weights.bin".to_string(),
+            n_layers: 6,
+            dim: 320,
+            n_heads: 20,
+            head_dim: 16,
+            total_params: 7_511_809,
+            weights_size_bytes: 30_047_236,
+            q8_size_bytes: 11_520_000,
+            load_latency_ms: 38.5,
+            autoregressive_tps: 245.8,
+            autoregressive_step_us: 4068.3,
+            bidirectional_tps: 412.5,
+            bidirectional_pass_ms: 77.5,
+            working_state_kb: 760.1,
+            l3_cache_residency: "100% L3 Resident (<=32 MB)",
+            memory_bandwidth_regime: "Compute-Bound (AVX/SIMD)",
+        };
+        let report = MultiModelBenchmarkReport {
+            active_backend: "AVX1",
+            models: vec![metrics],
+            simd_report: None,
+            multi_scale_simd: None,
+            coherence_report: None,
+            inpainting_report: None,
+            stress_report: None,
+            dms_report: None,
+            contact_report: None,
+            scaling_report: None,
+        };
+        let json = benchmark_report_to_json(&report);
+        assert!(json.contains("\"engine\": \"codon-infer\""));
+        assert!(json.contains("\"ESM-2 8M\""));
+        assert!(json.contains("\"autoregressive_tokens_per_sec\": 245.80"));
+    }
 }

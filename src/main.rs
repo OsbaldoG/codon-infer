@@ -39,7 +39,8 @@ fn print_help(theme: &TerminalTheme) {
     println!("\nGLOBAL OPTIONS:");
     println!("    -h, --help               Print help information");
     println!("    -V, --version            Print engine version and active vector acceleration");
-    println!("    --model <PATH>           Path to weights binary (default: esm2_8m_weights.bin)");
+    println!("    --model <PATH>           Path to weights binary (or 'all' for multi-scale benchmark)");
+    println!("    --export-json <PATH>     Export benchmark or analysis metrics to JSON");
     println!("    --color <auto|always|never> Control ANSI TrueColor terminal styling");
     println!("    --no-color               Disable all colored terminal escapes (NO_COLOR standard)");
     println!("\nSUBCOMMAND EXAMPLES:");
@@ -48,6 +49,8 @@ fn print_help(theme: &TerminalTheme) {
     println!("    codon-infer dms --fasta protein.fasta --window 128 --export-csv dms.csv");
     println!("    codon-infer contacts --sequence \"MCMPCFTTDHQMARKCDDCCGGKGRGKCYGPQCLCR\" --export-csv contacts.csv");
     println!("    codon-infer benchmark --suite full");
+    println!("    codon-infer benchmark --model esm2_35m_weights.bin --suite full");
+    println!("    codon-infer benchmark --suite full --export-json benchmark_report.json");
 }
 
 fn load_input_record(
@@ -131,13 +134,18 @@ fn main() -> io::Result<()> {
     match subcommand {
         "benchmark" => {
             let mut suite = "full".to_string();
+            let mut model_arg: Option<String> = None;
+            let mut export_json_path: Option<String> = None;
             let mut i = sub_args_start;
             while i < args.len() {
                 if (args[i] == "--suite" || args[i] == "-s") && i + 1 < args.len() {
                     suite = args[i + 1].clone();
                     i += 2;
                 } else if args[i] == "--model" && i + 1 < args.len() {
-                    model_path = args[i + 1].clone();
+                    model_arg = Some(args[i + 1].clone());
+                    i += 2;
+                } else if args[i] == "--export-json" && i + 1 < args.len() {
+                    export_json_path = Some(args[i + 1].clone());
                     i += 2;
                 } else if args[i] == "--no-color" || args[i] == "--color" {
                     i += if args[i] == "--color" { 2 } else { 1 };
@@ -146,11 +154,28 @@ fn main() -> io::Result<()> {
                     i += 1;
                 }
             }
-            let load_t = Instant::now();
-            println!("Loading ESM-2 weights from '{}'...", model_path);
-            let (config, weights) = load_model(&model_path)?;
-            println!("Weights mapped successfully for {} in {:.2} ms.", config.model_name(), load_t.elapsed().as_secs_f64() * 1000.0);
-            codon_infer::benchmark::run_full_benchmark_suite(&weights, &config, &suite);
+
+            let model_paths: Vec<String> = if let Some(ref m) = model_arg {
+                if m == "all" {
+                    codon_infer::benchmark::discover_available_models()
+                } else {
+                    vec![m.clone()]
+                }
+            } else {
+                let discovered = codon_infer::benchmark::discover_available_models();
+                if discovered.is_empty() {
+                    vec![model_path]
+                } else {
+                    discovered
+                }
+            };
+
+            codon_infer::benchmark::run_benchmark_cli(
+                &model_paths,
+                &suite,
+                &theme,
+                export_json_path.as_deref(),
+            )?;
             Ok(())
         }
 
