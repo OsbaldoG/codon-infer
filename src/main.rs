@@ -2,16 +2,19 @@ use std::io::{self, Write};
 use std::time::Instant;
 use codon_infer::{
     active_simd_backend, export_contacts_csv, export_contacts_json,
-    export_dms_csv, export_dms_json, generate_sequence, parse_fasta_file,
-    parse_raw_sequence, render_dms_heatmap, run_pipeline_contacts,
-    run_pipeline_dms, run_pipeline_inpaint, EsmConfig, EsmWeights,
-    FastaRecord, RunState, TerminalTheme,
+    export_dms_csv, export_dms_json, generate_sequence_parallel,
+    generate_sequence_q8, parse_fasta_file, parse_raw_sequence, render_dms_heatmap,
+    run_pipeline_contacts_parallel, run_pipeline_dms_parallel,
+    run_pipeline_inpaint_parallel, EsmConfig, EsmWeights, EsmWeightsQ8,
+    FastaRecord, ModelWeightsRef, RunState, TerminalTheme,
 };
 
 fn print_version() {
     println!("codon-infer v{}", env!("CARGO_PKG_VERSION"));
     println!("Engine: Pure Rust Zero-Dependencies (std)");
     println!("Vector Dispatch: {}", active_simd_backend());
+    println!("Concurrency: std::thread::scope (zero runtime overhead)");
+    println!("Quantization: Q8_0 In-Memory Block Engine (32-float scale block)");
     println!("Target Model: ESM-2 Multi-Scale [8M, 35M, 150M, 650M, 3B] (Meta AI / UniRef50)");
 }
 
@@ -19,12 +22,12 @@ fn print_help(theme: &TerminalTheme) {
     let logo = if theme.enabled {
         "\x1b[38;2;139;92;246m╔═══════════════════════════════════════════════════════════════════════════════╗\n\
          ║   \x1b[38;2;59;130;246mCODON-INFER\x1b[38;2;139;92;246m: High-Performance Zero-Allocation ESM-2 Engine in Pure Rust     ║\n\
-         ║   \x1b[38;2;16;185;129mVersion 1.4.0\x1b[38;2;139;92;246m | Multi-Scale CLI & Bioinformatic Analysis Pipeline (8M to 3B) ║\n\
+         ║   \x1b[38;2;16;185;129mVersion 1.5.0-dev\x1b[38;2;139;92;246m | Q8_0 & Scoped Multi-Thread R&D Suite (8M to 3B)       ║\n\
          ╚═══════════════════════════════════════════════════════════════════════════════╝\x1b[0m"
     } else {
         "╔═══════════════════════════════════════════════════════════════════════════════╗\n\
          ║   CODON-INFER: High-Performance Zero-Allocation ESM-2 Engine in Pure Rust     ║\n\
-         ║   Version 1.4.0 | Multi-Scale CLI & Bioinformatic Analysis Pipeline (8M to 3B) ║\n\
+         ║   Version 1.5.0-dev | Q8_0 & Scoped Multi-Thread R&D Suite (8M to 3B)       ║\n\
          ╚═══════════════════════════════════════════════════════════════════════════════╝"
     };
     println!("{}", logo);
@@ -39,19 +42,22 @@ fn print_help(theme: &TerminalTheme) {
     println!("\nGLOBAL OPTIONS:");
     println!("    -h, --help               Print help information");
     println!("    -V, --version            Print engine version and active vector acceleration");
+    println!("    -t, --threads <N>        Number of CPU threads (default: available logical cores)");
+    println!("    --quantize <q8_0|fp32>   Quantization mode for execution (default: fp32)");
+    println!("    --q8                     Shortcut flag for '--quantize q8_0'");
     println!("    --model <PATH>           Path to weights binary (or 'all' for multi-scale benchmark)");
     println!("    --export-json <PATH>     Export benchmark or analysis metrics to JSON");
     println!("    --color <auto|always|never> Control ANSI TrueColor terminal styling");
     println!("    --no-color               Disable all colored terminal escapes (NO_COLOR standard)");
     println!("\nSUBCOMMAND EXAMPLES:");
-    println!("    codon-infer generate --sequence \"M\" --temperature 0.7 --max-tokens 50");
-    println!("    codon-infer inpaint --sequence \"MCMPC*TTDHQMARKCDD\"");
-    println!("    codon-infer dms --fasta protein.fasta --window 128 --export-csv dms.csv");
-    println!("    codon-infer contacts --sequence \"MCMPCFTTDHQMARKCDDCCGGKGRGKCYGPQCLCR\" --export-csv contacts.csv");
-    println!("    codon-infer benchmark --suite full");
-    println!("    codon-infer benchmark --model esm2_35m_weights.bin --suite full");
-    println!("    codon-infer benchmark --model esm2_650m_weights.bin --suite full");
-    println!("    codon-infer benchmark --suite full --export-json benchmark_report.json");
+    println!("    codon-infer generate --sequence \"M\" --temperature 0.7 --max-tokens 50 --threads 4");
+    println!("    codon-infer generate --sequence \"M\" --quantize q8_0 --threads 4");
+    println!("    codon-infer inpaint --sequence \"MCMPC*TTDHQMARKCDD\" --threads 4");
+    println!("    codon-infer dms --fasta protein.fasta --window 128 --export-csv dms.csv --threads 4");
+    println!("    codon-infer contacts --sequence \"MCMPCFTTDHQMARKCDDCCGGKGRGKCYGPQCLCR\" --threads 4");
+    println!("    codon-infer benchmark --suite full --threads 4");
+    println!("    codon-infer benchmark --model esm2_650m_weights.bin --suite full --threads 4");
+    println!("    codon-infer benchmark --model esm2_650m_weights.bin --suite full --threads 4 --quantize q8_0");
 }
 
 fn load_input_record(
@@ -78,13 +84,39 @@ fn load_input_record(
     }
 }
 
-fn load_model(model_path: &str) -> io::Result<(EsmConfig, EsmWeights)> {
+pub enum LoadedWeights {
+    Fp32(EsmWeights),
+    Q8(EsmWeightsQ8),
+}
+
+impl LoadedWeights {
+    pub fn as_ref(&self) -> ModelWeightsRef<'_> {
+        match *self {
+            LoadedWeights::Fp32(ref w) => ModelWeightsRef::Fp32(w),
+            LoadedWeights::Q8(ref w) => ModelWeightsRef::Q8(w),
+        }
+    }
+}
+
+pub fn load_model_weights(model_path: &str, quantize_q8: bool) -> io::Result<(EsmConfig, LoadedWeights)> {
     let config = match EsmConfig::detect_from_file(model_path) {
         Ok(cfg) => cfg,
         Err(_) => EsmConfig::esm2_8m(),
     };
-    let weights = EsmWeights::from_file(model_path, &config)?;
-    Ok((config, weights))
+    if quantize_q8 {
+        let is_q8_file = model_path.ends_with(".q8") || model_path.ends_with(".q8.bin");
+        if is_q8_file {
+            let weights_q8 = EsmWeightsQ8::from_file(model_path, &config)?;
+            Ok((config, LoadedWeights::Q8(weights_q8)))
+        } else {
+            let fp32 = EsmWeights::from_file(model_path, &config)?;
+            let weights_q8 = fp32.quantize_q8();
+            Ok((config, LoadedWeights::Q8(weights_q8)))
+        }
+    } else {
+        let weights = EsmWeights::from_file(model_path, &config)?;
+        Ok((config, LoadedWeights::Fp32(weights)))
+    }
 }
 
 fn main() -> io::Result<()> {
@@ -101,14 +133,31 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
 
-    // Detect color preferences early
+    // Detect hardware parallelism for default threading
+    let default_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+
+    // Detect global preferences early
     let mut color_arg: Option<String> = None;
     let mut no_color_flag = false;
+    let mut global_threads: Option<usize> = None;
+    let mut global_quantize: Option<bool> = None;
+
     for (i, a) in args.iter().enumerate() {
         if a == "--no-color" {
             no_color_flag = true;
         } else if a == "--color" && i + 1 < args.len() {
             color_arg = Some(args[i + 1].clone());
+        } else if (a == "--threads" || a == "-t") && i + 1 < args.len() {
+            if let Ok(t) = args[i + 1].parse::<usize>() {
+                global_threads = Some(t.max(1));
+            }
+        } else if a == "--quantize" && i + 1 < args.len() {
+            let q_str = args[i + 1].to_lowercase();
+            global_quantize = Some(q_str == "q8_0" || q_str == "q8");
+        } else if a == "--q8" {
+            global_quantize = Some(true);
         }
     }
     let theme = TerminalTheme::detect(color_arg.as_deref(), no_color_flag);
@@ -134,6 +183,9 @@ fn main() -> io::Result<()> {
             let mut suite = "full".to_string();
             let mut model_arg: Option<String> = None;
             let mut export_json_path: Option<String> = None;
+            let mut num_threads = global_threads.unwrap_or(default_threads);
+            let mut quantize_q8 = global_quantize.unwrap_or(false);
+
             let mut i = sub_args_start;
             while i < args.len() {
                 if (args[i] == "--suite" || args[i] == "-s") && i + 1 < args.len() {
@@ -142,6 +194,16 @@ fn main() -> io::Result<()> {
                 } else if args[i] == "--model" && i + 1 < args.len() {
                     model_arg = Some(args[i + 1].clone());
                     i += 2;
+                } else if (args[i] == "--threads" || args[i] == "-t") && i + 1 < args.len() {
+                    if let Ok(t) = args[i + 1].parse::<usize>() { num_threads = t.max(1); }
+                    i += 2;
+                } else if args[i] == "--quantize" && i + 1 < args.len() {
+                    let q_str = args[i + 1].to_lowercase();
+                    quantize_q8 = q_str == "q8_0" || q_str == "q8";
+                    i += 2;
+                } else if args[i] == "--q8" {
+                    quantize_q8 = true;
+                    i += 1;
                 } else if args[i] == "--export-json" && i + 1 < args.len() {
                     export_json_path = Some(args[i + 1].clone());
                     i += 2;
@@ -173,6 +235,8 @@ fn main() -> io::Result<()> {
                 &suite,
                 &theme,
                 export_json_path.as_deref(),
+                num_threads,
+                quantize_q8,
             )?;
             Ok(())
         }
@@ -184,6 +248,8 @@ fn main() -> io::Result<()> {
             let mut stride: usize = 64;
             let mut export_csv: Option<String> = None;
             let mut export_json: Option<String> = None;
+            let mut num_threads = global_threads.unwrap_or(default_threads);
+            let mut quantize_q8 = global_quantize.unwrap_or(false);
 
             let mut i = sub_args_start;
             while i < args.len() {
@@ -193,6 +259,16 @@ fn main() -> io::Result<()> {
                 } else if (args[i] == "--sequence" || args[i] == "-s") && i + 1 < args.len() {
                     sequence_arg = Some(args[i + 1].clone());
                     i += 2;
+                } else if (args[i] == "--threads" || args[i] == "-t") && i + 1 < args.len() {
+                    if let Ok(t) = args[i + 1].parse::<usize>() { num_threads = t.max(1); }
+                    i += 2;
+                } else if args[i] == "--quantize" && i + 1 < args.len() {
+                    let q_str = args[i + 1].to_lowercase();
+                    quantize_q8 = q_str == "q8_0" || q_str == "q8";
+                    i += 2;
+                } else if args[i] == "--q8" {
+                    quantize_q8 = true;
+                    i += 1;
                 } else if args[i] == "--window" && i + 1 < args.len() {
                     if let Ok(w) = args[i + 1].parse::<usize>() { window_size = w; }
                     i += 2;
@@ -217,9 +293,17 @@ fn main() -> io::Result<()> {
             }
 
             let record = load_input_record(fasta_path.as_deref(), sequence_arg.as_deref(), "target_protein")?;
-            let (config, weights) = load_model(&model_path)?;
+            let (config, loaded_weights) = load_model_weights(&model_path, quantize_q8)?;
 
-            let result = run_pipeline_dms(&record, window_size, stride, &config, &weights, &theme);
+            let result = run_pipeline_dms_parallel(
+                &record,
+                window_size,
+                stride,
+                &config,
+                loaded_weights.as_ref(),
+                num_threads,
+                &theme,
+            );
             render_dms_heatmap(&result, 25, &theme);
 
             if let Some(ref csv_path) = export_csv {
@@ -236,6 +320,8 @@ fn main() -> io::Result<()> {
         "inpaint" => {
             let mut fasta_path: Option<String> = None;
             let mut sequence_arg: Option<String> = None;
+            let mut num_threads = global_threads.unwrap_or(default_threads);
+            let mut quantize_q8 = global_quantize.unwrap_or(false);
 
             let mut i = sub_args_start;
             while i < args.len() {
@@ -245,6 +331,16 @@ fn main() -> io::Result<()> {
                 } else if (args[i] == "--sequence" || args[i] == "-s") && i + 1 < args.len() {
                     sequence_arg = Some(args[i + 1].clone());
                     i += 2;
+                } else if (args[i] == "--threads" || args[i] == "-t") && i + 1 < args.len() {
+                    if let Ok(t) = args[i + 1].parse::<usize>() { num_threads = t.max(1); }
+                    i += 2;
+                } else if args[i] == "--quantize" && i + 1 < args.len() {
+                    let q_str = args[i + 1].to_lowercase();
+                    quantize_q8 = q_str == "q8_0" || q_str == "q8";
+                    i += 2;
+                } else if args[i] == "--q8" {
+                    quantize_q8 = true;
+                    i += 1;
                 } else if args[i] == "--model" && i + 1 < args.len() {
                     model_path = args[i + 1].clone();
                     i += 2;
@@ -257,9 +353,9 @@ fn main() -> io::Result<()> {
             }
 
             let record = load_input_record(fasta_path.as_deref(), sequence_arg.as_deref(), "masked_protein")?;
-            let (config, weights) = load_model(&model_path)?;
+            let (config, loaded_weights) = load_model_weights(&model_path, quantize_q8)?;
 
-            run_pipeline_inpaint(&record, &config, &weights, &theme);
+            run_pipeline_inpaint_parallel(&record, &config, loaded_weights.as_ref(), num_threads, &theme);
             Ok(())
         }
 
@@ -270,6 +366,8 @@ fn main() -> io::Result<()> {
             let mut top_l_factor: f32 = 1.0;
             let mut export_csv: Option<String> = None;
             let mut export_json: Option<String> = None;
+            let mut num_threads = global_threads.unwrap_or(default_threads);
+            let mut quantize_q8 = global_quantize.unwrap_or(false);
 
             let mut i = sub_args_start;
             while i < args.len() {
@@ -279,6 +377,16 @@ fn main() -> io::Result<()> {
                 } else if (args[i] == "--sequence" || args[i] == "-s") && i + 1 < args.len() {
                     sequence_arg = Some(args[i + 1].clone());
                     i += 2;
+                } else if (args[i] == "--threads" || args[i] == "-t") && i + 1 < args.len() {
+                    if let Ok(t) = args[i + 1].parse::<usize>() { num_threads = t.max(1); }
+                    i += 2;
+                } else if args[i] == "--quantize" && i + 1 < args.len() {
+                    let q_str = args[i + 1].to_lowercase();
+                    quantize_q8 = q_str == "q8_0" || q_str == "q8";
+                    i += 2;
+                } else if args[i] == "--q8" {
+                    quantize_q8 = true;
+                    i += 1;
                 } else if args[i] == "--min-separation" && i + 1 < args.len() {
                     if let Ok(m) = args[i + 1].parse::<usize>() { min_separation = m; }
                     i += 2;
@@ -303,9 +411,17 @@ fn main() -> io::Result<()> {
             }
 
             let record = load_input_record(fasta_path.as_deref(), sequence_arg.as_deref(), "target_structure")?;
-            let (config, weights) = load_model(&model_path)?;
+            let (config, loaded_weights) = load_model_weights(&model_path, quantize_q8)?;
 
-            let (top_contacts, enrichment, cys_indices) = run_pipeline_contacts(&record, min_separation, top_l_factor, &config, &weights, &theme);
+            let (top_contacts, enrichment, cys_indices) = run_pipeline_contacts_parallel(
+                &record,
+                min_separation,
+                top_l_factor,
+                &config,
+                loaded_weights.as_ref(),
+                num_threads,
+                &theme,
+            );
 
             if let Some(ref csv_path) = export_csv {
                 export_contacts_csv(csv_path, &record.id, &top_contacts)?;
@@ -324,6 +440,8 @@ fn main() -> io::Result<()> {
             let mut temperature: f32 = 0.7;
             let mut max_tokens: Option<usize> = None;
             let mut fasta_path: Option<String> = None;
+            let mut num_threads = global_threads.unwrap_or(default_threads);
+            let mut quantize_q8 = global_quantize.unwrap_or(false);
 
             let mut i = sub_args_start;
             while i < args.len() {
@@ -336,6 +454,16 @@ fn main() -> io::Result<()> {
                 } else if (args[i] == "--fasta" || args[i] == "-f") && i + 1 < args.len() {
                     fasta_path = Some(args[i + 1].clone());
                     i += 2;
+                } else if (args[i] == "--threads" || args[i] == "-t") && i + 1 < args.len() {
+                    if let Ok(t) = args[i + 1].parse::<usize>() { num_threads = t.max(1); }
+                    i += 2;
+                } else if args[i] == "--quantize" && i + 1 < args.len() {
+                    let q_str = args[i + 1].to_lowercase();
+                    quantize_q8 = q_str == "q8_0" || q_str == "q8";
+                    i += 2;
+                } else if args[i] == "--q8" {
+                    quantize_q8 = true;
+                    i += 1;
                 } else if args[i] == "--seed" && i + 1 < args.len() {
                     if let Ok(s) = args[i + 1].parse::<u64>() { custom_seed = Some(s); }
                     i += 2;
@@ -358,11 +486,14 @@ fn main() -> io::Result<()> {
                 prompt = rec.sequence;
             }
 
-            println!("--- Codon-Infer Engine V1.4 (Zero-Deps Multi-Scale CLI) ---");
-            println!("Active SIMD Backend: {}", active_simd_backend());
+            println!("--- Codon-Infer Engine V1.5-dev (Zero-Deps Multi-Scale CLI) ---");
+            println!("Active SIMD Backend:  {}", active_simd_backend());
+            println!("Concurrency Threads:  {}", num_threads);
+            println!("Execution Precision:  {}", if quantize_q8 { "Q8_0 (In-Memory Blocks)" } else { "FP32 (Canonical)" });
+
             let load_timer = Instant::now();
             println!("Loading model weights from '{}'...", model_path);
-            let (config, weights) = load_model(&model_path)?;
+            let (config, loaded_weights) = load_model_weights(&model_path, quantize_q8)?;
             println!("Model weights loaded successfully for {} in {:?}!\n", config.model_name(), load_timer.elapsed());
 
             let mut run_state = RunState::new(&config);
@@ -383,16 +514,34 @@ fn main() -> io::Result<()> {
                 io::stdout().flush().unwrap();
             };
 
-            let metrics = generate_sequence(
-                &prompt,
-                temperature,
-                max_tokens,
-                seed,
-                &config,
-                &weights,
-                &mut run_state,
-                Some(&mut print_cb),
-            );
+            let metrics = match loaded_weights {
+                LoadedWeights::Fp32(ref weights) => {
+                    generate_sequence_parallel(
+                        &prompt,
+                        temperature,
+                        max_tokens,
+                        seed,
+                        &config,
+                        weights,
+                        &mut run_state,
+                        num_threads,
+                        Some(&mut print_cb),
+                    )
+                }
+                LoadedWeights::Q8(ref weights_q8) => {
+                    generate_sequence_q8(
+                        &prompt,
+                        temperature,
+                        max_tokens,
+                        seed,
+                        &config,
+                        weights_q8,
+                        &mut run_state,
+                        num_threads,
+                        Some(&mut print_cb),
+                    )
+                }
+            };
 
             println!("\n\n--- Performance & Validation Report ---");
             println!(" * Prompt Pre-fill Latency:            {:.2} ms", metrics.prefill_ms);

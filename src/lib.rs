@@ -1,6 +1,6 @@
 #![allow(unused_unsafe, unsafe_op_in_unsafe_fn)]
 use std::fs::File;
-use std::io::{self, Read, Seek};
+use std::io::{self, Read, Seek, Write};
 use std::time::Instant;
 
 pub mod mcp;
@@ -17,9 +17,12 @@ pub use export::{
     dms_to_json_string, contacts_to_json_string, inpaint_to_json_string,
 };
 pub use pipeline::{
-    run_pipeline_dms, run_pipeline_inpaint, run_pipeline_contacts, render_dms_heatmap,
-    compute_pipeline_inpaint, compute_pipeline_contacts, InpaintPipelineResult, InpaintSite,
-    InpaintCandidate, ContactsPipelineResult,
+    run_pipeline_dms, run_pipeline_dms_parallel,
+    run_pipeline_inpaint, run_pipeline_inpaint_parallel,
+    run_pipeline_contacts, run_pipeline_contacts_parallel,
+    render_dms_heatmap, compute_pipeline_inpaint, compute_pipeline_inpaint_parallel,
+    compute_pipeline_contacts, compute_pipeline_contacts_parallel,
+    InpaintPipelineResult, InpaintSite, InpaintCandidate, ContactsPipelineResult,
 };
 pub use benchmark::{
     ModelBenchmarkMetrics, MultiModelBenchmarkReport, MultiScaleSimdReport,
@@ -344,6 +347,152 @@ pub struct EsmWeightsQ8 {
     pub classifier_weights: Vec<f32>,
 }
 
+impl EsmWeightsQ8 {
+    pub fn save_to_file(&self, path: &str) -> io::Result<()> {
+        let mut file = File::create(path)?;
+        write_q8_blocks(&mut file, &self.token_embedding_table)?;
+        write_floats(&mut file, &self.ln_1_weight)?;
+        write_floats(&mut file, &self.ln_1_bias)?;
+        write_q8_blocks(&mut file, &self.wq)?;
+        write_floats(&mut file, &self.bq)?;
+        write_q8_blocks(&mut file, &self.wk)?;
+        write_floats(&mut file, &self.bk)?;
+        write_q8_blocks(&mut file, &self.wv)?;
+        write_floats(&mut file, &self.bv)?;
+        write_q8_blocks(&mut file, &self.wo)?;
+        write_floats(&mut file, &self.bo)?;
+        write_floats(&mut file, &self.ln_2_weight)?;
+        write_floats(&mut file, &self.ln_2_bias)?;
+        write_q8_blocks(&mut file, &self.fc1_weight)?;
+        write_floats(&mut file, &self.fc1_bias)?;
+        write_q8_blocks(&mut file, &self.fc2_weight)?;
+        write_floats(&mut file, &self.fc2_bias)?;
+        write_floats(&mut file, &self.ln_f_weight)?;
+        write_floats(&mut file, &self.ln_f_bias)?;
+        write_floats(&mut file, &self.classifier_weights)?;
+        file.flush()?;
+        Ok(())
+    }
+
+    pub fn from_file(path: &str, config: &EsmConfig) -> io::Result<Self> {
+        let mut file = File::open(path)?;
+        let token_embedding_table = read_q8_blocks(&mut file, config.vocab_size * (config.dim / 32))?;
+        let ln_1_weight = read_floats(&mut file, config.n_layers * config.dim)?;
+        let ln_1_bias = read_floats(&mut file, config.n_layers * config.dim)?;
+        let wq = read_q8_blocks(&mut file, config.n_layers * config.dim * (config.dim / 32))?;
+        let bq = read_floats(&mut file, config.n_layers * config.dim)?;
+        let wk = read_q8_blocks(&mut file, config.n_layers * config.dim * (config.dim / 32))?;
+        let bk = read_floats(&mut file, config.n_layers * config.dim)?;
+        let wv = read_q8_blocks(&mut file, config.n_layers * config.dim * (config.dim / 32))?;
+        let bv = read_floats(&mut file, config.n_layers * config.dim)?;
+        let wo = read_q8_blocks(&mut file, config.n_layers * config.dim * (config.dim / 32))?;
+        let bo = read_floats(&mut file, config.n_layers * config.dim)?;
+        let ln_2_weight = read_floats(&mut file, config.n_layers * config.dim)?;
+        let ln_2_bias = read_floats(&mut file, config.n_layers * config.dim)?;
+        let fc1_weight = read_q8_blocks(&mut file, config.n_layers * config.hidden_dim * (config.dim / 32))?;
+        let fc1_bias = read_floats(&mut file, config.n_layers * config.hidden_dim)?;
+        let fc2_weight = read_q8_blocks(&mut file, config.n_layers * config.dim * (config.hidden_dim / 32))?;
+        let fc2_bias = read_floats(&mut file, config.n_layers * config.dim)?;
+        let ln_f_weight = read_floats(&mut file, config.dim)?;
+        let ln_f_bias = read_floats(&mut file, config.dim)?;
+
+        let current_pos = file.stream_position()?;
+        let file_len = file.metadata()?.len();
+        if current_pos > file_len {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Stream position exceeds file length"));
+        }
+        let remaining_bytes = (file_len - current_pos) as usize;
+        if remaining_bytes % 4 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Unaligned trailing bytes in Q8: {} is not a multiple of 4", remaining_bytes),
+            ));
+        }
+        let remaining_floats = remaining_bytes / 4;
+        let classifier_weights = read_floats(&mut file, remaining_floats)?;
+
+        let final_pos = file.stream_position()?;
+        if final_pos != file_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Q8 Weights file underread: read {} of {} bytes", final_pos, file_len),
+            ));
+        }
+
+        Ok(Self {
+            token_embedding_table,
+            ln_1_weight,
+            ln_1_bias,
+            wq,
+            bq,
+            wk,
+            bk,
+            wv,
+            bv,
+            wo,
+            bo,
+            ln_2_weight,
+            ln_2_bias,
+            fc1_weight,
+            fc1_bias,
+            fc2_weight,
+            fc2_bias,
+            ln_f_weight,
+            ln_f_bias,
+            classifier_weights,
+        })
+    }
+
+    pub fn load_from_file(model_path: &str) -> io::Result<(EsmConfig, Self)> {
+        let config = match EsmConfig::detect_from_file(model_path) {
+            Ok(cfg) => cfg,
+            Err(_) => EsmConfig::esm2_8m(),
+        };
+        let weights = Self::from_file(model_path, &config)?;
+        Ok((config, weights))
+    }
+
+    pub fn load_or_convert(model_path: &str, config: &EsmConfig) -> io::Result<Self> {
+        let is_q8_file = model_path.ends_with(".q8") || model_path.ends_with(".q8.bin");
+        if is_q8_file {
+            Self::from_file(model_path, config)
+        } else {
+            let fp32 = EsmWeights::from_file(model_path, config)?;
+            Ok(fp32.quantize_q8())
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuantizationMode {
+    Fp32,
+    Q8_0,
+}
+
+#[derive(Clone, Copy)]
+pub enum ModelWeightsRef<'a> {
+    Fp32(&'a EsmWeights),
+    Q8(&'a EsmWeightsQ8),
+}
+
+pub fn compute_cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    let mut dot = 0.0f32;
+    let mut norm_a = 0.0f32;
+    let mut norm_b = 0.0f32;
+    let len = a.len().min(b.len());
+    for i in 0..len {
+        dot += a[i] * b[i];
+        norm_a += a[i] * a[i];
+        norm_b += b[i] * b[i];
+    }
+    let denom = norm_a.sqrt() * norm_b.sqrt();
+    if denom > 1e-12 {
+        dot / denom
+    } else {
+        1.0
+    }
+}
+
 pub fn matmul_q8(out: &mut [f32], x: &[f32], w: &[BlockQ8_0], bias: &[f32], in_dim: usize, out_dim: usize) {
     debug_assert!(out.len() >= out_dim && bias.len() >= out_dim && x.len() >= in_dim);
     let blocks_per_row = in_dim / 32;
@@ -379,6 +528,39 @@ fn read_floats(file: &mut File, num_floats: usize) -> io::Result<Vec<f32>> {
         }
     }
     Ok(floats)
+}
+
+fn write_floats(file: &mut File, floats: &[f32]) -> io::Result<()> {
+    let byte_slice = unsafe {
+        std::slice::from_raw_parts(
+            floats.as_ptr() as *const u8,
+            floats.len() * std::mem::size_of::<f32>(),
+        )
+    };
+    file.write_all(byte_slice)
+}
+
+fn read_q8_blocks(file: &mut File, num_blocks: usize) -> io::Result<Vec<BlockQ8_0>> {
+    let mut blocks = Vec::<BlockQ8_0>::with_capacity(num_blocks);
+    unsafe {
+        blocks.set_len(num_blocks);
+        let byte_slice = std::slice::from_raw_parts_mut(
+            blocks.as_mut_ptr() as *mut u8,
+            num_blocks * std::mem::size_of::<BlockQ8_0>(),
+        );
+        file.read_exact(byte_slice)?;
+    }
+    Ok(blocks)
+}
+
+fn write_q8_blocks(file: &mut File, blocks: &[BlockQ8_0]) -> io::Result<()> {
+    let byte_slice = unsafe {
+        std::slice::from_raw_parts(
+            blocks.as_ptr() as *const u8,
+            blocks.len() * std::mem::size_of::<BlockQ8_0>(),
+        )
+    };
+    file.write_all(byte_slice)
 }
 
 pub struct RunState {
@@ -560,6 +742,184 @@ pub fn matmul(out: &mut [f32], x: &[f32], w: &[f32], bias: &[f32], in_dim: usize
         if std::is_x86_feature_detected!("avx") { unsafe { matmul_avx1(out, x, w, bias, in_dim, out_dim); } return; }
     }
     matmul_scalar(out, x, w, bias, in_dim, out_dim);
+}
+
+pub fn matmul_parallel(
+    out: &mut [f32],
+    x: &[f32],
+    w: &[f32],
+    bias: &[f32],
+    in_dim: usize,
+    out_dim: usize,
+    num_threads: usize,
+) {
+    if num_threads <= 1 || out_dim < 32 {
+        matmul(out, x, w, bias, in_dim, out_dim);
+        return;
+    }
+
+    let n_threads = num_threads.min(out_dim);
+    let chunk_size = (out_dim + n_threads - 1) / n_threads;
+
+    std::thread::scope(|s| {
+        for (t_idx, out_chunk) in out.chunks_mut(chunk_size).enumerate() {
+            let start_row = t_idx * chunk_size;
+            let rows_in_chunk = out_chunk.len();
+            let bias_chunk = &bias[start_row..start_row + rows_in_chunk];
+            let w_start = start_row * in_dim;
+            let w_end = w_start + rows_in_chunk * in_dim;
+            let w_chunk = &w[w_start..w_end];
+
+            s.spawn(move || {
+                matmul(out_chunk, x, w_chunk, bias_chunk, in_dim, rows_in_chunk);
+            });
+        }
+    });
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+pub unsafe fn matmul_q8_avx1(
+    out: &mut [f32],
+    x: &[f32],
+    w: &[BlockQ8_0],
+    bias: &[f32],
+    in_dim: usize,
+    out_dim: usize,
+) {
+    use std::arch::x86_64::*;
+    debug_assert!(out.len() >= out_dim && bias.len() >= out_dim && x.len() >= in_dim);
+    let blocks_per_row = in_dim / 32;
+    let x_ptr = x.as_ptr();
+
+    for i in 0..out_dim {
+        let row_blocks = &w[i * blocks_per_row..(i + 1) * blocks_per_row];
+        let mut row_sum = 0.0f32;
+
+        for (b_idx, block) in row_blocks.iter().enumerate() {
+            let block_x = x_ptr.add(b_idx * 32);
+            let qs_ptr = block.qs.as_ptr();
+
+            let mut acc = _mm256_setzero_ps();
+
+            // 4 chunks of 8 elements = 32 elements
+            for c in 0..4 {
+                let offset = c * 8;
+                let vx = _mm256_loadu_ps(block_x.add(offset));
+                let raw_8 = _mm_loadl_epi64(qs_ptr.add(offset) as *const __m128i);
+                let epi32_lo = _mm_cvtepi8_epi32(raw_8);
+                let epi32_hi = _mm_cvtepi8_epi32(_mm_srli_si128(raw_8, 4));
+                let ps_lo = _mm_cvtepi32_ps(epi32_lo);
+                let ps_hi = _mm_cvtepi32_ps(epi32_hi);
+                let vq = _mm256_set_m128(ps_hi, ps_lo);
+                let prod = _mm256_mul_ps(vq, vx);
+                acc = _mm256_add_ps(acc, prod);
+            }
+
+            row_sum += hsum256_ps_avx(acc) * block.d;
+        }
+
+        *out.get_unchecked_mut(i) = row_sum + *bias.get_unchecked(i);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn matmul_q8_avx2_fma(
+    out: &mut [f32],
+    x: &[f32],
+    w: &[BlockQ8_0],
+    bias: &[f32],
+    in_dim: usize,
+    out_dim: usize,
+) {
+    use std::arch::x86_64::*;
+    debug_assert!(out.len() >= out_dim && bias.len() >= out_dim && x.len() >= in_dim);
+    let blocks_per_row = in_dim / 32;
+    let x_ptr = x.as_ptr();
+
+    for i in 0..out_dim {
+        let row_blocks = &w[i * blocks_per_row..(i + 1) * blocks_per_row];
+        let mut row_sum = 0.0f32;
+
+        for (b_idx, block) in row_blocks.iter().enumerate() {
+            let block_x = x_ptr.add(b_idx * 32);
+            let qs_ptr = block.qs.as_ptr();
+
+            let mut acc = _mm256_setzero_ps();
+
+            // 4 chunks of 8 elements = 32 elements
+            for c in 0..4 {
+                let offset = c * 8;
+                let vx = _mm256_loadu_ps(block_x.add(offset));
+                let raw_8 = _mm_loadl_epi64(qs_ptr.add(offset) as *const __m128i);
+                let epi32 = _mm256_cvtepi8_epi32(raw_8);
+                let vq = _mm256_cvtepi32_ps(epi32);
+                acc = _mm256_fmadd_ps(vq, vx, acc);
+            }
+
+            row_sum += hsum256_ps_avx(acc) * block.d;
+        }
+
+        *out.get_unchecked_mut(i) = row_sum + *bias.get_unchecked(i);
+    }
+}
+
+#[inline]
+pub fn matmul_q8_simd(
+    out: &mut [f32],
+    x: &[f32],
+    w: &[BlockQ8_0],
+    bias: &[f32],
+    in_dim: usize,
+    out_dim: usize,
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            unsafe { matmul_q8_avx2_fma(out, x, w, bias, in_dim, out_dim) };
+            return;
+        }
+        if std::is_x86_feature_detected!("avx") {
+            unsafe { matmul_q8_avx1(out, x, w, bias, in_dim, out_dim) };
+            return;
+        }
+    }
+    matmul_q8(out, x, w, bias, in_dim, out_dim);
+}
+
+pub fn matmul_q8_parallel(
+    out: &mut [f32],
+    x: &[f32],
+    w: &[BlockQ8_0],
+    bias: &[f32],
+    in_dim: usize,
+    out_dim: usize,
+    num_threads: usize,
+) {
+    if num_threads <= 1 || out_dim < 32 {
+        matmul_q8_simd(out, x, w, bias, in_dim, out_dim);
+        return;
+    }
+
+    let blocks_per_row = in_dim / 32;
+    let n_threads = num_threads.min(out_dim);
+    let chunk_size = (out_dim + n_threads - 1) / n_threads;
+
+    std::thread::scope(|s| {
+        for (t_idx, out_chunk) in out.chunks_mut(chunk_size).enumerate() {
+            let start_row = t_idx * chunk_size;
+            let rows_in_chunk = out_chunk.len();
+            let bias_chunk = &bias[start_row..start_row + rows_in_chunk];
+            let w_start = start_row * blocks_per_row;
+            let w_end = w_start + rows_in_chunk * blocks_per_row;
+            let w_chunk = &w[w_start..w_end];
+
+            s.spawn(move || {
+                matmul_q8_simd(out_chunk, x, w_chunk, bias_chunk, in_dim, rows_in_chunk);
+            });
+        }
+    });
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -827,55 +1187,367 @@ pub fn apply_rope(q: &mut [f32], k: &mut [f32], rope_cos: &[f32], rope_sin: &[f3
 }
 
 pub fn forward(token: usize, pos: usize, config: &EsmConfig, weights: &EsmWeights, state: &mut RunState) {
-    let dim = config.dim; let embed_offset = token * dim;
+    forward_parallel(token, pos, config, weights, state, 1);
+}
+
+pub fn forward_parallel(
+    token: usize,
+    pos: usize,
+    config: &EsmConfig,
+    weights: &EsmWeights,
+    state: &mut RunState,
+    num_threads: usize,
+) {
+    let dim = config.dim;
+    let embed_offset = token * dim;
     state.x.copy_from_slice(&weights.token_embedding_table[embed_offset..embed_offset + dim]);
-    let head_dim = dim / config.n_heads; let inv_scale = 1.0 / (head_dim as f32).sqrt();
+    let head_dim = dim / config.n_heads;
+    let inv_scale = 1.0 / (head_dim as f32).sqrt();
+
     #[cfg(target_arch = "x86_64")]
     let has_avx = std::is_x86_feature_detected!("avx") && (head_dim == 16 || head_dim == 24 || head_dim == 32 || head_dim == 64);
+
     for l in 0..config.n_layers {
-        let layer_dim_offset = l * dim; let layer_matrix_offset = l * dim * dim;
-        layer_norm(&mut state.xb, &state.x, &weights.ln_1_weight[layer_dim_offset..layer_dim_offset + dim], &weights.ln_1_bias[layer_dim_offset..layer_dim_offset + dim]);
-        matmul(&mut state.q, &state.xb, &weights.wq[layer_matrix_offset..layer_matrix_offset + (dim * dim)], &weights.bq[layer_dim_offset..layer_dim_offset + dim], dim, dim);
-        matmul(&mut state.k, &state.xb, &weights.wk[layer_matrix_offset..layer_matrix_offset + (dim * dim)], &weights.bk[layer_dim_offset..layer_dim_offset + dim], dim, dim);
-        matmul(&mut state.v, &state.xb, &weights.wv[layer_matrix_offset..layer_matrix_offset + (dim * dim)], &weights.bv[layer_dim_offset..layer_dim_offset + dim], dim, dim);
+        let layer_dim_offset = l * dim;
+        let layer_matrix_offset = l * dim * dim;
+
+        layer_norm(
+            &mut state.xb,
+            &state.x,
+            &weights.ln_1_weight[layer_dim_offset..layer_dim_offset + dim],
+            &weights.ln_1_bias[layer_dim_offset..layer_dim_offset + dim],
+        );
+
+        matmul_parallel(
+            &mut state.q,
+            &state.xb,
+            &weights.wq[layer_matrix_offset..layer_matrix_offset + (dim * dim)],
+            &weights.bq[layer_dim_offset..layer_dim_offset + dim],
+            dim,
+            dim,
+            num_threads,
+        );
+        matmul_parallel(
+            &mut state.k,
+            &state.xb,
+            &weights.wk[layer_matrix_offset..layer_matrix_offset + (dim * dim)],
+            &weights.bk[layer_dim_offset..layer_dim_offset + dim],
+            dim,
+            dim,
+            num_threads,
+        );
+        matmul_parallel(
+            &mut state.v,
+            &state.xb,
+            &weights.wv[layer_matrix_offset..layer_matrix_offset + (dim * dim)],
+            &weights.bv[layer_dim_offset..layer_dim_offset + dim],
+            dim,
+            dim,
+            num_threads,
+        );
+
         apply_rope(&mut state.q, &mut state.k, &state.rope_cos, &state.rope_sin, pos, dim, config.n_heads);
-        let layer_kv_base = l * config.max_seq_len * dim; let kv_offset = layer_kv_base + pos * dim;
+
+        let layer_kv_base = l * config.max_seq_len * dim;
+        let kv_offset = layer_kv_base + pos * dim;
         state.key_cache[kv_offset..kv_offset + dim].copy_from_slice(&state.k);
         state.value_cache[kv_offset..kv_offset + dim].copy_from_slice(&state.v);
+
         for h in 0..config.n_heads {
-            let q_offset = h * head_dim; let q_head = &state.q[q_offset..q_offset + head_dim];
-            let att_offset = h * config.max_seq_len; let att_head = &mut state.att[att_offset..att_offset + config.max_seq_len];
+            let q_offset = h * head_dim;
+            let q_head = &state.q[q_offset..q_offset + head_dim];
+            let att_offset = h * config.max_seq_len;
+            let att_head = &mut state.att[att_offset..att_offset + config.max_seq_len];
             let xb2_head = &mut state.xb2[q_offset..q_offset + head_dim];
+
             #[cfg(target_arch = "x86_64")]
             if has_avx {
-                unsafe { attention_head_avx1(q_head, &state.key_cache, &state.value_cache, att_head, xb2_head, layer_kv_base, q_offset, pos, dim, head_dim, inv_scale); }
+                unsafe {
+                    attention_head_avx1(
+                        q_head,
+                        &state.key_cache,
+                        &state.value_cache,
+                        att_head,
+                        xb2_head,
+                        layer_kv_base,
+                        q_offset,
+                        pos,
+                        dim,
+                        head_dim,
+                        inv_scale,
+                    );
+                }
                 continue;
             }
+
             for t in 0..=pos {
                 let cache_offset = layer_kv_base + t * dim + q_offset;
                 let k_head = &state.key_cache[cache_offset..cache_offset + head_dim];
-                let mut score = 0.0f32; for i in 0..head_dim { score += q_head[i] * k_head[i]; }
+                let mut score = 0.0f32;
+                for i in 0..head_dim {
+                    score += q_head[i] * k_head[i];
+                }
                 att_head[t] = score * inv_scale;
             }
-            softmax(&mut att_head[0..=pos]); xb2_head.fill(0.0);
+            softmax(&mut att_head[0..=pos]);
+            xb2_head.fill(0.0);
             for t in 0..=pos {
-                let prob = att_head[t]; let cache_offset = layer_kv_base + t * dim + q_offset;
+                let prob = att_head[t];
+                let cache_offset = layer_kv_base + t * dim + q_offset;
                 let v_head = &state.value_cache[cache_offset..cache_offset + head_dim];
-                for i in 0..head_dim { xb2_head[i] += prob * v_head[i]; }
+                for i in 0..head_dim {
+                    xb2_head[i] += prob * v_head[i];
+                }
             }
         }
-        matmul(&mut state.xb, &state.xb2, &weights.wo[layer_matrix_offset..layer_matrix_offset + (dim * dim)], &weights.bo[layer_dim_offset..layer_dim_offset + dim], dim, dim);
-        for i in 0..dim { state.x[i] += state.xb[i]; }
-        layer_norm(&mut state.xb, &state.x, &weights.ln_2_weight[layer_dim_offset..layer_dim_offset + dim], &weights.ln_2_bias[layer_dim_offset..layer_dim_offset + dim]);
-        let hidden_dim = config.hidden_dim; let fc1_w_offset = l * dim * hidden_dim; let fc1_b_offset = l * hidden_dim;
-        matmul(&mut state.hb, &state.xb, &weights.fc1_weight[fc1_w_offset..fc1_w_offset + (dim * hidden_dim)], &weights.fc1_bias[fc1_b_offset..fc1_b_offset + hidden_dim], dim, hidden_dim);
+
+        matmul_parallel(
+            &mut state.xb,
+            &state.xb2,
+            &weights.wo[layer_matrix_offset..layer_matrix_offset + (dim * dim)],
+            &weights.bo[layer_dim_offset..layer_dim_offset + dim],
+            dim,
+            dim,
+            num_threads,
+        );
+
+        for i in 0..dim {
+            state.x[i] += state.xb[i];
+        }
+
+        layer_norm(
+            &mut state.xb,
+            &state.x,
+            &weights.ln_2_weight[layer_dim_offset..layer_dim_offset + dim],
+            &weights.ln_2_bias[layer_dim_offset..layer_dim_offset + dim],
+        );
+
+        let hidden_dim = config.hidden_dim;
+        let fc1_w_offset = l * dim * hidden_dim;
+        let fc1_b_offset = l * hidden_dim;
+        matmul_parallel(
+            &mut state.hb,
+            &state.xb,
+            &weights.fc1_weight[fc1_w_offset..fc1_w_offset + (dim * hidden_dim)],
+            &weights.fc1_bias[fc1_b_offset..fc1_b_offset + hidden_dim],
+            dim,
+            hidden_dim,
+            num_threads,
+        );
+
         gelu(&mut state.hb2, &state.hb);
+
         let fc2_w_offset = l * hidden_dim * dim;
-        matmul(&mut state.xb, &state.hb2, &weights.fc2_weight[fc2_w_offset..fc2_w_offset + (hidden_dim * dim)], &weights.fc2_bias[layer_dim_offset..layer_dim_offset + dim], hidden_dim, dim);
-        for i in 0..dim { state.x[i] += state.xb[i]; }
+        matmul_parallel(
+            &mut state.xb,
+            &state.hb2,
+            &weights.fc2_weight[fc2_w_offset..fc2_w_offset + (hidden_dim * dim)],
+            &weights.fc2_bias[layer_dim_offset..layer_dim_offset + dim],
+            hidden_dim,
+            dim,
+            num_threads,
+        );
+
+        for i in 0..dim {
+            state.x[i] += state.xb[i];
+        }
     }
+
     layer_norm(&mut state.xb, &state.x, &weights.ln_f_weight, &weights.ln_f_bias);
-    project_lm_head(&mut state.logits, &state.xb, weights, config, &mut state.hb, &mut state.hb2);
+    project_lm_head_parallel(
+        &mut state.logits,
+        &state.xb,
+        &weights.classifier_weights,
+        &weights.token_embedding_table,
+        config,
+        &mut state.hb,
+        &mut state.hb2,
+        num_threads,
+    );
+}
+
+pub fn forward_q8(
+    token: usize,
+    pos: usize,
+    config: &EsmConfig,
+    weights: &EsmWeightsQ8,
+    state: &mut RunState,
+    num_threads: usize,
+) {
+    let dim = config.dim;
+    let head_dim = dim / config.n_heads;
+    let inv_scale = 1.0 / (head_dim as f32).sqrt();
+
+    // Dequantize embedding for current token
+    let embed_blocks_per_row = dim / 32;
+    let embed_row = &weights.token_embedding_table[token * embed_blocks_per_row..(token + 1) * embed_blocks_per_row];
+    for (b_idx, block) in embed_row.iter().enumerate() {
+        block.dequantize_to(&mut state.x[b_idx * 32..(b_idx + 1) * 32]);
+    }
+
+    let q8_matrix_blocks = dim * (dim / 32);
+    let q8_fc1_blocks = config.hidden_dim * (dim / 32);
+    let q8_fc2_blocks = dim * (config.hidden_dim / 32);
+
+    #[cfg(target_arch = "x86_64")]
+    let has_avx = std::is_x86_feature_detected!("avx") && (head_dim == 16 || head_dim == 24 || head_dim == 32 || head_dim == 64);
+
+    for l in 0..config.n_layers {
+        let layer_dim_offset = l * dim;
+        let layer_matrix_q8 = l * q8_matrix_blocks;
+
+        layer_norm(
+            &mut state.xb,
+            &state.x,
+            &weights.ln_1_weight[layer_dim_offset..layer_dim_offset + dim],
+            &weights.ln_1_bias[layer_dim_offset..layer_dim_offset + dim],
+        );
+
+        matmul_q8_parallel(
+            &mut state.q,
+            &state.xb,
+            &weights.wq[layer_matrix_q8..layer_matrix_q8 + q8_matrix_blocks],
+            &weights.bq[layer_dim_offset..layer_dim_offset + dim],
+            dim,
+            dim,
+            num_threads,
+        );
+        matmul_q8_parallel(
+            &mut state.k,
+            &state.xb,
+            &weights.wk[layer_matrix_q8..layer_matrix_q8 + q8_matrix_blocks],
+            &weights.bk[layer_dim_offset..layer_dim_offset + dim],
+            dim,
+            dim,
+            num_threads,
+        );
+        matmul_q8_parallel(
+            &mut state.v,
+            &state.xb,
+            &weights.wv[layer_matrix_q8..layer_matrix_q8 + q8_matrix_blocks],
+            &weights.bv[layer_dim_offset..layer_dim_offset + dim],
+            dim,
+            dim,
+            num_threads,
+        );
+
+        apply_rope(&mut state.q, &mut state.k, &state.rope_cos, &state.rope_sin, pos, dim, config.n_heads);
+
+        let layer_kv_base = l * config.max_seq_len * dim;
+        let kv_offset = layer_kv_base + pos * dim;
+        state.key_cache[kv_offset..kv_offset + dim].copy_from_slice(&state.k);
+        state.value_cache[kv_offset..kv_offset + dim].copy_from_slice(&state.v);
+
+        for h in 0..config.n_heads {
+            let q_offset = h * head_dim;
+            let q_head = &state.q[q_offset..q_offset + head_dim];
+            let att_offset = h * config.max_seq_len;
+            let att_head = &mut state.att[att_offset..att_offset + config.max_seq_len];
+            let xb2_head = &mut state.xb2[q_offset..q_offset + head_dim];
+
+            #[cfg(target_arch = "x86_64")]
+            if has_avx {
+                unsafe {
+                    attention_head_avx1(
+                        q_head,
+                        &state.key_cache,
+                        &state.value_cache,
+                        att_head,
+                        xb2_head,
+                        layer_kv_base,
+                        q_offset,
+                        pos,
+                        dim,
+                        head_dim,
+                        inv_scale,
+                    );
+                }
+                continue;
+            }
+
+            for t in 0..=pos {
+                let cache_offset = layer_kv_base + t * dim + q_offset;
+                let k_head = &state.key_cache[cache_offset..cache_offset + head_dim];
+                let mut score = 0.0f32;
+                for i in 0..head_dim {
+                    score += q_head[i] * k_head[i];
+                }
+                att_head[t] = score * inv_scale;
+            }
+            softmax(&mut att_head[0..=pos]);
+            xb2_head.fill(0.0);
+            for t in 0..=pos {
+                let prob = att_head[t];
+                let cache_offset = layer_kv_base + t * dim + q_offset;
+                let v_head = &state.value_cache[cache_offset..cache_offset + head_dim];
+                for i in 0..head_dim {
+                    xb2_head[i] += prob * v_head[i];
+                }
+            }
+        }
+
+        matmul_q8_parallel(
+            &mut state.xb,
+            &state.xb2,
+            &weights.wo[layer_matrix_q8..layer_matrix_q8 + q8_matrix_blocks],
+            &weights.bo[layer_dim_offset..layer_dim_offset + dim],
+            dim,
+            dim,
+            num_threads,
+        );
+
+        for i in 0..dim {
+            state.x[i] += state.xb[i];
+        }
+
+        layer_norm(
+            &mut state.xb,
+            &state.x,
+            &weights.ln_2_weight[layer_dim_offset..layer_dim_offset + dim],
+            &weights.ln_2_bias[layer_dim_offset..layer_dim_offset + dim],
+        );
+
+        let fc1_q8 = l * q8_fc1_blocks;
+        let fc1_b = l * config.hidden_dim;
+        matmul_q8_parallel(
+            &mut state.hb,
+            &state.xb,
+            &weights.fc1_weight[fc1_q8..fc1_q8 + q8_fc1_blocks],
+            &weights.fc1_bias[fc1_b..fc1_b + config.hidden_dim],
+            dim,
+            config.hidden_dim,
+            num_threads,
+        );
+
+        gelu(&mut state.hb2, &state.hb);
+
+        let fc2_q8 = l * q8_fc2_blocks;
+        matmul_q8_parallel(
+            &mut state.xb,
+            &state.hb2,
+            &weights.fc2_weight[fc2_q8..fc2_q8 + q8_fc2_blocks],
+            &weights.fc2_bias[layer_dim_offset..layer_dim_offset + dim],
+            config.hidden_dim,
+            dim,
+            num_threads,
+        );
+
+        for i in 0..dim {
+            state.x[i] += state.xb[i];
+        }
+    }
+
+    layer_norm(&mut state.xb, &state.x, &weights.ln_f_weight, &weights.ln_f_bias);
+    project_lm_head_q8(
+        &mut state.logits,
+        &state.xb,
+        &weights.classifier_weights,
+        &weights.token_embedding_table,
+        config,
+        &mut state.hb,
+        &mut state.hb2,
+        num_threads,
+    );
 }
 
 pub fn project_lm_head(
@@ -886,25 +1558,79 @@ pub fn project_lm_head(
     dense_buf: &mut [f32],
     ln_buf: &mut [f32],
 ) {
+    project_lm_head_parallel(
+        logits,
+        x_norm,
+        &weights.classifier_weights,
+        &weights.token_embedding_table,
+        config,
+        dense_buf,
+        ln_buf,
+        1,
+    );
+}
+
+pub fn project_lm_head_parallel(
+    logits: &mut [f32],
+    x_norm: &[f32],
+    classifier_weights: &[f32],
+    embedding_table: &[f32],
+    config: &EsmConfig,
+    dense_buf: &mut [f32],
+    ln_buf: &mut [f32],
+    num_threads: usize,
+) {
     let dim = config.dim;
     let required_len = 3 * dim + dim * dim + config.vocab_size * dim + config.vocab_size;
-    if weights.classifier_weights.len() >= required_len {
-        let lm_ln_w = &weights.classifier_weights[0..dim];
-        let lm_ln_b = &weights.classifier_weights[dim..2 * dim];
-        let lm_dense_w = &weights.classifier_weights[2 * dim..2 * dim + dim * dim];
-        let lm_dense_b = &weights.classifier_weights[2 * dim + dim * dim..3 * dim + dim * dim];
-        let lm_dec_w = &weights.classifier_weights[3 * dim + dim * dim..3 * dim + dim * dim + config.vocab_size * dim];
-        let lm_dec_b = &weights.classifier_weights[3 * dim + dim * dim + config.vocab_size * dim..3 * dim + dim * dim + config.vocab_size * dim + config.vocab_size];
+    if classifier_weights.len() >= required_len {
+        let lm_ln_w = &classifier_weights[0..dim];
+        let lm_ln_b = &classifier_weights[dim..2 * dim];
+        let lm_dense_w = &classifier_weights[2 * dim..2 * dim + dim * dim];
+        let lm_dense_b = &classifier_weights[2 * dim + dim * dim..3 * dim + dim * dim];
+        let lm_dec_w = &classifier_weights[3 * dim + dim * dim..3 * dim + dim * dim + config.vocab_size * dim];
+        let lm_dec_b = &classifier_weights[3 * dim + dim * dim + config.vocab_size * dim..3 * dim + dim * dim + config.vocab_size * dim + config.vocab_size];
 
         let dense_out = &mut dense_buf[0..dim];
-        matmul(dense_out, x_norm, lm_dense_w, lm_dense_b, dim, dim);
+        matmul_parallel(dense_out, x_norm, lm_dense_w, lm_dense_b, dim, dim, num_threads);
         let gelu_out = &mut ln_buf[0..dim];
         gelu(gelu_out, dense_out);
         layer_norm(dense_out, gelu_out, lm_ln_w, lm_ln_b);
-        matmul(logits, dense_out, lm_dec_w, lm_dec_b, dim, config.vocab_size);
+        matmul_parallel(logits, dense_out, lm_dec_w, lm_dec_b, dim, config.vocab_size, num_threads);
     } else {
         const ZERO_BIAS: [f32; 33] = [0.0; 33];
-        matmul(logits, x_norm, &weights.token_embedding_table, &ZERO_BIAS, dim, config.vocab_size);
+        matmul_parallel(logits, x_norm, embedding_table, &ZERO_BIAS, dim, config.vocab_size, num_threads);
+    }
+}
+
+pub fn project_lm_head_q8(
+    logits: &mut [f32],
+    x_norm: &[f32],
+    classifier_weights: &[f32],
+    embedding_table: &[BlockQ8_0],
+    config: &EsmConfig,
+    dense_buf: &mut [f32],
+    ln_buf: &mut [f32],
+    num_threads: usize,
+) {
+    let dim = config.dim;
+    let required_len = 3 * dim + dim * dim + config.vocab_size * dim + config.vocab_size;
+    if classifier_weights.len() >= required_len {
+        let lm_ln_w = &classifier_weights[0..dim];
+        let lm_ln_b = &classifier_weights[dim..2 * dim];
+        let lm_dense_w = &classifier_weights[2 * dim..2 * dim + dim * dim];
+        let lm_dense_b = &classifier_weights[2 * dim + dim * dim..3 * dim + dim * dim];
+        let lm_dec_w = &classifier_weights[3 * dim + dim * dim..3 * dim + dim * dim + config.vocab_size * dim];
+        let lm_dec_b = &classifier_weights[3 * dim + dim * dim + config.vocab_size * dim..3 * dim + dim * dim + config.vocab_size * dim + config.vocab_size];
+
+        let dense_out = &mut dense_buf[0..dim];
+        matmul_parallel(dense_out, x_norm, lm_dense_w, lm_dense_b, dim, dim, num_threads);
+        let gelu_out = &mut ln_buf[0..dim];
+        gelu(gelu_out, dense_out);
+        layer_norm(dense_out, gelu_out, lm_ln_w, lm_ln_b);
+        matmul_parallel(logits, dense_out, lm_dec_w, lm_dec_b, dim, config.vocab_size, num_threads);
+    } else {
+        const ZERO_BIAS: [f32; 33] = [0.0; 33];
+        matmul_q8_parallel(logits, x_norm, embedding_table, &ZERO_BIAS, dim, config.vocab_size, num_threads);
     }
 }
 
@@ -930,6 +1656,16 @@ pub fn forward_bidirectional(
     config: &EsmConfig,
     weights: &EsmWeights,
     state: &mut BidirectionalRunState,
+) {
+    forward_bidirectional_parallel(tokens, config, weights, state, 1);
+}
+
+pub fn forward_bidirectional_parallel(
+    tokens: &[usize],
+    config: &EsmConfig,
+    weights: &EsmWeights,
+    state: &mut BidirectionalRunState,
+    num_threads: usize,
 ) {
     let seq_len = tokens.len();
     assert!(seq_len <= state.max_len, "Sequence length {} exceeds max_len {}", seq_len, state.max_len);
@@ -960,11 +1696,11 @@ pub fn forward_bidirectional(
             let xp = &state.x[p * dim..(p + 1) * dim];
             layer_norm(&mut state.xb, xp, &weights.ln_1_weight[layer_dim_offset..layer_dim_offset + dim], &weights.ln_1_bias[layer_dim_offset..layer_dim_offset + dim]);
             let q_slice = &mut state.q[p * dim..(p + 1) * dim];
-            matmul(q_slice, &state.xb, &weights.wq[layer_matrix_offset..layer_matrix_offset + dim * dim], &weights.bq[layer_dim_offset..layer_dim_offset + dim], dim, dim);
+            matmul_parallel(q_slice, &state.xb, &weights.wq[layer_matrix_offset..layer_matrix_offset + dim * dim], &weights.bq[layer_dim_offset..layer_dim_offset + dim], dim, dim, num_threads);
             let k_slice = &mut state.k[p * dim..(p + 1) * dim];
-            matmul(k_slice, &state.xb, &weights.wk[layer_matrix_offset..layer_matrix_offset + dim * dim], &weights.bk[layer_dim_offset..layer_dim_offset + dim], dim, dim);
+            matmul_parallel(k_slice, &state.xb, &weights.wk[layer_matrix_offset..layer_matrix_offset + dim * dim], &weights.bk[layer_dim_offset..layer_dim_offset + dim], dim, dim, num_threads);
             let v_slice = &mut state.v[p * dim..(p + 1) * dim];
-            matmul(v_slice, &state.xb, &weights.wv[layer_matrix_offset..layer_matrix_offset + dim * dim], &weights.bv[layer_dim_offset..layer_dim_offset + dim], dim, dim);
+            matmul_parallel(v_slice, &state.xb, &weights.wv[layer_matrix_offset..layer_matrix_offset + dim * dim], &weights.bv[layer_dim_offset..layer_dim_offset + dim], dim, dim, num_threads);
             apply_rope(q_slice, k_slice, &state.rope_cos, &state.rope_sin, p, dim, config.n_heads);
         }
 
@@ -1067,14 +1803,14 @@ pub fn forward_bidirectional(
             }
 
             let out_slice = &state.out_att[p * dim..(p + 1) * dim];
-            matmul(&mut state.xb, out_slice, &weights.wo[layer_matrix_offset..layer_matrix_offset + dim * dim], &weights.bo[layer_dim_offset..layer_dim_offset + dim], dim, dim);
+            matmul_parallel(&mut state.xb, out_slice, &weights.wo[layer_matrix_offset..layer_matrix_offset + dim * dim], &weights.bo[layer_dim_offset..layer_dim_offset + dim], dim, dim, num_threads);
             for i in 0..dim { state.x[p * dim + i] += state.xb[i]; }
 
             let xp = &state.x[p * dim..(p + 1) * dim];
             layer_norm(&mut state.xb, xp, &weights.ln_2_weight[layer_dim_offset..layer_dim_offset + dim], &weights.ln_2_bias[layer_dim_offset..layer_dim_offset + dim]);
-            matmul(&mut state.hb, &state.xb, &weights.fc1_weight[fc1_w_offset..fc1_w_offset + dim * hidden_dim], &weights.fc1_bias[fc1_b_offset..fc1_b_offset + hidden_dim], dim, hidden_dim);
+            matmul_parallel(&mut state.hb, &state.xb, &weights.fc1_weight[fc1_w_offset..fc1_w_offset + dim * hidden_dim], &weights.fc1_bias[fc1_b_offset..fc1_b_offset + hidden_dim], dim, hidden_dim, num_threads);
             gelu(&mut state.hb2, &state.hb);
-            matmul(&mut state.xb, &state.hb2, &weights.fc2_weight[fc2_w_offset..fc2_w_offset + hidden_dim * dim], &weights.fc2_bias[layer_dim_offset..layer_dim_offset + dim], hidden_dim, dim);
+            matmul_parallel(&mut state.xb, &state.hb2, &weights.fc2_weight[fc2_w_offset..fc2_w_offset + hidden_dim * dim], &weights.fc2_bias[layer_dim_offset..layer_dim_offset + dim], hidden_dim, dim, num_threads);
             for i in 0..dim { state.x[p * dim + i] += state.xb[i]; }
         }
     }
@@ -1083,7 +1819,177 @@ pub fn forward_bidirectional(
         let xp = &state.x[p * dim..(p + 1) * dim];
         layer_norm(&mut state.xb, xp, &weights.ln_f_weight, &weights.ln_f_bias);
         let logits_p = &mut state.logits[p * config.vocab_size..(p + 1) * config.vocab_size];
-        project_lm_head(logits_p, &state.xb, weights, config, &mut state.hb, &mut state.hb2);
+        project_lm_head_parallel(logits_p, &state.xb, &weights.classifier_weights, &weights.token_embedding_table, config, &mut state.hb, &mut state.hb2, num_threads);
+    }
+}
+
+pub fn forward_bidirectional_q8(
+    tokens: &[usize],
+    config: &EsmConfig,
+    weights: &EsmWeightsQ8,
+    state: &mut BidirectionalRunState,
+    num_threads: usize,
+) {
+    let seq_len = tokens.len();
+    assert!(seq_len <= state.max_len, "Sequence length {} exceeds max_len {}", seq_len, state.max_len);
+    let dim = config.dim;
+    let head_dim = dim / config.n_heads;
+    let inv_scale = 1.0 / (head_dim as f32).sqrt();
+    let hidden_dim = config.hidden_dim;
+
+    #[cfg(target_arch = "x86_64")]
+    let has_avx512 = head_dim == 64 && std::is_x86_feature_detected!("avx512f");
+    #[cfg(target_arch = "x86_64")]
+    let has_avx = std::is_x86_feature_detected!("avx") && (head_dim == 16 || head_dim == 24 || head_dim == 32 || head_dim == 64);
+
+    let embed_blocks_per_row = dim / 32;
+    for p in 0..seq_len {
+        let token = tokens[p];
+        let row_blocks = &weights.token_embedding_table[token * embed_blocks_per_row..(token + 1) * embed_blocks_per_row];
+        for (b_idx, block) in row_blocks.iter().enumerate() {
+            block.dequantize_to(&mut state.x[p * dim + b_idx * 32..p * dim + (b_idx + 1) * 32]);
+        }
+    }
+
+    let q8_matrix_blocks = dim * (dim / 32);
+    let q8_fc1_blocks = hidden_dim * (dim / 32);
+    let q8_fc2_blocks = dim * (hidden_dim / 32);
+
+    for l in 0..config.n_layers {
+        let layer_dim_offset = l * dim;
+        let layer_matrix_q8 = l * q8_matrix_blocks;
+        let fc1_q8 = l * q8_fc1_blocks;
+        let fc1_b = l * hidden_dim;
+        let fc2_q8 = l * q8_fc2_blocks;
+
+        for p in 0..seq_len {
+            let xp = &state.x[p * dim..(p + 1) * dim];
+            layer_norm(&mut state.xb, xp, &weights.ln_1_weight[layer_dim_offset..layer_dim_offset + dim], &weights.ln_1_bias[layer_dim_offset..layer_dim_offset + dim]);
+            let q_slice = &mut state.q[p * dim..(p + 1) * dim];
+            matmul_q8_parallel(q_slice, &state.xb, &weights.wq[layer_matrix_q8..layer_matrix_q8 + q8_matrix_blocks], &weights.bq[layer_dim_offset..layer_dim_offset + dim], dim, dim, num_threads);
+            let k_slice = &mut state.k[p * dim..(p + 1) * dim];
+            matmul_q8_parallel(k_slice, &state.xb, &weights.wk[layer_matrix_q8..layer_matrix_q8 + q8_matrix_blocks], &weights.bk[layer_dim_offset..layer_dim_offset + dim], dim, dim, num_threads);
+            let v_slice = &mut state.v[p * dim..(p + 1) * dim];
+            matmul_q8_parallel(v_slice, &state.xb, &weights.wv[layer_matrix_q8..layer_matrix_q8 + q8_matrix_blocks], &weights.bv[layer_dim_offset..layer_dim_offset + dim], dim, dim, num_threads);
+            apply_rope(q_slice, k_slice, &state.rope_cos, &state.rope_sin, p, dim, config.n_heads);
+        }
+
+        let is_last_layer = l == config.n_layers - 1;
+        if is_last_layer {
+            state.final_layer_att[0..seq_len * seq_len].fill(0.0);
+        }
+
+        for p in 0..seq_len {
+            for h in 0..config.n_heads {
+                let q_offset = p * dim + h * head_dim;
+                let q_head = &state.q[q_offset..q_offset + head_dim];
+                let att_head = &mut state.att[h * state.max_len..h * state.max_len + seq_len];
+
+                #[cfg(target_arch = "x86_64")]
+                {
+                    if has_avx512 {
+                        let q_ptr = q_head.as_ptr();
+                        for t in 0..seq_len {
+                            let k_offset = t * dim + h * head_dim;
+                            let k_ptr = unsafe { state.k.as_ptr().add(k_offset) };
+                            let score = unsafe { dot_product_head_avx512_d64(q_ptr, k_ptr) };
+                            att_head[t] = score * inv_scale;
+                        }
+                    } else if has_avx {
+                        let q_ptr = q_head.as_ptr();
+                        for t in 0..seq_len {
+                            let k_offset = t * dim + h * head_dim;
+                            let k_ptr = unsafe { state.k.as_ptr().add(k_offset) };
+                            let score = unsafe { dot_product_head_avx(q_ptr, k_ptr, head_dim) };
+                            att_head[t] = score * inv_scale;
+                        }
+                    } else {
+                        for t in 0..seq_len {
+                            let k_offset = t * dim + h * head_dim;
+                            let k_head = &state.k[k_offset..k_offset + head_dim];
+                            let mut score = 0.0f32;
+                            for i in 0..head_dim { score += q_head[i] * k_head[i]; }
+                            att_head[t] = score * inv_scale;
+                        }
+                    }
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                {
+                    for t in 0..seq_len {
+                        let k_offset = t * dim + h * head_dim;
+                        let k_head = &state.k[k_offset..k_offset + head_dim];
+                        let mut score = 0.0f32;
+                        for i in 0..head_dim { score += q_head[i] * k_head[i]; }
+                        att_head[t] = score * inv_scale;
+                    }
+                }
+                softmax(att_head);
+
+                if is_last_layer {
+                    let head_weight = 1.0 / config.n_heads as f32;
+                    for t in 0..seq_len {
+                        state.final_layer_att[p * seq_len + t] += att_head[t] * head_weight;
+                    }
+                }
+
+                let out_head = &mut state.out_att[p * dim + h * head_dim..p * dim + (h + 1) * head_dim];
+                out_head.fill(0.0);
+                #[cfg(target_arch = "x86_64")]
+                {
+                    if has_avx512 {
+                        let out_ptr = out_head.as_mut_ptr();
+                        for t in 0..seq_len {
+                            let prob = att_head[t];
+                            let v_offset = t * dim + h * head_dim;
+                            let v_ptr = unsafe { state.v.as_ptr().add(v_offset) };
+                            unsafe { accumulate_value_head_avx512_d64(out_ptr, v_ptr, prob); }
+                        }
+                    } else if has_avx {
+                        let out_ptr = out_head.as_mut_ptr();
+                        for t in 0..seq_len {
+                            let prob = att_head[t];
+                            let v_offset = t * dim + h * head_dim;
+                            let v_ptr = unsafe { state.v.as_ptr().add(v_offset) };
+                            unsafe { accumulate_value_head_avx(out_ptr, v_ptr, prob, head_dim); }
+                        }
+                    } else {
+                        for t in 0..seq_len {
+                            let prob = att_head[t];
+                            let v_offset = t * dim + h * head_dim;
+                            let v_head = &state.v[v_offset..v_offset + head_dim];
+                            for i in 0..head_dim { out_head[i] += prob * v_head[i]; }
+                        }
+                    }
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                {
+                    for t in 0..seq_len {
+                        let prob = att_head[t];
+                        let v_offset = t * dim + h * head_dim;
+                        let v_head = &state.v[v_offset..v_offset + head_dim];
+                        for i in 0..head_dim { out_head[i] += prob * v_head[i]; }
+                    }
+                }
+            }
+
+            let out_slice = &state.out_att[p * dim..(p + 1) * dim];
+            matmul_q8_parallel(&mut state.xb, out_slice, &weights.wo[layer_matrix_q8..layer_matrix_q8 + q8_matrix_blocks], &weights.bo[layer_dim_offset..layer_dim_offset + dim], dim, dim, num_threads);
+            for i in 0..dim { state.x[p * dim + i] += state.xb[i]; }
+
+            let xp = &state.x[p * dim..(p + 1) * dim];
+            layer_norm(&mut state.xb, xp, &weights.ln_2_weight[layer_dim_offset..layer_dim_offset + dim], &weights.ln_2_bias[layer_dim_offset..layer_dim_offset + dim]);
+            matmul_q8_parallel(&mut state.hb, &state.xb, &weights.fc1_weight[fc1_q8..fc1_q8 + q8_fc1_blocks], &weights.fc1_bias[fc1_b..fc1_b + hidden_dim], dim, hidden_dim, num_threads);
+            gelu(&mut state.hb2, &state.hb);
+            matmul_q8_parallel(&mut state.xb, &state.hb2, &weights.fc2_weight[fc2_q8..fc2_q8 + q8_fc2_blocks], &weights.fc2_bias[layer_dim_offset..layer_dim_offset + dim], hidden_dim, dim, num_threads);
+            for i in 0..dim { state.x[p * dim + i] += state.xb[i]; }
+        }
+    }
+
+    for p in 0..seq_len {
+        let xp = &state.x[p * dim..(p + 1) * dim];
+        layer_norm(&mut state.xb, xp, &weights.ln_f_weight, &weights.ln_f_bias);
+        let logits_p = &mut state.logits[p * config.vocab_size..(p + 1) * config.vocab_size];
+        project_lm_head_q8(logits_p, &state.xb, &weights.classifier_weights, &weights.token_embedding_table, config, &mut state.hb, &mut state.hb2, num_threads);
     }
 }
 
@@ -1116,27 +2022,155 @@ pub struct GenerationMetrics {
     pub prefill_ms: f64, pub generation_ms: f64, pub throughput_tps: f32,
 }
 
-pub fn generate_sequence(prompt: &str, temperature: f32, max_new_tokens: Option<usize>, seed: u64, config: &EsmConfig, weights: &EsmWeights, state: &mut RunState, mut on_token: Option<&mut dyn FnMut(char)>) -> GenerationMetrics {
-    let mut prompt_tokens = Tokenizer::encode(prompt); prompt_tokens.pop();
-    if prompt_tokens.is_empty() { prompt_tokens.push(0); }
-    let mut pos = 0; let prefill_timer = Instant::now();
-    for &token in &prompt_tokens { if pos >= config.max_seq_len { break; } forward(token, pos, config, weights, state); pos += 1; }
+pub fn generate_sequence(
+    prompt: &str,
+    temperature: f32,
+    max_new_tokens: Option<usize>,
+    seed: u64,
+    config: &EsmConfig,
+    weights: &EsmWeights,
+    state: &mut RunState,
+    on_token: Option<&mut dyn FnMut(char)>,
+) -> GenerationMetrics {
+    generate_sequence_parallel(prompt, temperature, max_new_tokens, seed, config, weights, state, 1, on_token)
+}
+
+pub fn generate_sequence_parallel(
+    prompt: &str,
+    temperature: f32,
+    max_new_tokens: Option<usize>,
+    seed: u64,
+    config: &EsmConfig,
+    weights: &EsmWeights,
+    state: &mut RunState,
+    num_threads: usize,
+    mut on_token: Option<&mut dyn FnMut(char)>,
+) -> GenerationMetrics {
+    let mut prompt_tokens = Tokenizer::encode(prompt);
+    prompt_tokens.pop();
+    if prompt_tokens.is_empty() {
+        prompt_tokens.push(0);
+    }
+    let mut pos = 0;
+    let prefill_timer = Instant::now();
+    for &token in &prompt_tokens {
+        if pos >= config.max_seq_len {
+            break;
+        }
+        forward_parallel(token, pos, config, weights, state, num_threads);
+        pos += 1;
+    }
     let prefill_duration = prefill_timer.elapsed();
-    let mut rng = SimpleRng::new(seed); let mut generated_tokens_count = 0; let mut generated_suffix = String::new();
-    let max_limit = max_new_tokens.map(|m| (pos + m).min(config.max_seq_len)).unwrap_or(config.max_seq_len);
+    let mut rng = SimpleRng::new(seed);
+    let mut generated_tokens_count = 0;
+    let mut generated_suffix = String::new();
+    let max_limit = max_new_tokens
+        .map(|m| (pos + m).min(config.max_seq_len))
+        .unwrap_or(config.max_seq_len);
     let gen_timer = Instant::now();
     while pos < max_limit {
         let next_token = sample(&mut state.logits, temperature, &mut rng);
-        if next_token == 2 { break; }
+        if next_token == 2 {
+            break;
+        }
         generated_tokens_count += 1;
-        if let Some(c) = Tokenizer::decode(next_token) { generated_suffix.push(c); if let Some(cb) = on_token.as_mut() { cb(c); } }
-        forward(next_token, pos, config, weights, state); pos += 1;
+        if let Some(c) = Tokenizer::decode(next_token) {
+            generated_suffix.push(c);
+            if let Some(cb) = on_token.as_mut() {
+                cb(c);
+            }
+        }
+        forward_parallel(next_token, pos, config, weights, state, num_threads);
+        pos += 1;
     }
     let gen_duration = gen_timer.elapsed();
-    let prefill_ms = prefill_duration.as_secs_f64() * 1000.0; let generation_ms = gen_duration.as_secs_f64() * 1000.0;
-    let throughput_tps = if gen_duration.as_secs_f32() > 0.0 { generated_tokens_count as f32 / gen_duration.as_secs_f32() } else { 0.0 };
-    let mut full_sequence = String::with_capacity(prompt.len() + generated_suffix.len()); full_sequence.push_str(prompt); full_sequence.push_str(&generated_suffix);
-    GenerationMetrics { full_sequence, generated_suffix, tokens_generated: generated_tokens_count, prefill_ms, generation_ms, throughput_tps }
+    let prefill_ms = prefill_duration.as_secs_f64() * 1000.0;
+    let generation_ms = gen_duration.as_secs_f64() * 1000.0;
+    let throughput_tps = if gen_duration.as_secs_f32() > 0.0 {
+        generated_tokens_count as f32 / gen_duration.as_secs_f32()
+    } else {
+        0.0
+    };
+    let mut full_sequence = String::with_capacity(prompt.len() + generated_suffix.len());
+    full_sequence.push_str(prompt);
+    full_sequence.push_str(&generated_suffix);
+    GenerationMetrics {
+        full_sequence,
+        generated_suffix,
+        tokens_generated: generated_tokens_count,
+        prefill_ms,
+        generation_ms,
+        throughput_tps,
+    }
+}
+
+pub fn generate_sequence_q8(
+    prompt: &str,
+    temperature: f32,
+    max_new_tokens: Option<usize>,
+    seed: u64,
+    config: &EsmConfig,
+    weights: &EsmWeightsQ8,
+    state: &mut RunState,
+    num_threads: usize,
+    mut on_token: Option<&mut dyn FnMut(char)>,
+) -> GenerationMetrics {
+    let mut prompt_tokens = Tokenizer::encode(prompt);
+    prompt_tokens.pop();
+    if prompt_tokens.is_empty() {
+        prompt_tokens.push(0);
+    }
+    let mut pos = 0;
+    let prefill_timer = Instant::now();
+    for &token in &prompt_tokens {
+        if pos >= config.max_seq_len {
+            break;
+        }
+        forward_q8(token, pos, config, weights, state, num_threads);
+        pos += 1;
+    }
+    let prefill_duration = prefill_timer.elapsed();
+    let mut rng = SimpleRng::new(seed);
+    let mut generated_tokens_count = 0;
+    let mut generated_suffix = String::new();
+    let max_limit = max_new_tokens
+        .map(|m| (pos + m).min(config.max_seq_len))
+        .unwrap_or(config.max_seq_len);
+    let gen_timer = Instant::now();
+    while pos < max_limit {
+        let next_token = sample(&mut state.logits, temperature, &mut rng);
+        if next_token == 2 {
+            break;
+        }
+        generated_tokens_count += 1;
+        if let Some(c) = Tokenizer::decode(next_token) {
+            generated_suffix.push(c);
+            if let Some(cb) = on_token.as_mut() {
+                cb(c);
+            }
+        }
+        forward_q8(next_token, pos, config, weights, state, num_threads);
+        pos += 1;
+    }
+    let gen_duration = gen_timer.elapsed();
+    let prefill_ms = prefill_duration.as_secs_f64() * 1000.0;
+    let generation_ms = gen_duration.as_secs_f64() * 1000.0;
+    let throughput_tps = if gen_duration.as_secs_f32() > 0.0 {
+        generated_tokens_count as f32 / gen_duration.as_secs_f32()
+    } else {
+        0.0
+    };
+    let mut full_sequence = String::with_capacity(prompt.len() + generated_suffix.len());
+    full_sequence.push_str(prompt);
+    full_sequence.push_str(&generated_suffix);
+    GenerationMetrics {
+        full_sequence,
+        generated_suffix,
+        tokens_generated: generated_tokens_count,
+        prefill_ms,
+        generation_ms,
+        throughput_tps,
+    }
 }
 
 #[cfg(test)]
@@ -1482,5 +2516,190 @@ mod tests {
         assert!(!bi_state.logits[0].is_nan());
         assert!(!bi_state.logits[config.vocab_size].is_nan());
     }
+
+    #[test]
+    fn test_matmul_fp32_parallel_parity() {
+        let in_dim = 320;
+        let out_dim = 128;
+        let x: Vec<f32> = (0..in_dim).map(|i| (i as f32) * 0.01 - 1.2).collect();
+        let w: Vec<f32> = (0..in_dim * out_dim).map(|i| ((i % 89) as f32) * 0.005 - 0.22).collect();
+        let bias: Vec<f32> = (0..out_dim).map(|i| (i as f32) * 0.03).collect();
+
+        let mut out_ref = vec![0.0f32; out_dim];
+        matmul(&mut out_ref, &x, &w, &bias, in_dim, out_dim);
+
+        for threads in [1, 2, 4] {
+            let mut out_par = vec![0.0f32; out_dim];
+            matmul_parallel(&mut out_par, &x, &w, &bias, in_dim, out_dim, threads);
+            for i in 0..out_dim {
+                assert!(
+                    (out_ref[i] - out_par[i]).abs() < 1e-4,
+                    "Thread {} mismatch at idx {}: ref={} vs par={}",
+                    threads,
+                    i,
+                    out_ref[i],
+                    out_par[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_matmul_q8_simd_parity() {
+        let in_dim = 320;
+        let out_dim = 128;
+        let x: Vec<f32> = (0..in_dim).map(|i| (i as f32) * 0.01 - 1.5).collect();
+        let raw_w: Vec<f32> = (0..in_dim * out_dim).map(|i| ((i % 97) as f32) * 0.005 - 0.25).collect();
+        let q8_blocks = quantize_slice_to_q8(&raw_w);
+        let bias: Vec<f32> = (0..out_dim).map(|i| (i as f32) * 0.02).collect();
+
+        let mut out_scalar = vec![0.0f32; out_dim];
+        matmul_q8(&mut out_scalar, &x, &q8_blocks, &bias, in_dim, out_dim);
+
+        let mut out_simd = vec![0.0f32; out_dim];
+        matmul_q8_simd(&mut out_simd, &x, &q8_blocks, &bias, in_dim, out_dim);
+
+        for i in 0..out_dim {
+            assert!(
+                (out_scalar[i] - out_simd[i]).abs() < 1e-4,
+                "Q8 SIMD mismatch at idx {}: scalar={} vs simd={}",
+                i,
+                out_scalar[i],
+                out_simd[i]
+            );
+        }
+
+        for threads in [1, 2, 4] {
+            let mut out_par = vec![0.0f32; out_dim];
+            matmul_q8_parallel(&mut out_par, &x, &q8_blocks, &bias, in_dim, out_dim, threads);
+            for i in 0..out_dim {
+                assert!(
+                    (out_scalar[i] - out_par[i]).abs() < 1e-4,
+                    "Q8 parallel (threads={}) mismatch at idx {}: scalar={} vs par={}",
+                    threads,
+                    i,
+                    out_scalar[i],
+                    out_par[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_forward_q8_cosine_similarity_8m() {
+        let model_path = if std::path::Path::new("esm2_8m_weights.bin").exists() {
+            "esm2_8m_weights.bin"
+        } else if std::path::Path::new("esm2_weights.bin").exists() {
+            "esm2_weights.bin"
+        } else {
+            return;
+        };
+
+        let config = EsmConfig::esm2_8m();
+        let weights = EsmWeights::from_file(model_path, &config).expect("weights must load");
+
+        // 1. Run FP32 forward pass
+        let mut state_fp32 = RunState::new(&config);
+        forward(20, 0, &config, &weights, &mut state_fp32);
+
+        // 2. Quantize to Q8_0 in memory
+        let weights_q8 = weights.quantize_q8();
+        let mut state_q8 = RunState::new(&config);
+        forward_q8(20, 0, &config, &weights_q8, &mut state_q8, 4);
+
+        // 3. Compute Cosine Similarity between logits across standard vocabulary (indices 4..=23)
+        let mut dot = 0.0f32;
+        let mut norm_fp32 = 0.0f32;
+        let mut norm_q8 = 0.0f32;
+        for i in 4..=23 {
+            let l_fp = state_fp32.logits[i];
+            let l_q8 = state_q8.logits[i];
+            dot += l_fp * l_q8;
+            norm_fp32 += l_fp * l_fp;
+            norm_q8 += l_q8 * l_q8;
+        }
+        let cos_sim = dot / (norm_fp32.sqrt() * norm_q8.sqrt());
+        assert!(
+            cos_sim > 0.995,
+            "Cosine similarity between FP32 and Q8_0 logits is {:.5}, expected > 0.995",
+            cos_sim
+        );
+    }
+
+    #[test]
+    fn test_q8_weights_save_load_roundtrip() {
+        let model_path = if std::path::Path::new("esm2_8m_weights.bin").exists() {
+            "esm2_8m_weights.bin"
+        } else if std::path::Path::new("esm2_weights.bin").exists() {
+            "esm2_weights.bin"
+        } else {
+            return;
+        };
+
+        let config = EsmConfig::esm2_8m();
+        let weights = EsmWeights::from_file(model_path, &config).expect("weights must load");
+        let weights_q8 = weights.quantize_q8();
+
+        let temp_q8_path = "target/test_esm2_8m_roundtrip.q8_0";
+        weights_q8.save_to_file(temp_q8_path).expect("Q8 save must succeed");
+
+        let loaded_q8 = EsmWeightsQ8::from_file(temp_q8_path, &config).expect("Q8 load must succeed");
+        assert_eq!(weights_q8.token_embedding_table.len(), loaded_q8.token_embedding_table.len());
+        assert_eq!(weights_q8.wq.len(), loaded_q8.wq.len());
+        assert_eq!(weights_q8.fc1_weight.len(), loaded_q8.fc1_weight.len());
+
+        let mut state_orig = RunState::new(&config);
+        forward_q8(20, 0, &config, &weights_q8, &mut state_orig, 2);
+
+        let mut state_loaded = RunState::new(&config);
+        forward_q8(20, 0, &config, &loaded_q8, &mut state_loaded, 2);
+
+        for i in 0..config.vocab_size {
+            assert_eq!(state_orig.logits[i], state_loaded.logits[i], "Mismatch in loaded Q8 logits at idx {}", i);
+        }
+
+        let _ = std::fs::remove_file(temp_q8_path);
+    }
+
+    #[test]
+    fn test_forward_650m_q8_and_multithread_if_available() {
+        let model_path = "esm2_650m_weights.bin";
+        if !std::path::Path::new(model_path).exists() {
+            return;
+        }
+        let (config, weights) = load_model_from_file(model_path).expect("650M weights must load");
+
+        // 1. Test FP32 with 4 threads
+        let mut state_fp32 = RunState::new(&config);
+        forward_parallel(20, 0, &config, &weights, &mut state_fp32, 4);
+        assert!(!state_fp32.logits[0].is_nan());
+        assert!(!state_fp32.logits[20].is_nan());
+
+        // 2. Test Q8 quantization and 4-thread execution
+        let weights_q8 = weights.quantize_q8();
+        let mut state_q8 = RunState::new(&config);
+        forward_q8(20, 0, &config, &weights_q8, &mut state_q8, 4);
+        assert!(!state_q8.logits[0].is_nan());
+        assert!(!state_q8.logits[20].is_nan());
+
+        // 3. Check Cosine similarity on 650M
+        let mut dot = 0.0f32;
+        let mut norm_fp32 = 0.0f32;
+        let mut norm_q8 = 0.0f32;
+        for i in 4..=23 {
+            let l_fp = state_fp32.logits[i];
+            let l_q8 = state_q8.logits[i];
+            dot += l_fp * l_q8;
+            norm_fp32 += l_fp * l_fp;
+            norm_q8 += l_q8 * l_q8;
+        }
+        let cos_sim = dot / (norm_fp32.sqrt() * norm_q8.sqrt());
+        assert!(
+            cos_sim > 0.990,
+            "650M Cosine similarity between FP32 and Q8_0 logits is {:.5}, expected > 0.990",
+            cos_sim
+        );
+    }
 }
+
 

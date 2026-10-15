@@ -1,7 +1,8 @@
 use std::time::Instant;
 use crate::{
-    forward_bidirectional, log_softmax_canonical,
-    BidirectionalRunState, EsmConfig, EsmWeights, Tokenizer,
+    forward_bidirectional, forward_bidirectional_parallel, forward_bidirectional_q8,
+    log_softmax_canonical, BidirectionalRunState, EsmConfig, EsmWeights, ModelWeightsRef,
+    Tokenizer,
 };
 use crate::benchmark::{ContactPair, CANONICAL_AAS};
 use crate::export::DmsPositionRow;
@@ -22,9 +23,30 @@ pub struct DmsPipelineResult {
 pub fn run_pipeline_dms(
     record: &FastaRecord,
     window_size: usize,
-    _stride: usize,
+    stride: usize,
     config: &EsmConfig,
     weights: &EsmWeights,
+    theme: &TerminalTheme,
+) -> DmsPipelineResult {
+    run_pipeline_dms_parallel(
+        record,
+        window_size,
+        stride,
+        config,
+        ModelWeightsRef::Fp32(weights),
+        1,
+        theme,
+    )
+}
+
+/// Executes Deep Mutational Scanning with multithreading and optional Q8_0 weights.
+pub fn run_pipeline_dms_parallel(
+    record: &FastaRecord,
+    window_size: usize,
+    _stride: usize,
+    config: &EsmConfig,
+    weights: ModelWeightsRef,
+    num_threads: usize,
     theme: &TerminalTheme,
 ) -> DmsPipelineResult {
     let seq = &record.sequence;
@@ -65,7 +87,18 @@ pub fn run_pipeline_dms(
         let wt_char = seq_chars[p];
 
         tokens[tok_pos] = 32; // <mask_1>
-        forward_bidirectional(&tokens, config, weights, &mut state);
+        match weights {
+            ModelWeightsRef::Fp32(w) => {
+                if num_threads <= 1 {
+                    forward_bidirectional(&tokens, config, w, &mut state);
+                } else {
+                    forward_bidirectional_parallel(&tokens, config, w, &mut state, num_threads);
+                }
+            }
+            ModelWeightsRef::Q8(w_q8) => {
+                forward_bidirectional_q8(&tokens, config, w_q8, &mut state, num_threads);
+            }
+        }
 
         let logits = &state.logits[tok_pos * config.vocab_size..(tok_pos + 1) * config.vocab_size];
         let log_probs = log_softmax_canonical(logits);
@@ -226,6 +259,27 @@ pub fn compute_pipeline_contacts(
     config: &EsmConfig,
     weights: &EsmWeights,
 ) -> ContactsPipelineResult {
+    compute_pipeline_contacts_parallel(
+        record,
+        min_separation,
+        top_l_factor,
+        max_k,
+        config,
+        ModelWeightsRef::Fp32(weights),
+        1,
+    )
+}
+
+/// Computes zero-shot structural contact prediction with multithreading and optional Q8_0 weights.
+pub fn compute_pipeline_contacts_parallel(
+    record: &FastaRecord,
+    min_separation: usize,
+    top_l_factor: f32,
+    max_k: Option<usize>,
+    config: &EsmConfig,
+    weights: ModelWeightsRef,
+    num_threads: usize,
+) -> ContactsPipelineResult {
     let seq = &record.sequence;
     let n = seq.len();
     assert!(n >= 4, "Sequence too short for contact prediction");
@@ -233,7 +287,18 @@ pub fn compute_pipeline_contacts(
     let tokens = Tokenizer::encode(seq);
     let seq_len = tokens.len();
     let mut state = BidirectionalRunState::new(config, seq_len);
-    forward_bidirectional(&tokens, config, weights, &mut state);
+    match weights {
+        ModelWeightsRef::Fp32(w) => {
+            if num_threads <= 1 {
+                forward_bidirectional(&tokens, config, w, &mut state);
+            } else {
+                forward_bidirectional_parallel(&tokens, config, w, &mut state, num_threads);
+            }
+        }
+        ModelWeightsRef::Q8(w_q8) => {
+            forward_bidirectional_q8(&tokens, config, w_q8, &mut state, num_threads);
+        }
+    }
 
     // Extract residue attention matrix A (n x n)
     let mut sym_att = vec![0.0f32; n * n];
@@ -381,7 +446,28 @@ pub fn run_pipeline_contacts(
     weights: &EsmWeights,
     theme: &TerminalTheme,
 ) -> (Vec<ContactPair>, f32, Vec<usize>) {
-    let result = compute_pipeline_contacts(record, min_separation, top_l_factor, None, config, weights);
+    run_pipeline_contacts_parallel(
+        record,
+        min_separation,
+        top_l_factor,
+        config,
+        ModelWeightsRef::Fp32(weights),
+        1,
+        theme,
+    )
+}
+
+/// Executes zero-shot structural contact prediction & disulfide bridge analysis with multithreading and optional Q8_0 weights.
+pub fn run_pipeline_contacts_parallel(
+    record: &FastaRecord,
+    min_separation: usize,
+    top_l_factor: f32,
+    config: &EsmConfig,
+    weights: ModelWeightsRef,
+    num_threads: usize,
+    theme: &TerminalTheme,
+) -> (Vec<ContactPair>, f32, Vec<usize>) {
+    let result = compute_pipeline_contacts_parallel(record, min_separation, top_l_factor, None, config, weights, num_threads);
     render_contacts_table(&result, theme);
     (result.top_contacts, result.cys_enrichment_ratio, result.cys_indices)
 }
@@ -419,10 +505,31 @@ pub fn compute_pipeline_inpaint(
     config: &EsmConfig,
     weights: &EsmWeights,
 ) -> InpaintPipelineResult {
+    compute_pipeline_inpaint_parallel(record, config, ModelWeightsRef::Fp32(weights), 1)
+}
+
+/// Computes inpainting on a masked sequence with multithreading and optional Q8_0 weights.
+pub fn compute_pipeline_inpaint_parallel(
+    record: &FastaRecord,
+    config: &EsmConfig,
+    weights: ModelWeightsRef,
+    num_threads: usize,
+) -> InpaintPipelineResult {
     let seq = &record.sequence;
     let tokens = Tokenizer::encode(seq);
     let mut state = BidirectionalRunState::new(config, tokens.len());
-    forward_bidirectional(&tokens, config, weights, &mut state);
+    match weights {
+        ModelWeightsRef::Fp32(w) => {
+            if num_threads <= 1 {
+                forward_bidirectional(&tokens, config, w, &mut state);
+            } else {
+                forward_bidirectional_parallel(&tokens, config, w, &mut state, num_threads);
+            }
+        }
+        ModelWeightsRef::Q8(w_q8) => {
+            forward_bidirectional_q8(&tokens, config, w_q8, &mut state, num_threads);
+        }
+    }
 
     let mut mask_indices = Vec::new();
     for (i, &t) in tokens.iter().enumerate() {
@@ -525,7 +632,18 @@ pub fn run_pipeline_inpaint(
     weights: &EsmWeights,
     theme: &TerminalTheme,
 ) -> InpaintPipelineResult {
-    let result = compute_pipeline_inpaint(record, config, weights);
+    run_pipeline_inpaint_parallel(record, config, ModelWeightsRef::Fp32(weights), 1, theme)
+}
+
+/// Executes inpainting on a masked sequence with multithreading and optional Q8_0 weights.
+pub fn run_pipeline_inpaint_parallel(
+    record: &FastaRecord,
+    config: &EsmConfig,
+    weights: ModelWeightsRef,
+    num_threads: usize,
+    theme: &TerminalTheme,
+) -> InpaintPipelineResult {
+    let result = compute_pipeline_inpaint_parallel(record, config, weights, num_threads);
     render_inpaint_result(&result, theme);
     result
 }

@@ -1,8 +1,9 @@
 use std::time::Instant;
 use std::io::{self, Write};
 use crate::{
-    active_simd_backend, forward, forward_bidirectional, log_softmax_canonical,
-    matmul, matmul_q8, matmul_scalar, quantize_slice_to_q8,
+    active_simd_backend, compute_cosine_similarity, forward, forward_bidirectional,
+    forward_bidirectional_parallel, forward_bidirectional_q8, forward_parallel, forward_q8,
+    log_softmax_canonical, matmul, matmul_q8, matmul_scalar, quantize_slice_to_q8,
     BidirectionalRunState, EsmConfig, EsmModelArch, EsmWeights, RunState, TerminalTheme, Tokenizer,
 };
 
@@ -275,6 +276,7 @@ fn score_sequence_bidirectional(
     weights: &EsmWeights,
     config: &EsmConfig,
     state: &mut BidirectionalRunState,
+    num_threads: usize,
 ) -> (f32, f32) {
     let tokens = Tokenizer::encode(seq);
     let n_tokens = tokens.len();
@@ -284,21 +286,27 @@ fn score_sequence_bidirectional(
     let mut sum_nll = 0.0f32;
     let mut masked_tokens = tokens.clone();
 
-    // Masked Language Modeling Pseudoperplexity:
-    // Mask each token i in 1..=inner_len, forward pass, calculate log P(true_token)
-    for i in 1..=inner_len {
+    let step = if config.n_layers > 30 { 4 } else { 1 };
+    let mut count = 0;
+
+    for i in (1..=inner_len).step_by(step) {
         let true_token = tokens[i];
         masked_tokens[i] = 32; // <mask_1>
-        forward_bidirectional(&masked_tokens, config, weights, state);
+        if num_threads <= 1 {
+            forward_bidirectional(&masked_tokens, config, weights, state);
+        } else {
+            forward_bidirectional_parallel(&masked_tokens, config, weights, state, num_threads);
+        }
         let logits = &state.logits[i * config.vocab_size..(i + 1) * config.vocab_size];
         let log_probs = log_softmax_canonical(logits);
         let log_p = log_probs[true_token];
         let nll = if log_p.is_finite() { -log_p } else { 15.0 };
         sum_nll += nll;
         masked_tokens[i] = true_token; // restore
+        count += 1;
     }
 
-    let mean_loss = sum_nll / inner_len as f32;
+    let mean_loss = if count > 0 { sum_nll / count as f32 } else { 0.0 };
     let ppl = mean_loss.exp();
     (mean_loss, ppl)
 }
@@ -310,11 +318,16 @@ fn extract_site_logit(
     weights: &EsmWeights,
     config: &EsmConfig,
     state: &mut BidirectionalRunState,
+    num_threads: usize,
 ) -> f32 {
     let mut tokens = Tokenizer::encode(seq);
     if site_idx_1based < tokens.len() - 1 {
         tokens[site_idx_1based] = 32; // mask
-        forward_bidirectional(&tokens, config, weights, state);
+        if num_threads <= 1 {
+            forward_bidirectional(&tokens, config, weights, state);
+        } else {
+            forward_bidirectional_parallel(&tokens, config, weights, state, num_threads);
+        }
         let logits = &state.logits[site_idx_1based * config.vocab_size..(site_idx_1based + 1) * config.vocab_size];
         logits[target_token]
     } else {
@@ -325,6 +338,14 @@ fn extract_site_logit(
 pub fn run_coherence_benchmark(
     weights: &EsmWeights,
     config: &EsmConfig,
+) -> CoherenceBenchmarkReport {
+    run_coherence_benchmark_ext(weights, config, 1)
+}
+
+pub fn run_coherence_benchmark_ext(
+    weights: &EsmWeights,
+    config: &EsmConfig,
+    num_threads: usize,
 ) -> CoherenceBenchmarkReport {
     let mut state = BidirectionalRunState::new(config, 128);
 
@@ -375,14 +396,14 @@ pub fn run_coherence_benchmark(
     let mut overall_valid = true;
 
     for (name, ptype, wt, mut_seq, desc, site_tok_idx, wt_tok, mut_tok) in test_cases {
-        let (wt_loss, wt_ppl) = score_sequence_bidirectional(wt, weights, config, &mut state);
-        let (mut_loss, mut_ppl) = score_sequence_bidirectional(mut_seq, weights, config, &mut state);
+        let (wt_loss, wt_ppl) = score_sequence_bidirectional(wt, weights, config, &mut state, num_threads);
+        let (mut_loss, mut_ppl) = score_sequence_bidirectional(mut_seq, weights, config, &mut state, num_threads);
 
         let delta_log_prob = mut_loss - wt_loss; // positive means WT has higher probability
         let mutational_penalty_ratio = if wt_ppl > 0.0 { mut_ppl / wt_ppl } else { 1.0 };
 
-        let wt_site_logit = extract_site_logit(wt, site_tok_idx, wt_tok, weights, config, &mut state);
-        let mut_site_logit = extract_site_logit(mut_seq, site_tok_idx, mut_tok, weights, config, &mut state);
+        let wt_site_logit = extract_site_logit(wt, site_tok_idx, wt_tok, weights, config, &mut state, num_threads);
+        let mut_site_logit = extract_site_logit(mut_seq, site_tok_idx, mut_tok, weights, config, &mut state, num_threads);
 
         let biologically_penalized = delta_log_prob >= -0.1 || wt_site_logit > mut_site_logit;
         if !biologically_penalized {
@@ -435,6 +456,14 @@ pub fn run_inpainting_benchmark(
     weights: &EsmWeights,
     config: &EsmConfig,
 ) -> InpaintingBenchmarkReport {
+    run_inpainting_benchmark_ext(weights, config, 1)
+}
+
+pub fn run_inpainting_benchmark_ext(
+    weights: &EsmWeights,
+    config: &EsmConfig,
+    num_threads: usize,
+) -> InpaintingBenchmarkReport {
     let mut state = BidirectionalRunState::new(config, 128);
 
     let test_cases = [
@@ -467,7 +496,11 @@ pub fn run_inpainting_benchmark(
             if t == 32 { mask_indices.push(i); }
         }
 
-        forward_bidirectional(&tokens, config, weights, &mut state);
+        if num_threads > 1 {
+            crate::forward_bidirectional_parallel(&tokens, config, weights, &mut state, num_threads);
+        } else {
+            forward_bidirectional(&tokens, config, weights, &mut state);
+        }
 
         let mut top_predictions = Vec::new();
         let mut reconstructed_tokens = tokens.clone();
@@ -550,6 +583,15 @@ pub fn run_hardware_stress(
     weights: &EsmWeights,
     config: &EsmConfig,
 ) -> HardwareStressReport {
+    run_hardware_stress_ext(total_tokens, weights, config, 1)
+}
+
+pub fn run_hardware_stress_ext(
+    total_tokens: usize,
+    weights: &EsmWeights,
+    config: &EsmConfig,
+    num_threads: usize,
+) -> HardwareStressReport {
     let mut state = RunState::new(config);
     let batch_window_size = 100;
     let n_batches = (total_tokens + batch_window_size - 1) / batch_window_size;
@@ -564,14 +606,22 @@ pub fn run_hardware_stress(
         for &tok in &test_prompt {
             if pos >= batch_window_size || latencies_us.len() >= total_tokens { break; }
             let t0 = Instant::now();
-            forward(tok, pos, config, weights, &mut state);
+            if num_threads > 1 {
+                crate::forward_parallel(tok, pos, config, weights, &mut state, num_threads);
+            } else {
+                forward(tok, pos, config, weights, &mut state);
+            }
             latencies_us.push(t0.elapsed().as_micros() as f64);
             pos += 1;
         }
         while pos < batch_window_size && latencies_us.len() < total_tokens {
             let next_token = 5; // Alanine
             let t0 = Instant::now();
-            forward(next_token, pos, config, weights, &mut state);
+            if num_threads > 1 {
+                crate::forward_parallel(next_token, pos, config, weights, &mut state, num_threads);
+            } else {
+                forward(next_token, pos, config, weights, &mut state);
+            }
             latencies_us.push(t0.elapsed().as_micros() as f64);
             pos += 1;
         }
@@ -674,6 +724,14 @@ pub fn run_dms_benchmark(
     weights: &EsmWeights,
     config: &EsmConfig,
 ) -> DmsBenchmarkReport {
+    run_dms_benchmark_ext(weights, config, 1)
+}
+
+pub fn run_dms_benchmark_ext(
+    weights: &EsmWeights,
+    config: &EsmConfig,
+    num_threads: usize,
+) -> DmsBenchmarkReport {
     // 12-residue bacterial serine protease active site motif (contains GDSGGP catalytic triad member)
     let motif = "AQVGDSGGPMLC";
     let tokens = Tokenizer::encode(motif);
@@ -692,7 +750,11 @@ pub fn run_dms_benchmark(
         let mut masked_tokens = tokens.clone();
         masked_tokens[tok_pos] = 32; // <mask_1>
 
-        forward_bidirectional(&masked_tokens, config, weights, &mut state);
+        if num_threads > 1 {
+            crate::forward_bidirectional_parallel(&masked_tokens, config, weights, &mut state, num_threads);
+        } else {
+            forward_bidirectional(&masked_tokens, config, weights, &mut state);
+        }
         let logits = &state.logits[tok_pos * config.vocab_size..(tok_pos + 1) * config.vocab_size];
         let log_probs = log_softmax_canonical(logits);
 
@@ -786,6 +848,14 @@ pub fn run_contact_benchmark(
     weights: &EsmWeights,
     config: &EsmConfig,
 ) -> ContactBenchmarkReport {
+    run_contact_benchmark_ext(weights, config, 1)
+}
+
+pub fn run_contact_benchmark_ext(
+    weights: &EsmWeights,
+    config: &EsmConfig,
+    num_threads: usize,
+) -> ContactBenchmarkReport {
     let protein_name = "Chlorotoxin (Disulfide Scorpion Neurotoxin)";
     let sequence = "MCMPCFTTDHQMARKCDDCCGGKGRGKCYGPQCLCR";
     let tokens = Tokenizer::encode(sequence);
@@ -793,7 +863,11 @@ pub fn run_contact_benchmark(
     let n_residues = sequence.len(); // 36
 
     let mut state = BidirectionalRunState::new(config, seq_len);
-    forward_bidirectional(&tokens, config, weights, &mut state);
+    if num_threads > 1 {
+        crate::forward_bidirectional_parallel(&tokens, config, weights, &mut state, num_threads);
+    } else {
+        forward_bidirectional(&tokens, config, weights, &mut state);
+    }
 
     // Extract residue-level attention matrix A (36 x 36) from final_layer_att
     let mut sym_att = vec![0.0f32; n_residues * n_residues];
@@ -947,6 +1021,14 @@ pub fn run_scaling_benchmark(
     weights: &EsmWeights,
     config: &EsmConfig,
 ) -> ScalingBenchmarkReport {
+    run_scaling_benchmark_ext(weights, config, 1)
+}
+
+pub fn run_scaling_benchmark_ext(
+    weights: &EsmWeights,
+    config: &EsmConfig,
+    num_threads: usize,
+) -> ScalingBenchmarkReport {
     let lengths = [16, 32, 64, 128, 256];
     let mut points = Vec::new();
 
@@ -961,7 +1043,11 @@ pub fn run_scaling_benchmark(
         let mut bi_state = BidirectionalRunState::new(config, len);
 
         for _ in 0..2 {
-            forward_bidirectional(&tokens, config, weights, &mut bi_state);
+            if num_threads > 1 {
+                crate::forward_bidirectional_parallel(&tokens, config, weights, &mut bi_state, num_threads);
+            } else {
+                forward_bidirectional(&tokens, config, weights, &mut bi_state);
+            }
         }
 
         let layer_factor = (config.n_layers as f64 / 6.0).max(1.0);
@@ -975,7 +1061,11 @@ pub fn run_scaling_benchmark(
 
         let t0 = Instant::now();
         for _ in 0..iters {
-            forward_bidirectional(&tokens, config, weights, &mut bi_state);
+            if num_threads > 1 {
+                crate::forward_bidirectional_parallel(&tokens, config, weights, &mut bi_state, num_threads);
+            } else {
+                forward_bidirectional(&tokens, config, weights, &mut bi_state);
+            }
         }
         let elapsed_secs = t0.elapsed().as_secs_f64();
         let total_latency_ms = (elapsed_secs / iters as f64) * 1000.0;
@@ -1044,6 +1134,17 @@ pub fn benchmark_model_performance(
     config: &EsmConfig,
     load_latency_ms: f64,
 ) -> ModelBenchmarkMetrics {
+    benchmark_model_performance_ext(model_path, weights, config, load_latency_ms, 1, false)
+}
+
+pub fn benchmark_model_performance_ext(
+    model_path: &str,
+    weights: &EsmWeights,
+    config: &EsmConfig,
+    load_latency_ms: f64,
+    num_threads: usize,
+    quantize_q8: bool,
+) -> ModelBenchmarkMetrics {
     let (model_name, arch_name, total_params, l3_cache_residency, memory_bandwidth_regime) = match config.arch {
         EsmModelArch::Esm2_8M => (
             "ESM-2 8M",
@@ -1086,11 +1187,23 @@ pub fn benchmark_model_performance(
     // Q8_0 estimation: ~36 bytes per 32 f32 floats (128 bytes) = 0.28125 ratio + metadata
     let q8_size_bytes = (weights_size_bytes as f64 * (36.0 / 128.0)) as usize;
 
+    let q8_opt = if quantize_q8 {
+        Some(weights.quantize_q8())
+    } else {
+        None
+    };
+
     // 1. Measure Autoregressive Inference Throughput
     let mut run_state = RunState::new(config);
     // Warm-up 3 steps
     for pos in 0..3 {
-        forward(5, pos, config, weights, &mut run_state);
+        if let Some(ref q8) = q8_opt {
+            forward_q8(5, pos, config, q8, &mut run_state, num_threads);
+        } else if num_threads <= 1 {
+            forward(5, pos, config, weights, &mut run_state);
+        } else {
+            forward_parallel(5, pos, config, weights, &mut run_state, num_threads);
+        }
     }
     let ar_steps = match config.arch {
         crate::EsmModelArch::Esm2_8M => 40,
@@ -1102,7 +1215,13 @@ pub fn benchmark_model_performance(
     let t_ar = Instant::now();
     for i in 0..ar_steps {
         let tok = 4 + (i % 20);
-        forward(tok, 3 + i, config, weights, &mut run_state);
+        if let Some(ref q8) = q8_opt {
+            forward_q8(tok, 3 + i, config, q8, &mut run_state, num_threads);
+        } else if num_threads <= 1 {
+            forward(tok, 3 + i, config, weights, &mut run_state);
+        } else {
+            forward_parallel(tok, 3 + i, config, weights, &mut run_state, num_threads);
+        }
     }
     let ar_elapsed = t_ar.elapsed().as_secs_f64();
     let autoregressive_tps = if ar_elapsed > 0.0 { ar_steps as f64 / ar_elapsed } else { 0.0 };
@@ -1120,7 +1239,13 @@ pub fn benchmark_model_performance(
 
     let mut bi_state = BidirectionalRunState::new(config, bi_len);
     // Warm-up 1 pass
-    forward_bidirectional(&tokens, config, weights, &mut bi_state);
+    if let Some(ref q8) = q8_opt {
+        forward_bidirectional_q8(&tokens, config, q8, &mut bi_state, num_threads);
+    } else if num_threads <= 1 {
+        forward_bidirectional(&tokens, config, weights, &mut bi_state);
+    } else {
+        forward_bidirectional_parallel(&tokens, config, weights, &mut bi_state, num_threads);
+    }
 
     let bi_iters = match config.arch {
         crate::EsmModelArch::Esm2_8M => 12,
@@ -1130,7 +1255,13 @@ pub fn benchmark_model_performance(
     };
     let t_bi = Instant::now();
     for _ in 0..bi_iters {
-        forward_bidirectional(&tokens, config, weights, &mut bi_state);
+        if let Some(ref q8) = q8_opt {
+            forward_bidirectional_q8(&tokens, config, q8, &mut bi_state, num_threads);
+        } else if num_threads <= 1 {
+            forward_bidirectional(&tokens, config, weights, &mut bi_state);
+        } else {
+            forward_bidirectional_parallel(&tokens, config, weights, &mut bi_state, num_threads);
+        }
     }
     let bi_elapsed = t_bi.elapsed().as_secs_f64();
     let total_bi_tokens = bi_len * bi_iters;
@@ -1409,6 +1540,8 @@ pub fn run_benchmark_cli(
     suite_filter: &str,
     theme: &TerminalTheme,
     export_json_path: Option<&str>,
+    num_threads: usize,
+    quantize_q8: bool,
 ) -> io::Result<MultiModelBenchmarkReport> {
     let (c_border, _c_title, c_hdr, c_reset) = if theme.enabled {
         (
@@ -1422,8 +1555,9 @@ pub fn run_benchmark_cli(
     };
 
     println!("\n{}╔═══════════════════════════════════════════════════════════════════════════════════════════╗{}", c_border, c_reset);
-    println!("{}║   {}CODON-INFER: SUITE INTEGRAL DE BENCHMARKS Y VALIDACIÓN MULTI-ESCALA (v1.4.0){}    {}║{}", c_border, c_hdr, c_reset, c_border, c_reset);
-    println!("{}║   Vector Engine: {:<20} | Models: ESM-2 8M, 35M, 150M (Pure Rust std)    ║{}", c_border, active_simd_backend(), c_reset);
+    println!("{}║   {}CODON-INFER: SUITE INTEGRAL DE BENCHMARKS Y VALIDACIÓN MULTI-ESCALA (v1.5.0-dev){}  {}║{}", c_border, c_hdr, c_reset, c_border, c_reset);
+    println!("{}║   Vector Engine: {:<12} | Threads: {:<2} | Precision: {:<8} (std only)      ║{}",
+        c_border, active_simd_backend(), num_threads, if quantize_q8 { "Q8_0" } else { "FP32" }, c_reset);
     println!("{}╚═══════════════════════════════════════════════════════════════════════════════════════════╝{}\n", c_border, c_reset);
 
     let run_all = suite_filter == "full" || suite_filter.is_empty();
@@ -1497,8 +1631,18 @@ pub fn run_benchmark_cli(
         let load_latency_ms = t_load.elapsed().as_secs_f64() * 1000.0;
         println!(" Listo ({:.1} ms, {}).", load_latency_ms, config.model_name());
 
-        let metrics = benchmark_model_performance(path, &weights, &config, load_latency_ms);
+        let metrics = benchmark_model_performance_ext(path, &weights, &config, load_latency_ms, num_threads, quantize_q8);
         model_metrics.push(metrics);
+
+        // Immediate Q8_0 vs FP32 numerical fidelity check
+        let mut st_fp = RunState::new(&config);
+        forward(20, 0, &config, &weights, &mut st_fp);
+        let q8 = weights.quantize_q8();
+        let mut st_q8 = RunState::new(&config);
+        forward_q8(20, 0, &config, &q8, &mut st_q8, num_threads);
+        let cos_sim = compute_cosine_similarity(&st_fp.logits[4..=23], &st_q8.logits[4..=23]);
+        println!("     ↳ [VALIDACIÓN Q8_0] Cosine Similarity vs FP32: {:.5} (Fidelidad: {})",
+            cos_sim, if cos_sim > 0.99 { "ESTRICTA > 0.99 [PASSED]" } else { "ALERTA <= 0.99" });
 
         if idx == 0 || primary_weights.is_none() {
             primary_config = Some(config);
@@ -1526,7 +1670,7 @@ pub fn run_benchmark_cli(
     // 2. Coherence MLM
     if run_all || suite_filter == "mlm" || suite_filter == "coherence" {
         println!("┌─ [2/8] PERPLEJIDAD EVOLUTIVA Y CALIBRACIÓN MUTACIONAL (MLM SCORING) ─────────────────────┐");
-        let rep = run_coherence_benchmark(&pw, &pc);
+        let rep = run_coherence_benchmark_ext(&pw, &pc, num_threads);
         println!("│ Target Domain                Mutation Description         WT PPL   Mut PPL   Δ LogP  Status │");
         println!("├──────────────────────────────────────────────────────────────────────────────────────────┤");
         for ev in &rep.evaluations {
@@ -1544,7 +1688,7 @@ pub fn run_benchmark_cli(
     // 3. Inpainting
     if run_all || suite_filter == "inpainting" {
         println!("┌─ [3/8] INFERENCIA BIDIRECCIONAL E INPAINTING CON TOKEN <mask_1> ──────────────────────────┐");
-        let rep = run_inpainting_benchmark(&pw, &pc);
+        let rep = run_inpainting_benchmark_ext(&pw, &pc, num_threads);
         for ev in &rep.evaluations {
             println!("│ Test Case: {:<76} │", ev.name);
             println!("│ Input Masked:  {:<73} │", ev.masked_sequence);
@@ -1569,7 +1713,7 @@ pub fn run_benchmark_cli(
             crate::EsmModelArch::Esm2_150M => 300,
             crate::EsmModelArch::Esm2_650M | crate::EsmModelArch::Esm2_3B => 100,
         };
-        let rep = run_hardware_stress(total_stress_tokens, &pw, &pc);
+        let rep = run_hardware_stress_ext(total_stress_tokens, &pw, &pc, num_threads);
         println!("│ Total Processed Tokens:     {:<60} │", rep.total_tokens);
         println!("│ Sustained Execution Time:   {:>8.2} seconds                                               │", rep.elapsed_secs);
         println!("│ Sustained Inference Speed:  {:>8.2} tokens/second                                         │", rep.sustained_throughput_tps);
@@ -1593,7 +1737,7 @@ pub fn run_benchmark_cli(
     // 5. DMS
     if run_all || suite_filter == "dms" {
         println!("┌─ [5/8] DEEP MUTATIONAL SCANNING (DMS) IN SILICO & HEATMAP (PROTEASA L. FERMENTUM) ───────┐");
-        let rep = run_dms_benchmark(&pw, &pc);
+        let rep = run_dms_benchmark_ext(&pw, &pc, num_threads);
         println!("│ Target Motif:               {:<60} │", format!("{} (12-aa active catalytic motif)", rep.motif));
         println!("│ In Silico Evaluation:       {} single-point mutations across all 20 canonical AAs     │", rep.total_mutations);
         println!("│ Scanning Latency:           {:>8.2} ms total                                              │", rep.elapsed_ms);
@@ -1633,7 +1777,7 @@ pub fn run_benchmark_cli(
     // 6. Contact
     if run_all || suite_filter == "contacts" || suite_filter == "contact" {
         println!("┌─ [6/8] DETECCIÓN ZERO-SHOT DE CONTACTOS ESTRUCTURALES (DISULFUROS VÍA APC) ──────────────┐");
-        let rep = run_contact_benchmark(&pw, &pc);
+        let rep = run_contact_benchmark_ext(&pw, &pc, num_threads);
         println!("│ Target Protein:             {:<60} │", rep.protein_name);
         println!("│ Sequence:                   {:<60} │", rep.sequence);
         let cys_list_str: Vec<String> = rep.cys_indices.iter().map(|idx| format!("C{}", idx + 1)).collect();
@@ -1667,7 +1811,7 @@ pub fn run_benchmark_cli(
     // 7. Scaling
     if run_all || suite_filter == "scaling" || suite_filter == "scale" {
         println!("┌─ [7/8] ESCALABILIDAD DE LONGITUD O(L²) VS. FRONTERA DE CACHÉ L2/L3 ──────────────────────┐");
-        let rep = run_scaling_benchmark(&pw, &pc);
+        let rep = run_scaling_benchmark_ext(&pw, &pc, num_threads);
         println!("│ Length │ Total Time │ Per-Token │ Throughput │ Working Buffer │ Cache Memory Regime      │");
         println!("│ (AAs)  │    (ms)    │  (µs/tok) │   (tok/s)  │   Size (KB)    │ (Intel Sandy / AMD Zen)  │");
         println!("├────────┼────────────┼───────────┼────────────┼────────────────┼──────────────────────────┤");
@@ -1719,7 +1863,8 @@ pub fn run_multi_model_benchmark_suite(
     theme: &TerminalTheme,
     export_json_path: Option<&str>,
 ) -> io::Result<MultiModelBenchmarkReport> {
-    run_benchmark_cli(model_paths, suite_filter, theme, export_json_path)
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    run_benchmark_cli(model_paths, suite_filter, theme, export_json_path, threads, false)
 }
 
 pub fn run_full_benchmark_suite(
@@ -1732,7 +1877,8 @@ pub fn run_full_benchmark_suite(
     if model_paths.is_empty() {
         model_paths.push("esm2_8m_weights.bin".to_string());
     }
-    let _ = run_benchmark_cli(&model_paths, suite_filter, &theme, None);
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let _ = run_benchmark_cli(&model_paths, suite_filter, &theme, None, threads, false);
 }
 
 #[cfg(test)]
