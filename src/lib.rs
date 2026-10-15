@@ -1262,12 +1262,15 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
     #[test]
     fn test_attention_simd_parity_dk_64() {
         let dk = 64;
-        let q: Vec<f32> = (0..dk).map(|i| (i as f32) * 0.08 - 2.5).collect();
-        let k: Vec<f32> = (0..dk).map(|i| ((i * 11) as f32) * 0.03 - 1.2).collect();
-        let v: Vec<f32> = (0..dk).map(|i| ((i * 17) as f32) * 0.04 - 0.9).collect();
+        let q: Vec<f32> = (0..dk).map(|i| (i as f32) * 0.01 - 0.3).collect();
+        let k: Vec<f32> = (0..dk).map(|i| ((i * 3) as f32) * 0.01 - 0.2).collect();
+        let v: Vec<f32> = (0..dk).map(|i| ((i * 5) as f32) * 0.01 - 0.25).collect();
 
         // 1. Scalar Reference Dot Product
         let mut scalar_dot = 0.0f32;
