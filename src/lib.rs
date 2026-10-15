@@ -1223,41 +1223,235 @@ pub fn matmul_q8_parallel(
 }
 
 // ============================================================================
-// MATMUL Q4_0 KERNELS SKELETON
+// MATMUL Q4_0 KERNELS (SCALAR, AVX1, AVX2+FMA, SIMD DISPATCH, PARALLEL)
 // ============================================================================
 
+/// Scalar reference kernel for Q4_0 matrix multiplication (Ground Truth).
 pub fn matmul_q4(
-    _out: &mut [f32],
-    _x: &[f32],
-    _w: &[BlockQ4_0],
-    _bias: &[f32],
-    _in_dim: usize,
-    _out_dim: usize,
+    out: &mut [f32],
+    x: &[f32],
+    w: &[BlockQ4_0],
+    bias: &[f32],
+    in_dim: usize,
+    out_dim: usize,
 ) {
-    todo!("Subagent B: matmul_q4 scalar reference kernel")
+    debug_assert!(out.len() >= out_dim && bias.len() >= out_dim && x.len() >= in_dim);
+    let blocks_per_row = in_dim / 32;
+    for i in 0..out_dim {
+        let row_blocks = &w[i * blocks_per_row..(i + 1) * blocks_per_row];
+        let mut sum = 0.0f32;
+        for (b_idx, block) in row_blocks.iter().enumerate() {
+            let x_chunk = &x[b_idx * 32..(b_idx + 1) * 32];
+            let mut block_sum = 0.0f32;
+            for j in 0..16 {
+                let q_lo = (block.qs[j] & 0x0F) as i32 - 8;
+                block_sum += x_chunk[j] * (q_lo as f32);
+                let q_hi = ((block.qs[j] >> 4) & 0x0F) as i32 - 8;
+                block_sum += x_chunk[j + 16] * (q_hi as f32);
+            }
+            sum += block_sum * block.d;
+        }
+        out[i] = sum + bias[i];
+    }
 }
 
-pub fn matmul_q4_simd(
-    _out: &mut [f32],
-    _x: &[f32],
-    _w: &[BlockQ4_0],
-    _bias: &[f32],
-    _in_dim: usize,
-    _out_dim: usize,
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+pub unsafe fn matmul_q4_avx1(
+    out: &mut [f32],
+    x: &[f32],
+    w: &[BlockQ4_0],
+    bias: &[f32],
+    in_dim: usize,
+    out_dim: usize,
 ) {
-    todo!("Subagent B: matmul_q4_simd runtime dispatch")
+    use std::arch::x86_64::*;
+    debug_assert!(out.len() >= out_dim && bias.len() >= out_dim && x.len() >= in_dim);
+    let blocks_per_row = in_dim / 32;
+    let x_ptr = x.as_ptr();
+
+    let mask_low = _mm_set1_epi8(0x0F);
+    let c8 = _mm_set1_epi8(8);
+
+    for i in 0..out_dim {
+        let row_blocks = &w[i * blocks_per_row..(i + 1) * blocks_per_row];
+        let mut row_sum = 0.0f32;
+
+        for (b_idx, block) in row_blocks.iter().enumerate() {
+            let block_x = x_ptr.add(b_idx * 32);
+            let raw16 = _mm_loadu_si128(block.qs.as_ptr() as *const __m128i);
+
+            let lo_i8 = _mm_sub_epi8(_mm_and_si128(raw16, mask_low), c8);
+            let hi_i8 = _mm_sub_epi8(_mm_and_si128(_mm_srli_epi16(raw16, 4), mask_low), c8);
+
+            let mut acc = _mm256_setzero_ps();
+
+            // 0..7
+            let lo_0_3 = _mm_cvtepi8_epi32(lo_i8);
+            let lo_4_7 = _mm_cvtepi8_epi32(_mm_srli_si128(lo_i8, 4));
+            let vq0 = _mm256_set_m128(_mm_cvtepi32_ps(lo_4_7), _mm_cvtepi32_ps(lo_0_3));
+            let vx0 = _mm256_loadu_ps(block_x);
+            acc = _mm256_add_ps(acc, _mm256_mul_ps(vq0, vx0));
+
+            // 8..15
+            let lo_hi64 = _mm_srli_si128(lo_i8, 8);
+            let lo_8_11 = _mm_cvtepi8_epi32(lo_hi64);
+            let lo_12_15 = _mm_cvtepi8_epi32(_mm_srli_si128(lo_hi64, 4));
+            let vq1 = _mm256_set_m128(_mm_cvtepi32_ps(lo_12_15), _mm_cvtepi32_ps(lo_8_11));
+            let vx1 = _mm256_loadu_ps(block_x.add(8));
+            acc = _mm256_add_ps(acc, _mm256_mul_ps(vq1, vx1));
+
+            // 16..23
+            let hi_0_3 = _mm_cvtepi8_epi32(hi_i8);
+            let hi_4_7 = _mm_cvtepi8_epi32(_mm_srli_si128(hi_i8, 4));
+            let vq2 = _mm256_set_m128(_mm_cvtepi32_ps(hi_4_7), _mm_cvtepi32_ps(hi_0_3));
+            let vx2 = _mm256_loadu_ps(block_x.add(16));
+            acc = _mm256_add_ps(acc, _mm256_mul_ps(vq2, vx2));
+
+            // 24..31
+            let hi_hi64 = _mm_srli_si128(hi_i8, 8);
+            let hi_8_11 = _mm_cvtepi8_epi32(hi_hi64);
+            let hi_12_15 = _mm_cvtepi8_epi32(_mm_srli_si128(hi_hi64, 4));
+            let vq3 = _mm256_set_m128(_mm_cvtepi32_ps(hi_12_15), _mm_cvtepi32_ps(hi_8_11));
+            let vx3 = _mm256_loadu_ps(block_x.add(24));
+            acc = _mm256_add_ps(acc, _mm256_mul_ps(vq3, vx3));
+
+            row_sum += hsum256_ps_avx(acc) * block.d;
+        }
+
+        *out.get_unchecked_mut(i) = row_sum + *bias.get_unchecked(i);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn matmul_q4_avx2_fma(
+    out: &mut [f32],
+    x: &[f32],
+    w: &[BlockQ4_0],
+    bias: &[f32],
+    in_dim: usize,
+    out_dim: usize,
+) {
+    use std::arch::x86_64::*;
+    debug_assert!(out.len() >= out_dim && bias.len() >= out_dim && x.len() >= in_dim);
+    let blocks_per_row = in_dim / 32;
+    let x_ptr = x.as_ptr();
+
+    let mask_low = _mm_set1_epi8(0x0F);
+    let c8 = _mm_set1_epi8(8);
+
+    for i in 0..out_dim {
+        let row_blocks = &w[i * blocks_per_row..(i + 1) * blocks_per_row];
+        let mut row_sum = 0.0f32;
+
+        for (b_idx, block) in row_blocks.iter().enumerate() {
+            let block_x = x_ptr.add(b_idx * 32);
+            let raw16 = _mm_loadu_si128(block.qs.as_ptr() as *const __m128i);
+
+            let lo_i8 = _mm_sub_epi8(_mm_and_si128(raw16, mask_low), c8);
+            let hi_i8 = _mm_sub_epi8(_mm_and_si128(_mm_srli_epi16(raw16, 4), mask_low), c8);
+
+            let mut acc = _mm256_setzero_ps();
+
+            // 0..7
+            let vq0 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(lo_i8));
+            let vx0 = _mm256_loadu_ps(block_x);
+            acc = _mm256_fmadd_ps(vq0, vx0, acc);
+
+            // 8..15
+            let vq1 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(lo_i8, 8)));
+            let vx1 = _mm256_loadu_ps(block_x.add(8));
+            acc = _mm256_fmadd_ps(vq1, vx1, acc);
+
+            // 16..23
+            let vq2 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(hi_i8));
+            let vx2 = _mm256_loadu_ps(block_x.add(16));
+            acc = _mm256_fmadd_ps(vq2, vx2, acc);
+
+            // 24..31
+            let vq3 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(hi_i8, 8)));
+            let vx3 = _mm256_loadu_ps(block_x.add(24));
+            acc = _mm256_fmadd_ps(vq3, vx3, acc);
+
+            row_sum += hsum256_ps_avx(acc) * block.d;
+        }
+
+        *out.get_unchecked_mut(i) = row_sum + *bias.get_unchecked(i);
+    }
+}
+
+#[inline]
+pub fn matmul_q4_simd(
+    out: &mut [f32],
+    x: &[f32],
+    w: &[BlockQ4_0],
+    bias: &[f32],
+    in_dim: usize,
+    out_dim: usize,
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            unsafe { matmul_q4_avx2_fma(out, x, w, bias, in_dim, out_dim) };
+            return;
+        }
+        if std::is_x86_feature_detected!("avx") {
+            unsafe { matmul_q4_avx1(out, x, w, bias, in_dim, out_dim) };
+            return;
+        }
+    }
+    matmul_q4(out, x, w, bias, in_dim, out_dim);
+}
+
+struct Q4Job<'a> {
+    out: *mut f32,
+    x: &'a [f32],
+    w: &'a [BlockQ4_0],
+    bias: &'a [f32],
+    in_dim: usize,
+    out_dim: usize,
+}
+
+unsafe fn run_q4_slice(ctx: *const (), t_idx: usize, n_threads: usize) {
+    let job = unsafe { &*(ctx as *const Q4Job) };
+    let blocks_per_row = job.in_dim / 32;
+    let chunk_size = (job.out_dim + n_threads - 1) / n_threads;
+    let start_row = t_idx * chunk_size;
+    if start_row < job.out_dim {
+        let rows_in_chunk = (job.out_dim - start_row).min(chunk_size);
+        let out_slice = unsafe { std::slice::from_raw_parts_mut(job.out.add(start_row), rows_in_chunk) };
+        let bias_chunk = &job.bias[start_row..start_row + rows_in_chunk];
+        let w_start = start_row * blocks_per_row;
+        let w_end = w_start + rows_in_chunk * blocks_per_row;
+        let w_chunk = &job.w[w_start..w_end];
+        matmul_q4_simd(out_slice, job.x, w_chunk, bias_chunk, job.in_dim, rows_in_chunk);
+    }
 }
 
 pub fn matmul_q4_parallel(
-    _out: &mut [f32],
-    _x: &[f32],
-    _w: &[BlockQ4_0],
-    _bias: &[f32],
-    _in_dim: usize,
-    _out_dim: usize,
-    _num_threads: usize,
+    out: &mut [f32],
+    x: &[f32],
+    w: &[BlockQ4_0],
+    bias: &[f32],
+    in_dim: usize,
+    out_dim: usize,
+    num_threads: usize,
 ) {
-    todo!("Subagent B: matmul_q4_parallel ThreadPool dispatch")
+    if num_threads <= 1 || out_dim < 32 {
+        matmul_q4_simd(out, x, w, bias, in_dim, out_dim);
+        return;
+    }
+
+    let job = Q4Job {
+        out: out.as_mut_ptr(),
+        x,
+        w,
+        bias,
+        in_dim,
+        out_dim,
+    };
+    get_global_pool().run_parallel(num_threads, run_q4_slice, &job as *const _ as *const ());
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -3039,5 +3233,278 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod tests_q4_simd {
+    use super::*;
+
+    /// Constructs a single BlockQ4_0 directly from 32 floats according to Q4_0 spec,
+    /// without relying on Subagent A's implementation.
+    fn create_test_block_q4(src: &[f32; 32]) -> BlockQ4_0 {
+        let mut max_abs = 0.0f32;
+        let mut max_val = 0.0f32;
+        for &val in src.iter() {
+            let abs = val.abs();
+            if abs > max_abs {
+                max_abs = abs;
+                max_val = val;
+            }
+        }
+
+        let d = max_val / -8.0;
+        let id = if d == 0.0 { 0.0 } else { 1.0 / d };
+
+        let mut qs = [0u8; 16];
+        for j in 0..16 {
+            let x0 = src[j];
+            let x1 = src[j + 16];
+            let q0 = ((x0 * id).round() + 8.0).clamp(0.0, 15.0) as u8;
+            let q1 = ((x1 * id).round() + 8.0).clamp(0.0, 15.0) as u8;
+            qs[j] = (q0 & 0x0F) | ((q1 & 0x0F) << 4);
+        }
+
+        BlockQ4_0 { d, qs }
+    }
+
+    /// Constructs a matrix of BlockQ4_0 of dimensions `out_dim x (in_dim / 32)`.
+    fn create_test_matrix_q4(in_dim: usize, out_dim: usize, seed_offset: f32) -> Vec<BlockQ4_0> {
+        assert_eq!(in_dim % 32, 0);
+        let num_blocks = out_dim * (in_dim / 32);
+        let mut blocks = Vec::with_capacity(num_blocks);
+
+        for b in 0..num_blocks {
+            let mut src = [0.0f32; 32];
+            for (k, elem) in src.iter_mut().enumerate() {
+                let idx = b * 32 + k;
+                *elem = ((idx as f32 * 1.5 + seed_offset).sin()) * 1.75;
+            }
+            blocks.push(create_test_block_q4(&src));
+        }
+        blocks
+    }
+
+    fn check_rel_parity(scalar: &[f32], simd: &[f32], tol: f32, label: &str) {
+        assert_eq!(scalar.len(), simd.len());
+        let mut sum_sq_diff = 0.0f32;
+        let mut sum_sq_ref = 0.0f32;
+        let mut max_diff = 0.0f32;
+        let mut max_diff_idx = 0;
+
+        for i in 0..scalar.len() {
+            let s = scalar[i];
+            let v = simd[i];
+            let diff = (s - v).abs();
+            if diff > max_diff {
+                max_diff = diff;
+                max_diff_idx = i;
+            }
+            sum_sq_diff += diff * diff;
+            sum_sq_ref += s * s;
+        }
+
+        let l2_diff = sum_sq_diff.sqrt();
+        let l2_ref = sum_sq_ref.sqrt();
+        let l2_rel_err = if l2_ref > 0.0 { l2_diff / l2_ref } else { l2_diff };
+
+        println!(
+            "{}: L2 rel err = {:.2e}, max diff = {:.2e} at idx {} (scalar={}, simd={})",
+            label, l2_rel_err, max_diff, max_diff_idx, scalar[max_diff_idx], simd[max_diff_idx]
+        );
+
+        assert!(
+            l2_rel_err <= tol,
+            "{}: L2 relative error {:.2e} exceeded tolerance {:.2e}",
+            label, l2_rel_err, tol
+        );
+    }
+
+    #[test]
+    fn test_q4_simd_parity_esm_dimensions() {
+        // Real ESM model dimensions: 320, 480, 640, 1280, 2560, 5120
+        let test_cases: &[(usize, usize)] = &[
+            (320, 320),   // ESM-2 8M dim x dim
+            (480, 480),   // ESM-2 35M dim x dim
+            (640, 640),   // ESM-2 150M dim x dim
+            (1280, 320),  // ESM-2 650M dim x projection
+            (2560, 64),   // ESM-2 3B dim x heads
+            (5120, 64),   // ESM-2 intermediate FFN x chunk
+            (320, 1280),  // FFN expansion 8M
+            (640, 2560),  // FFN expansion 150M
+            (320, 5120),  // FFN expansion 650M
+        ];
+
+        for &(in_dim, out_dim) in test_cases {
+            let x: Vec<f32> = (0..in_dim).map(|i| (i as f32 * 0.03).cos() * 0.8).collect();
+            let blocks = create_test_matrix_q4(in_dim, out_dim, 0.42);
+            let bias: Vec<f32> = (0..out_dim).map(|i| (i as f32 * 0.01) - 0.2).collect();
+
+            let mut out_scalar = vec![0.0f32; out_dim];
+            matmul_q4(&mut out_scalar, &x, &blocks, &bias, in_dim, out_dim);
+
+            // 1. SIMD Dispatch Parity
+            let mut out_simd = vec![0.0f32; out_dim];
+            matmul_q4_simd(&mut out_simd, &x, &blocks, &bias, in_dim, out_dim);
+            check_rel_parity(
+                &out_scalar,
+                &out_simd,
+                1e-5,
+                &format!("SIMD dispatch ({in_dim}x{out_dim})"),
+            );
+
+            // 2. AVX1 Parity (if supported by CPU)
+            #[cfg(target_arch = "x86_64")]
+            if std::is_x86_feature_detected!("avx") {
+                let mut out_avx1 = vec![0.0f32; out_dim];
+                unsafe { matmul_q4_avx1(&mut out_avx1, &x, &blocks, &bias, in_dim, out_dim) };
+                check_rel_parity(
+                    &out_scalar,
+                    &out_avx1,
+                    1e-5,
+                    &format!("AVX1 ({in_dim}x{out_dim})"),
+                );
+            }
+
+            // 3. AVX2+FMA Parity (if supported by CPU)
+            #[cfg(target_arch = "x86_64")]
+            if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+                let mut out_avx2 = vec![0.0f32; out_dim];
+                unsafe { matmul_q4_avx2_fma(&mut out_avx2, &x, &blocks, &bias, in_dim, out_dim) };
+                check_rel_parity(
+                    &out_scalar,
+                    &out_avx2,
+                    1e-5,
+                    &format!("AVX2+FMA ({in_dim}x{out_dim})"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_q4_parallel_vs_sequential_identity_threads() {
+        let test_dims = &[(640, 128), (1280, 64)];
+
+        for &(in_dim, out_dim) in test_dims {
+            let x: Vec<f32> = (0..in_dim).map(|i| (i as f32 * 0.05).sin()).collect();
+            let blocks = create_test_matrix_q4(in_dim, out_dim, 0.77);
+            let bias: Vec<f32> = (0..out_dim).map(|i| (i as f32 * 0.01) - 0.5).collect();
+
+            let mut out_seq = vec![0.0f32; out_dim];
+            matmul_q4_simd(&mut out_seq, &x, &blocks, &bias, in_dim, out_dim);
+
+            for &threads in &[1, 2, 4, 8] {
+                let mut out_par = vec![0.0f32; out_dim];
+                matmul_q4_parallel(&mut out_par, &x, &blocks, &bias, in_dim, out_dim, threads);
+
+                for i in 0..out_dim {
+                    assert_eq!(
+                        out_seq[i].to_bits(),
+                        out_par[i].to_bits(),
+                        "threads={} mismatch at row {}: seq={} vs par={}",
+                        threads, i, out_seq[i], out_par[i]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_q4_edge_case_small_out_dim() {
+        let in_dim = 320;
+        let small_out_dims = [1, 2, 7, 15, 16, 31];
+
+        for &out_dim in &small_out_dims {
+            let x: Vec<f32> = (0..in_dim).map(|i| (i as f32 * 0.02).cos()).collect();
+            let blocks = create_test_matrix_q4(in_dim, out_dim, 1.23);
+            let bias: Vec<f32> = (0..out_dim).map(|i| i as f32 * 0.1).collect();
+
+            let mut out_scalar = vec![0.0f32; out_dim];
+            matmul_q4(&mut out_scalar, &x, &blocks, &bias, in_dim, out_dim);
+
+            let mut out_simd = vec![0.0f32; out_dim];
+            matmul_q4_simd(&mut out_simd, &x, &blocks, &bias, in_dim, out_dim);
+            check_rel_parity(&out_scalar, &out_simd, 1e-5, &format!("small out_dim={out_dim} simd"));
+
+            // Parallel with 4 threads must fall back sequentially without panic or corruption
+            let mut out_par = vec![0.0f32; out_dim];
+            matmul_q4_parallel(&mut out_par, &x, &blocks, &bias, in_dim, out_dim, 4);
+            for i in 0..out_dim {
+                assert_eq!(
+                    out_simd[i].to_bits(),
+                    out_par[i].to_bits(),
+                    "small out_dim={out_dim} parallel fallback mismatch at {i}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_q4_edge_case_zero_blocks() {
+        let in_dim = 64;
+        let out_dim = 32;
+        let blocks_per_row = in_dim / 32;
+
+        // 1. Zero weights (d = 0.0, qs = 0x88)
+        let zero_blocks = vec![BlockQ4_0 { d: 0.0, qs: [0x88; 16] }; out_dim * blocks_per_row];
+        let x: Vec<f32> = (0..in_dim).map(|i| (i as f32) + 1.0).collect();
+        let bias: Vec<f32> = (0..out_dim).map(|i| (i as f32) * 2.5).collect();
+
+        let mut out_scalar = vec![0.0f32; out_dim];
+        matmul_q4(&mut out_scalar, &x, &zero_blocks, &bias, in_dim, out_dim);
+
+        let mut out_simd = vec![0.0f32; out_dim];
+        matmul_q4_simd(&mut out_simd, &x, &zero_blocks, &bias, in_dim, out_dim);
+
+        for i in 0..out_dim {
+            assert_eq!(out_scalar[i], bias[i], "Scalar zero-weights should equal bias");
+            assert_eq!(out_simd[i], bias[i], "SIMD zero-weights should equal bias");
+        }
+
+        // 2. Zero input x
+        let x_zero = vec![0.0f32; in_dim];
+        let test_blocks = create_test_matrix_q4(in_dim, out_dim, std::f32::consts::PI);
+        let mut out_from_zero_x = vec![0.0f32; out_dim];
+        matmul_q4_simd(&mut out_from_zero_x, &x_zero, &test_blocks, &bias, in_dim, out_dim);
+
+        for i in 0..out_dim {
+            assert_eq!(out_from_zero_x[i], bias[i], "Zero x should equal bias");
+        }
+    }
+
+    #[test]
+    fn test_q4_edge_case_extreme_values() {
+        let in_dim = 64;
+        let out_dim = 32;
+        let blocks_per_row = in_dim / 32;
+
+        // Block with max positive nibbles (0xFF -> 15 -> +7) and large delta
+        let pos_extreme_blocks = vec![BlockQ4_0 { d: 5000.0, qs: [0xFF; 16] }; out_dim * blocks_per_row];
+        // Block with max negative nibbles (0x00 -> 0 -> -8) and large delta
+        let neg_extreme_blocks = vec![BlockQ4_0 { d: 5000.0, qs: [0x00; 16] }; out_dim * blocks_per_row];
+
+        let x_extreme: Vec<f32> = (0..in_dim).map(|i| if i % 2 == 0 { 100.0 } else { -100.0 }).collect();
+        let bias = vec![0.0f32; out_dim];
+
+        // Check positive extremes
+        let mut out_pos_scalar = vec![0.0f32; out_dim];
+        matmul_q4(&mut out_pos_scalar, &x_extreme, &pos_extreme_blocks, &bias, in_dim, out_dim);
+        let mut out_pos_simd = vec![0.0f32; out_dim];
+        matmul_q4_simd(&mut out_pos_simd, &x_extreme, &pos_extreme_blocks, &bias, in_dim, out_dim);
+        check_rel_parity(&out_pos_scalar, &out_pos_simd, 1e-5, "extreme positive values");
+
+        // Check negative extremes
+        let mut out_neg_scalar = vec![0.0f32; out_dim];
+        matmul_q4(&mut out_neg_scalar, &x_extreme, &neg_extreme_blocks, &bias, in_dim, out_dim);
+        let mut out_neg_simd = vec![0.0f32; out_dim];
+        matmul_q4_simd(&mut out_neg_simd, &x_extreme, &neg_extreme_blocks, &bias, in_dim, out_dim);
+        check_rel_parity(&out_neg_scalar, &out_neg_simd, 1e-5, "extreme negative values");
+
+        // Check that outputs are finite
+        for i in 0..out_dim {
+            assert!(out_pos_simd[i].is_finite());
+            assert!(out_neg_simd[i].is_finite());
+        }
+    }
+}
+
 
 
