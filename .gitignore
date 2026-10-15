@@ -31,3 +31,8 @@ codon-infer-mcp
 *_output.json
 dms_output.*
 contacts_output.*
+
+# Large multi-model weights binaries (>100MB)
+*_pesos.bin
+esm2_35m*.bin
+esm2_150m*.bin

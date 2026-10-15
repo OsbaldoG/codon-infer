@@ -12,19 +12,19 @@ fn print_version() {
     println!("codon-infer v{}", env!("CARGO_PKG_VERSION"));
     println!("Engine: Pure Rust Zero-Dependencies (std)");
     println!("Vector Dispatch: {}", active_simd_backend());
-    println!("Target Model: ESM-2 8M Parameters (Meta AI / UniRef50)");
+    println!("Target Model: ESM-2 Multi-Scale [8M, 35M, 150M] (Meta AI / UniRef50)");
 }
 
 fn print_help(theme: &TerminalTheme) {
     let logo = if theme.enabled {
         "\x1b[38;2;139;92;246m╔═══════════════════════════════════════════════════════════════════════════════╗\n\
          ║   \x1b[38;2;59;130;246mCODON-INFER\x1b[38;2;139;92;246m: High-Performance Zero-Allocation ESM-2 Engine in Pure Rust     ║\n\
-         ║   \x1b[38;2;16;185;129mVersion 1.3.0\x1b[38;2;139;92;246m | Production CLI & Bioinformatic Analysis Pipeline           ║\n\
+         ║   \x1b[38;2;16;185;129mVersion 1.4.0\x1b[38;2;139;92;246m | Multi-Scale CLI & Bioinformatic Analysis Pipeline          ║\n\
          ╚═══════════════════════════════════════════════════════════════════════════════╝\x1b[0m"
     } else {
         "╔═══════════════════════════════════════════════════════════════════════════════╗\n\
          ║   CODON-INFER: High-Performance Zero-Allocation ESM-2 Engine in Pure Rust     ║\n\
-         ║   Version 1.3.0 | Production CLI & Bioinformatic Analysis Pipeline           ║\n\
+         ║   Version 1.4.0 | Multi-Scale CLI & Bioinformatic Analysis Pipeline          ║\n\
          ╚═══════════════════════════════════════════════════════════════════════════════╝"
     };
     println!("{}", logo);
@@ -333,7 +333,7 @@ fn main() -> io::Result<()> {
                 prompt = rec.sequence;
             }
 
-            println!("--- Codon-Infer Engine V1.3 (Zero-Deps Production CLI) ---");
+            println!("--- Codon-Infer Engine V1.4 (Zero-Deps Multi-Scale CLI) ---");
             println!("Active SIMD Backend: {}", active_simd_backend());
             let load_timer = Instant::now();
             println!("Loading model weights from '{}'...", model_path);
