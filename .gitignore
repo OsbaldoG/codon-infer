@@ -25,5 +25,9 @@ codon-infer-mcp
 *.swp
 *.swo
 
-# Logs
+# Logs and outputs
 *.log
+*_output.csv
+*_output.json
+dms_output.*
+contacts_output.*

@@ -1,39 +1,42 @@
 # codon-infer 🧬⚡
 
-> **High-Performance, Zero-Allocation ESM-2 Protein Language Model Inference Engine in Pure Rust (v1.2).**
+> **High-Performance, Zero-Allocation ESM-2 Protein Language Model Inference Engine & Bioinformatic Pipeline in Pure Rust (v1.3).**
 
 [![Rust](https://img.shields.io/badge/rust-2024_edition-orange.svg)](https://www.rust-lang.org/)
-[![Version](https://img.shields.io/badge/version-1.2.0-blue.svg)]()
+[![Version](https://img.shields.io/badge/version-1.3.0-blue.svg)]()
 [![Dependencies](https://img.shields.io/badge/dependencies-0%20(pure%20std)-brightgreen.svg)]()
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Model](https://img.shields.io/badge/model-ESM--2%208M%20(t6__8M__UR50D)-blueviolet.svg)](https://github.com/facebookresearch/esm)
 [![SIMD](https://img.shields.io/badge/SIMD-AVX2%2BFMA%20%7C%20AVX1-red.svg)]()
 [![Throughput](https://img.shields.io/badge/CPU%20throughput->200%20tokens%2Fsec-success.svg)]()
 
-`codon-infer` is an ultra-lightweight, dependency-free inference engine for Evolutionary Scale Modeling (**ESM-2**) protein language models (`esm2_t6_8M_UR50D`), engineered from first principles in **100% safe, idiomatic Rust (`std` only)**.
+`codon-infer` is an ultra-lightweight, dependency-free inference engine and bioinformatic analysis suite for Evolutionary Scale Modeling (**ESM-2**) protein language models (`esm2_t6_8M_UR50D`), engineered from first principles in **100% safe, idiomatic Rust (`std` only)**.
 
-By eliminating Python, PyTorch, C/CUDA runtimes, and external third-party crates, `codon-infer` executes ESM-2 autoregressive generation, motif extension, and *de novo* peptide design at **over 200 tokens/second on standard x86_64 CPUs** with a static memory footprint under 40 MB.
+By eliminating Python, PyTorch, C/CUDA runtimes, and external third-party crates, `codon-infer` executes ESM-2 autoregressive generation, bidirectional active-site inpainting, in silico deep mutational scanning (DMS), and structural contact prediction at **over 200 tokens/second on standard x86_64 CPUs** with a static memory footprint under 40 MB.
 
 ---
 
-## ⚡ Highlights (Version 1.2)
+## ⚡ Highlights (Version 1.3)
 
-* **Pure Rust (`std` only) Zero-Dependency Engine:** Built solely on the Rust Standard Library. Zero external dependencies, no `tch`, no `onnxruntime`, no `ndarray`, and zero C bindings.
-* **Dual SIMD Hardware Acceleration:**
-  * **AVX2 + FMA:** 256-bit Fused Multiply-Add vector pipeline optimized for modern AMD Ryzen and Intel Haswell+ architectures, unrolling matrix-vector products across 4 registers (32 floats per iteration).
-  * **AVX1:** 256-bit SIMD kernel for legacy Intel Sandy Bridge / Ivy Bridge processors lacking FMA.
-  * **Dynamic Runtime CPU Dispatch:** Evaluates CPU capabilities at startup via `is_x86_feature_detected!` and routes compute paths without requiring separate binaries.
-* **`Q8_0` Block Quantization (L3 Cache Optimized):**
-  * Symmetrically quantizes weights in contiguous blocks of 32 elements: each block contains one 32-bit float scale delta (`d: f32`) and 32 signed 8-bit integers (`qs: [i8; 32]`).
-  * Yields ~4x weight compression while fitting model working sets directly into processor L3 cache to eliminate RAM memory bus bottlenecks.
+* **Production CLI Subcommands (`generate`, `inpaint`, `dms`, `contacts`, `benchmark`):**
+  * Expressive, unified terminal interface supporting subcommands, global flags (`--model`, `--color`, `--no-color`), automatic TTY detection, and clear error diagnostics.
+* **Zero-Dependency TrueColor UX (`ui.rs`):**
+  * **Physicochemical Palette:** Amino acid residues styled using TrueColor ANSI RGB according to biochemical properties (Aliphatic, Aromatic, Basic, Acidic, Polar, Cysteine, Conformationally flexible).
+  * **Continuous Thermal Gradient Heatmap:** Dynamic RGB interpolation (`lerp_rgb`) from Deep Crimson (`#7F1D1D`) for lethal substitutions ($\Delta \log P \le -4.0$) through Amber, Neutral Slate, to Electric Blue (`#1E3A8A`) for beneficial variants, preserving ASCII density glyphs (`█`, `▓`, `▒`, `░`, `·`) for non-color terminals.
+  * **Stderr Dynamic Progress Bar:** Clean ANSI `\r` updates reporting throughput (`muts/s`) and estimated completion time (`ETA`) without polluting redirected `stdout`.
+* **Multi-FASTA & Stream Pipeline (`fasta.rs`):**
+  * High-throughput zero-copy streaming parser for multi-record FASTA files (`--fasta <FILE>`), standard input (`--fasta -`), or direct string sequences (`--sequence <STR>`).
+* **Publication-Grade Export Formats (`export.rs`):**
+  * Structured rectangular CSV matrices and comprehensive JSON reports with residue mutational tolerances, Shannon entropy, and top contact pairs.
+* **Sliding Window Evaluator for Full-Length Proteins (`pipeline.rs`):**
+  * Processes arbitrary-length proteins using adaptive sliding windows ($W=128, S=64$) centered on evaluated residues to prevent RoPE boundary distortion and guarantee cache locality.
+* **Dual SIMD Hardware Acceleration & Pure Rust Core:**
+  * **AVX2 + FMA:** 256-bit Fused Multiply-Add vector pipeline for modern AMD Ryzen and Intel Haswell+.
+  * **AVX1:** 256-bit SIMD kernel for legacy Intel Sandy Bridge / Ivy Bridge processors.
+  * **Dynamic Runtime CPU Dispatch:** Evaluates CPU capabilities at startup via `is_x86_feature_detected!`.
 * **Exact Mathematical & Architectural Parity with ESM-2:**
-  * **Complete `EsmLMHead` Integration:** Fully executes the 102,849-parameter classifier head: dense linear projection ($320 \times 320$), dense bias ($320$), non-linear GELU activation, and tied embedding output projection ($320 \times 33$) with exact per-token decoder biases ($33$).
-  * **RoPE Split-Half Formulation:** Implements the official PyTorch/Fairseq split-half rotary positional embedding ($x_{:d/2}, x_{d/2:}$ rotated via $[-x_2, x_1]$) for positional phase coherence across context windows up to 1,024 residues.
-  * **Numerical `erf` Approximation for GELU:** Precise error-function based Gaussian Error Linear Unit approximation ($0.5 \cdot x \cdot (1 + \text{erf}(x / \sqrt{2}))$) ensuring identical activations to PyTorch.
-* **Strict Zero-Allocation Runtime (`RunState`):** All transformer buffers, scratchpads, attention matrices, and KV caches are allocated upfront on the heap. Zero `malloc`, `vec![]`, or `.clone()` calls during forward passes.
-* **Direct Binary I/O:** Loads 7,511,809 raw 32-bit float parameters (~30.04 MB) sequentially via single-pass `read_exact` in ~30–50 ms.
-* **Biological Tokenizer & Logit Masking:** Hard-masks non-standard, ambiguous, and control tokens ($Z, B, X, U, O, \dots$) to $-\infty$, ensuring strict generation of the 20 canonical IUPAC amino acids.
-* **Model Context Protocol (MCP) Support:** Includes `codon-infer-mcp`, exposing protein inference and de novo generation as an autonomous tool for AI agents (Claude, Gemini, etc.) over stdio JSON-RPC.
+  * Complete 102,849-parameter `EsmLMHead` with numerical `erf` GELU approximation and split-half RoPE positional embeddings.
+* **Strict Zero-Allocation Runtime (`RunState`):** All transformer buffers, scratchpads, attention matrices, and KV caches pre-allocated. Zero memory churn during forward passes.
 
 ---
 
@@ -150,13 +153,17 @@ cargo build --release
 ```
 
 ### 2. Run Test Suite
-Verify numerical primitives, SIMD vectorization parity, and quantized blocks:
+Verify numerical primitives, SIMD vectorization parity, FASTA parser, and export formats:
 ```bash
 cargo test
 ```
 Expected output:
 ```text
-running 7 tests
+running 16 tests
+test fasta::tests::test_parse_raw_sequence ... ok
+test fasta::tests::test_parse_single_fasta ... ok
+test fasta::tests::test_parse_multi_fasta ... ok
+test export::tests::test_csv_export_format ... ok
 test mcp::tests::test_mcp_json_parser_and_formatter ... ok
 test tests::test_layer_norm_stability ... ok
 test tests::test_q8_0_quantization_roundtrip ... ok
@@ -164,77 +171,76 @@ test tests::test_softmax_sum_to_one ... ok
 test tests::test_tokenizer_boundaries ... ok
 test tests::test_matmul_avx1_and_dispatch_parity ... ok
 test tests::test_forward_pass_with_weights_if_available ... ok
-
-test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; finished in 1.00s
+...
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; finished in 1.05s
 ```
 
-### 3. Run Autoregressive Inference
-Execute sequence extension using the default model weights (`esm2_weights.bin`):
+### 3. Subcommands & Bioinformatic Pipelines
+
+#### A. Autoregressive Sequence Generation (`generate`)
+Execute de novo sequence generation or motif extension:
 ```bash
-./target/release/codon-infer --sequence "MCMPCFTTDHQMARKCDD" --temperature 0.7 --max-tokens 40
+codon-infer generate --sequence "MCMPCFTTDHQMARKCDD" --temperature 0.7 --max-tokens 40
 ```
 
-Sample output:
-```text
---- Codon-Infer Engine V1.2 (Zero-Deps SIMD Mode) ---
-Active SIMD Backend: AVX1 (256-bit Sandy Bridge Vector Engine)
-Loading model weights from 'esm2_weights.bin'...
-Model weights loaded successfully in 48.31ms!
-
-Initial seed prompt: 'MCMPCFTTDHQMARKCDD'
-Starting autoregressive generation with stochastic sampling...
-Generation: MCMPCFTTDHQMARKCDDDPCCIIVQCCRQEIIQRCCLRIDRNCCIIIVYCCNCY
-
---- Performance & Validation Report ---
- * Prompt Pre-fill Latency:            33.61 ms
- * Token Generation Time:              185.70 ms
- * Tokens Generated:                   40 tokens
- * Throughput (Speed):                 215.40 tokens/second
-[Execution Completed Successfully]
-```
-
-### 4. Run Stress & Bioinformatic Benchmark Suite
-Execute the full validation suite covering SIMD micro-kernels, evolutionary perplexity (LDH & bacteriocin mutational calibration), `<mask_1>` inpainting, and 10,000-token hardware stress:
+#### B. Bidirectional Inpainting & Motif Infilling (`inpaint`)
+Reconstruct missing, ambiguous, or masked active-site motifs (marked with `*` or `<mask_1>`):
 ```bash
-cargo run --release -- benchmark --suite full
+codon-infer inpaint --sequence "MCMPC*TTDHQMARKCDD"
 ```
 
-Filter by specific benchmark suite:
+#### C. In Silico Deep Mutational Scanning (`dms`)
+Perform comprehensive single-point saturation mutagenesis with TrueColor thermal heatmap rendering and tabular export:
 ```bash
-cargo run --release -- benchmark --suite simd        # SIMD micro-kernels & parity
-cargo run --release -- benchmark --suite mlm         # Evolutionary perplexity & mutational penalties
-cargo run --release -- benchmark --suite inpainting  # Bidirectional mask infilling
-cargo run --release -- benchmark --suite stress      # 10,000-token hardware cache thrashing
+codon-infer dms --fasta proteins.fasta --window 128 --export-csv dms_matrix.csv --export-json dms_report.json
 ```
 
-### 5. Run Model Context Protocol (MCP) Server
-For integration into autonomous LLM agents (Claude Desktop, Cursor, Gemini):
+#### D. Zero-Shot Structural Contact Prediction (`contacts`)
+Compute epistatic residue couplings using multi-head attention contact maps (APC-corrected) and identify putative disulfide bonds:
 ```bash
-cargo run --release --bin codon-infer-mcp
+codon-infer contacts --fasta proteins.fasta --export-csv contacts.csv --export-json contacts.json
 ```
 
-MCP tool exposed:
-* `generate_protein`: Generates *de novo* or extended sequences given a `prompt`, `temperature`, and `max_new_tokens`.
+#### E. Hardware & Biological Benchmark Suite (`benchmark`)
+Execute the full hardware stress and biological validation suite:
+```bash
+codon-infer benchmark --suite full
+```
+
+Available suites:
+* `simd`: AVX2+FMA vs AVX1 numerical parity and matrix-vector microbenchmarks.
+* `mlm`: Evolutionary pseudo-perplexity and wild-type vs disruptive mutation penalties.
+* `dms`: Deep mutational scanning calibration on bacterial catalytic peptidase motifs.
+* `contacts`: Structural contact prediction and Cys-Cys spatial proximity scoring.
+* `inpainting`: Multi-position bidirectional masked sequence infilling.
+* `stress`: 10,000-token continuous inference cache-thrashing stability test.
+* `scaling`: Context length scaling ($L = 32 \to 256$) memory and latency benchmark.
 
 ---
 
-## 🛠️ CLI Options
+## 🛠️ Unified CLI Options Reference
 
-### Inference Mode
-| Argument | Description | Default |
+### Global Flags
+| Option | Description | Default |
 | :--- | :--- | :--- |
-| `--model <PATH>` | Path to raw binary parameters | `esm2_weights.bin` (or `esm2_pesos.bin`) |
-| `--sequence <STR>` | Starting amino acid prompt | `"M"` |
-| `--temperature <FLOAT>` | Sampling temperature (0.0 = greedy argmax, >0.0 = stochastic) | `0.7` |
-| `--max-tokens <USIZE>` | Maximum number of new amino acid residues to generate | Full context (up to 1,024) |
-| `--seed <U64>` | Seed for XORShift64 PRNG | Dynamic (system clock entropy) |
+| `-h`, `--help` | Display help banner with subcommand guide | - |
+| `-V`, `--version` | Display version and active SIMD vector engine | - |
+| `--model <PATH>` | Custom ESM-2 raw FP32 weights binary | `esm2_weights.bin` |
+| `--color <auto\|always\|never>` | Control ANSI TrueColor terminal styling | `auto` |
+| `--no-color` | Strictly disable ANSI terminal escapes (NO_COLOR standard) | `false` |
 
-### Benchmark Mode
-| Argument | Description | Default |
-| :--- | :--- | :--- |
-| `benchmark` | Triggers the automated stress and functional validation suite | - |
-| `--suite <STR>` | Benchmark suite to run (`full`, `simd`, `mlm`, `inpainting`, `stress`) | `"full"` |
-| `--model <PATH>` | Custom weights file path | `esm2_weights.bin` |
+### Pipeline Options
+| Option | Applicable Subcommands | Description | Default |
+| :--- | :--- | :--- | :--- |
+| `--sequence <STR>` | `generate`, `inpaint`, `dms`, `contacts` | Direct input amino acid sequence | `"M"` |
+| `--fasta <PATH>` | `inpaint`, `dms`, `contacts` | Path to FASTA file (or `-` for stdin) | - |
+| `--export-csv <PATH>`| `dms`, `contacts` | Destination path for rectangular matrix / table | - |
+| `--export-json <PATH>`| `dms`, `contacts` | Destination path for structured JSON analysis | - |
+| `--window <USIZE>` | `dms` | Sliding window context size for long proteins | `128` |
+| `--stride <USIZE>` | `dms` | Sliding window stride step size | `64` |
+| `--temperature <F32>`| `generate` | Sampling temperature (0.0 = greedy argmax) | `0.7` |
+| `--max-tokens <USIZE>`| `generate` | Maximum new residues to generate | `1024` |
+| `--suite <STR>` | `benchmark` | Benchmark suite to execute | `"full"` |
 
 ---
 
@@ -245,11 +251,16 @@ codon-infer/
 ├── .cargo/
 │   └── config.toml         # Native CPU optimization flags (-C target-cpu=native)
 ├── .gitignore              # Clean repository filter (build artifacts & backups ignored)
-├── Cargo.toml              # Zero-dependency specification (v1.2.0, edition 2024)
+├── Cargo.toml              # Zero-dependency specification (v1.3.0, edition 2024)
 ├── esm2_weights.bin        # ESM-2 8M FP32 weights (7.51M parameters, ~30 MB)
 ├── src/
 │   ├── lib.rs              # Core engine: dual SIMD matmul, RoPE split-half, Q8_0, EsmLMHead
-│   ├── main.rs             # CLI binary entrypoint & benchmarking reporter
+│   ├── main.rs             # CLI dispatcher & subcommand argument parser
+│   ├── ui.rs               # TrueColor ANSI palettes, thermal gradients & progress bar
+│   ├── fasta.rs            # Zero-copy multi-FASTA & stream sequence reader
+│   ├── export.rs           # Publication-grade CSV and JSON data serializers
+│   ├── pipeline.rs         # Sliding-window DMS, contacts, and inpainting drivers
+│   ├── benchmark.rs        # Automated bioinformatic & hardware stress suite
 │   ├── mcp.rs              # Zero-dependency stdio JSON-RPC MCP server
 │   └── mcp_main.rs         # Standalone MCP server executable entrypoint
 ├── AUDIT_REPORT.md         # Comprehensive architectural & mathematical audit report
