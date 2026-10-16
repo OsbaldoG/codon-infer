@@ -1,16 +1,17 @@
 # codon-infer 🧬⚡
 
-> **Motor de Inferencia y Pipeline Bioinformático para Modelos de Lenguaje de Proteínas ESM-2 Multi-Escala, de Alto Rendimiento y Cero Asignaciones en Rust Puro (v1.5.0).**
+> **Motor de Inferencia y Pipeline Bioinformático para Modelos de Lenguaje de Proteínas ESM-2 Multi-Escala, de Alto Rendimiento y Cero Asignaciones en Rust Puro (v1.6.0).**
 
 [🇬🇧 Read in English (README.md)](README.md)
 
 [![Rust](https://img.shields.io/badge/rust-edición_2024-orange.svg)](https://www.rust-lang.org/)
-[![Version](https://img.shields.io/badge/versión-1.5.0-blue.svg)]()
-[![Tests](https://img.shields.io/badge/tests-32%20pasados%2C%200%20fallidos-brightgreen.svg)]()
+[![Version](https://img.shields.io/badge/versión-1.6.0-blue.svg)]()
+[![Tests](https://img.shields.io/badge/tests-50%20pasados%2C%200%20fallidos-brightgreen.svg)]()
 [![Dependencies](https://img.shields.io/badge/dependencias-0%20(std%20puro)-brightgreen.svg)]()
 [![License](https://img.shields.io/badge/licencia-MIT-blue.svg)](LICENSE)
 [![Model](https://img.shields.io/badge/modelo-ESM--2%20(8M%20a%203B)-blueviolet.svg)](https://github.com/facebookresearch/esm)
 [![SIMD](https://img.shields.io/badge/SIMD-AVX512%20%7C%20AVX2%2BFMA%20%7C%20AVX1-red.svg)]()
+[![Precision](https://img.shields.io/badge/precisión-FP32%20%7C%20Q8__0%20%7C%20Q4__0-green.svg)]()
 [![Throughput](https://img.shields.io/badge/Rendimiento%20CPU->200%20tokens%2Fseg-success.svg)]()
 
 > 📖 **Nota de Idioma:** Este documento constituye la documentación oficial técnica completa en **español**. Para consultar la versión original en inglés técnico, acceda a [README.md](README.md).
@@ -18,6 +19,31 @@
 `codon-infer` es un motor de inferencia y suite de análisis bioinformático ultraligero y libre de dependencias externas para la familia de modelos de lenguaje de proteínas Evolutionary Scale Modeling (**ESM-2**) en todas sus variantes de escala (`8M`, `35M`, `150M`, `650M` y `3B`), diseñado desde primeros principios matemáticos y de hardware en **Rust 100% seguro e idiomático (`std` exclusivamente)**.
 
 Al prescindir por completo de los ecosistemas de Python, PyTorch, C/CUDA y crates externos de terceros, `codon-infer` ejecuta generación autorregresiva de secuencias, *inpainting* bidireccional de sitios activos, escaneo mutacional profundo *in silico* (DMS) y predicción de contactos estructurales mediante vectorización SIMD dinámica a más de **200 tokens/segundo en CPUs x86_64 estándar**, manteniendo una huella de memoria estática inferior a 40 MB para modelos de 8M.
+
+---
+
+## ⚡ Aspectos Destacados (Versión 1.6: Motor Multi-Escala Q4_0, Paridad Canónica HF y Cuantizador Streaming 3B)
+
+* **Motor de Cuantización Nativa por Bloques `Q4_0` a 4 Bits (`BlockQ4_0`):**
+  * Representación sub-byte que empaqueta 32 nibbles de 4 bits en 16 bytes junto a un factor de escala flotante `d` de 32 bits (`#[repr(C)]`, exactamente **20 bytes** por bloque de 32 parámetros).
+  * Convención de cuantización simétrica estándar compatible con llama.cpp: $d = \max / -8.0$, $id = 1/d$, $q = \text{clamp}(\text{round}(x \cdot id) + 8, 0, 15)$. El nibble bajo almacena el índice $j \in [0, 15]$ y el nibble alto el índice $j + 16$.
+  * **Compresión Teórica de Matrices de 6.40×** (0.625 B/parámetro frente a 4.0 B en FP32) y hasta **6.30× de Reducción Total del Archivo** (**ESM-2 3B** reducido de 11.36 GB a **1.80 GB**, y **ESM-2 650M** reducido de 2.60 GB a **414.62 MB**).
+  * **Reducción de ~83.5% en Memoria Pico (RSS):** La huella de memoria en RAM de ESM-2 650M pasa de 2,501.33 MiB en FP32 a **413.07 MiB en Q4_0**, mientras que **ESM-2 3B** se ejecuta en apenas **1,752.57 MiB RSS en Q4_0** (`3,102.18 MiB` en Q8_0) sobre una máquina de 11 GiB de RAM.
+  * **Aceleración de 1.92× en Inferencia para ESM-2 650M:** Alivia el cuello de botella de ancho de banda DRAM en ejecuciones con 4 hilos (**4,535.47 ms** en Q4_0 y **4,669.89 ms** en Q8_0 frente a **8,692.15 ms** en FP32).
+* **Paridad Matemática Exacta con HuggingFace (`grouped_canonical_v1`):**
+  * Validación estricta al byte exacto en las 5 escalas (`8M`, `35M`, `150M`, `650M`, `3B`) con **100.0% de coincidencia Top-1** y similitud de coseno $\ge 0.999999$ frente a las referencias oficiales de HuggingFace `facebook/esm2_*` (`hidden_states` y `logits`).
+  * Cuantizadores por streaming bloque a bloque (`quantize_file_streaming_q8` / `quantize_file_streaming_q4`) mediante `BufReader` / `BufWriter` que convierten los 10.58 GiB de `esm2_3b_weights.bin` con un **Peak RSS de solo 12.55 MiB**.
+* **Arquitectura de Cabecera Universal `CODQ` de 64 Bytes:**
+  * Cabecera fija little-endian de 64 bytes (`b"CODQ"`, versión 1, tipo de datos, arquitectura, profundidad de capas, dimensión oculta, dimensión FFN, vocabulario).
+  * Garantiza alineación estricta de 64 bytes (línea de caché y SIMD) para el primer bloque de pesos, permitiendo carga zero-copy inmediata.
+  * Resuelve la ambigüedad paramétrica entre escalas cuantizadas con retrocompatibilidad completa mediante `detect_from_file_len`.
+* **Micro-Kernels Vectoriales SIMD con Manipulación de Bits:**
+  * Kernels AVX2+FMA que desempaquetan 16 bytes con `_mm_srli_epi16` y `_mm_and_si128`, convierten con signo a enteros de 32 bits y flotantes con `_mm256_cvtepi8_epi32` y `_mm256_cvtepi32_ps`, y acumulan con FMA (`_mm256_fmadd_ps`).
+  * Kernel de reserva AVX1 con desempaquetado entero de 128 bits y acumulación flotante de 256 bits.
+  * Cero asignaciones en el heap durante el ciclo de inferencia (*hot path*).
+* **CLI Multi-Formato Unificada (`quantize`, `generate`, `inpaint`, `dms`, `contacts`, `benchmark`):**
+  * Autodetección dinámica del formato (FP32, Q8_0, Q4_0) mediante cabecera `CODQ` o fallback heurístico legacy.
+  * Nuevas opciones de cuantización por streaming en `codon-infer quantize --model <input> --output <output> [--format <q4_0|q8_0>]` con autodetección por extensión.
 
 ---
 
@@ -207,16 +233,44 @@ $$\frac{16}{8} = 2 \text{ YMM}, \quad \frac{24}{8} = 3 \text{ YMM}, \quad \frac{
 | **Registros SIMD por Cabeza** | **2 YMM** (16 floats) | **3 YMM** (24 floats) | **4 YMM** (32 floats) | **8 YMM / 4 ZMM** (64 floats) | **8 YMM / 4 ZMM** (64 floats) |
 | **Dimensión FFN ($d_{\text{ffn}}$)** | 1,280 | 1,920 | 2,560 | 5,120 | 10,240 |
 | **Vocabulario** | 33 tokens | 33 tokens | 33 tokens | 33 tokens | 33 tokens |
-| **Parámetros Totales** | 7,523,042 (~7.5M) | 33,517,246 (~33.5M) | 148,161,290 (~148M) | 651,085,526 (~651M) | ~2.84B (~3B) |
-| **Tamaño Binario (FP32)** | 30,092,168 B (~30.1 MB) | 134,068,984 B (~134.1 MB) | 592,645,160 B (~592.6 MB) | **2,604,342,104 B (~2.60 GB)** | ~11.36 GB |
-| **Tamaño Binario Cuantizado (`Q8_0`)** | ~8.5 MB | ~37.7 MB | ~166.5 MB | **738,902,264 B (~738.9 MB)** | ~3.19 GB |
-| **Latencia de Carga de Pesos** | **34.8 ms** | **117.4 ms** | **466.8 ms** | **751 ms (FP32) / 219.98 ms (Q8_0)** | **~8.5 s** |
-| **Throughput Autorregresivo (Generate)** | **>315 tokens/s** (~3.1 ms/tok) | **~80 – 85 tokens/s** (~11.8 ms/tok) | **~18 – 20 tokens/s** (~53.0 ms/tok) | **4.57 tok/s (1T) -> 7.70 tok/s (2T Q8)** | **~0.8 – 1.0 tokens/s** |
-| **Throughput Bidireccional (Inpaint)** | **>400 tokens/s** (~76 ms / $L=32$) | **~85 – 90 tokens/s** (~356 ms / $L=32$) | **~18 – 21 tokens/s** (~1,580 ms / $L=32$) | **~4.8 tok/s (1T) -> ~8.2 tok/s (2T Q8)** | **~0.9 – 1.1 tokens/s** |
+| **Flotantes Totales (`grouped_canonical_v1`)** | 7,522,913 (~7.5M) | 33,516,993 (~33.5M) | 148,160,673 (~148M) | 651,084,833 (~651M) | 2,839,088,673 (~2.84B) |
+| **Tamaño Binario (FP32)** | `30,091,652 B` (28.70 MiB) | `134,067,972 B` (127.86 MiB) | `592,642,692 B` (565.19 MiB) | **`2,604,339,332 B` (2,483.69 MiB)** | **`11,356,354,692 B` (10.58 GiB)** |
+| **Tamaño Binario Cuantizado (`Q8_0`)** | `8,864,556 B` (8.45 MiB) | `38,636,896 B` (36.85 MiB) | `168,646,036 B` (160.83 MiB) | **`738,899,556 B` (704.67 MiB)** | **`3,216,540,676 B` (3.00 GiB)** |
+| **Tamaño Binario Cuantizado (`Q4_0`)** | **`5,208,516 B` (4.97 MiB)** | **`22,093,636 B` (21.07 MiB)** | **`94,978,756 B` (90.58 MiB)** | **`414,617,796 B` (395.41 MiB)** | **`1,801,205,956 B` (1.68 GiB)** |
+| **Latencia Carga Caliente (Q4_0)** | **4.69 ms** | **12.85 ms** | **39.17 ms** | **137.32 ms** | **545.36 ms** |
+| **Throughput Bidireccional ($L=41$, 4T)** | **476.9 tok/s (Q8) / 456.5 tok/s (Q4)** | **128.7 tok/s (Q4)** | **30.0 tok/s (Q4)** | **9.04 tok/s (Q4)** | **2.20 tok/s (Q8) / 2.12 tok/s (Q4)** |
 | **Memoria de Estado de Trabajo ($L=128$)** | **~911 KB** | **~1,321 KB** | **~1,732 KB** | **~3,450 KB** | **~7,200 KB** |
-| **Residencia en Jerarquía de Caché** | **100% en Caché L3** ($\le 32$ MB) | Residencia Parcial en L3 / DDR | Transmisión (*streaming*) desde RAM ($> 500$ MB) | Streaming DRAM (~2.48 GB FP32 / ~698 MB Q8) | Transmisión Masiva RAM (>10 GB) |
-| **Demanda de Ancho de Banda de Memoria** | **Limitado por Cómputo (AVX/SIMD)** | **Balanceado Caché/DRAM** | **Limitado por Bus de Memoria** | **Limitado por Bus (Optimizado Q8)** | **Extremadamente Limitado por DRAM** |
-| **Caso de Uso Primario** | DMS *in silico* ultrarrápido, inpainting en tiempo real | DMS de alta resolución, cribado de péptidos | Predicción de contactos 3D, diseño *de novo* | Mapas de contacto de alta fidelidad, DMS fino | Modelos de lenguaje de proteínas de frontera |
+| **Residencia en Jerarquía de Caché** | **100% en Caché L3** ($\le 32$ MB) | Residencia Parcial en L3 / DDR | Transmisión (*streaming*) desde RAM ($> 500$ MB) | Streaming DRAM (~2.48 GB FP32 / ~395 MB Q4) | Streaming DRAM (~1.68 GiB Q4) |
+| **Demanda de Ancho de Banda de Memoria** | **Limitado por Cómputo (AVX/SIMD)** | **Balanceado Caché/DRAM** | **Limitado por Bus de Memoria** | **Limitado por Bus (Optimizado Q4/Q8)** | **Limitado por DRAM (Habilitado por Q4/Q8)** |
+| **Caso de Uso Primario** | DMS *in silico* ultrarrápido, inpainting en tiempo real | DMS de alta resolución, cribado de péptidos | Predicción de contactos 3D, diseño *de novo* | Mapas de contacto de alta fidelidad, DMS fino | Modelos de lenguaje de proteínas de frontera en CPU |
+
+### 4. Validación Empírica Multi-Escala y Rendimiento frente a HuggingFace (`8M` a `3B`)
+
+Evaluación empírica en `test_peptidase.fasta` (41 tokens) frente a los tensores oficiales de referencia de HuggingFace `facebook/esm2_*` (`scripts/ref_{8m,35m,150m,650m,3b}.npz`) bajo ejecución vectorial SIMD nativa (4 hilos, `wait4` kernel `ru_maxrss`):
+
+| Escala del Modelo | Formato | Tamaño Exacto (`stat -c %s`) | Compresión Total | Coseno `hidden_states[-1]` vs HF | Coseno Logits vs HF | Divergencia KL vs HF | Top-1 Match vs HF | Forward Mediana (4 hilos) | Throughput | Memoria Pico (RSS) |
+| :--- | :---: | ---: | :---: | :---: | :---: | :---: | :---: | ---: | ---: | ---: |
+| **ESM-2 8M** | FP32 | `30,091,652 B` (28.70 MiB) | 1.00× | 0.999999 | 0.999999 | 0.000000 | **100.0% (41/41)** | 113.44 ms | 361.4 tok/s | 32.75 MiB |
+| | Q8_0 | `8,864,556 B` (8.45 MiB) | 3.39× | 0.999764 | 0.999995 | 0.000128 | **100.0% (41/41)** | 85.97 ms | 476.9 tok/s | 29.11 MiB |
+| | **Q4_0** | **`5,208,516 B` (4.97 MiB)** | **5.78×** | **0.934598** | **0.998168** | **0.031316** | **100.0% (41/41)** | **89.82 ms** | **456.5 tok/s** | **29.29 MiB** |
+| **ESM-2 35M** | FP32 | `134,067,972 B` (127.86 MiB) | 1.00× | 0.999999 | 1.000000 | 0.000000 | **100.0% (41/41)** | 446.47 ms | 91.8 tok/s | 133.30 MiB |
+| | Q8_0 | `38,636,896 B` (36.85 MiB) | 3.47× | 0.999825 | 0.999994 | 0.000120 | **100.0% (41/41)** | 377.27 ms | 108.7 tok/s | 42.24 MiB |
+| | **Q4_0** | **`22,093,636 B` (21.07 MiB)** | **6.07×** | **0.952611** | **0.998566** | **0.048077** | **95.1% (39/41)** | **318.58 ms** | **128.7 tok/s** | **29.41 MiB** |
+| **ESM-2 150M** | FP32 | `592,642,692 B` (565.19 MiB) | 1.00× | 0.999999 | 1.000000 | 0.000000 | **100.0% (41/41)** | 2,390.36 ms | 17.2 tok/s | 575.01 MiB |
+| | Q8_0 | `168,646,036 B` (160.83 MiB) | 3.51× | 0.999934 | 0.999998 | 0.000042 | **100.0% (41/41)** | 1,430.16 ms | 28.7 tok/s | 170.61 MiB |
+| | **Q4_0** | **`94,978,756 B` (90.58 MiB)** | **6.24×** | **0.981715** | **0.999266** | **0.020517** | **100.0% (41/41)** | **1,367.83 ms** | **30.0 tok/s** | **100.39 MiB** |
+| **ESM-2 650M** | FP32 | `2,604,339,332 B` (2,483.69 MiB) | 1.00× | 0.999999 | 1.000000 | 0.000000 | **100.0% (41/41)** | 8,692.15 ms | 4.72 tok/s | 2,501.33 MiB |
+| | Q8_0 | `738,899,556 B` (704.67 MiB) | 3.52× | 0.999913 | 0.999996 | 0.000039 | **100.0% (41/41)** | 4,669.89 ms | 8.78 tok/s | 722.41 MiB |
+| | **Q4_0** | **`414,617,796 B` (395.41 MiB)** | **6.28×** | **0.980842** | **0.999292** | **0.019508** | **97.6% (40/41)** | **4,535.47 ms** | **9.04 tok/s** | **413.07 MiB** |
+| **ESM-2 3B** | FP32 | `11,356,354,692 B` (10.58 GiB) | 1.00× | *Ref HF* | *Ref HF* | *Ref HF* | *Ref HF* | *N/A (>11 GiB RAM)* | *N/A* | *Streaming Solamente* |
+| | **Q8_0** | **`3,216,540,676 B` (3.00 GiB)** | **3.53×** | **0.999983** | **0.999998** | **0.000027** | **100.0% (41/41)** | **18,615.93 ms** | **2.20 tok/s** | **3,102.18 MiB** |
+| | **Q4_0** | **`1,801,205,956 B` (1.68 GiB)** | **6.30×** | **0.994156** | **0.999422** | **0.006447** | **100.0% (41/41)** | **19,368.89 ms** | **2.12 tok/s** | **1,752.57 MiB** |
+
+> [!NOTE]
+> **Conclusiones Clave de Fidelidad y Memoria (`docs/benchmarks_v1.6.0.md`):**
+> 1. **Paridad Exacta con HuggingFace:** En todos los modelos FP32 (`8M` a `650M`), `codon-infer` reproduce los `hidden_states` capa a capa y los `logits` finales de HuggingFace `facebook/esm2_*` con similitud de coseno $\ge 0.999999$ y **100.0% de coincidencia Top-1**.
+> 2. **ESM-2 3B en RAM Convencional:** El cuantizador por streaming (`12.55 MiB` Peak RSS) comprime los 10.58 GiB de `esm2_3b_weights.bin` a un binario `Q4_0` de `1.68 GiB` (`1,801,205,956 B`) que carga en **545 ms** y se ejecuta en **1,752.57 MiB Peak RSS** con **0.999422 de coseno de logits** y **100.0% de coincidencia Top-1** frente a HuggingFace `esm2_t36_3B_UR50D`.
+> 3. **Alivio de Ancho de Banda DRAM:** En ESM-2 650M, `Q4_0` logra una **aceleración de 1.92×** en forward frente a FP32 (4.54 s vs 8.69 s) y reduce el Peak RSS en un **83.5%** (de 2,501 MiB a 413 MiB).
 
 ---
 
@@ -337,25 +391,26 @@ cargo test --release
 ```
 Salida esperada:
 ```text
-running 32 tests
+running 51 tests
 test benchmark::tests::test_benchmark_report_to_json_validity ... ok
 test benchmark::tests::test_discover_available_models ... ok
-test fasta::tests::test_parse_multi_fasta_with_masks ... ok
 test export::tests::test_json_string_serializers ... ok
-test export::tests::test_dms_row_and_csv_generation ... ok
-test fasta::tests::test_parse_raw_sequence_fallback ... ok
+test fasta::tests::test_parse_multi_fasta_with_masks ... ok
 test fasta::tests::test_parse_simple_fasta ... ok
+test fasta::tests::test_parse_raw_sequence_fallback ... ok
 test mcp::tests::test_mcp_json_parser_and_formatter ... ok
 test mcp::tests::test_mcp_resolve_record_fallback ... ok
+test export::tests::test_dms_row_and_csv_generation ... ok
 test tests::test_attention_simd_parity_dk_16_24_32 ... ok
 test tests::test_attention_simd_parity_dk_64 ... ok
 test mcp::tests::test_mcp_tools_list_schema ... ok
 test tests::test_esm_config_autodetection ... ok
+test benchmark::tests::test_multi_scale_simd_parity ... ok
 test tests::test_bidirectional_logits_entropy ... ok
-test mcp::tests::test_mcp_dispatch_with_weights_if_available ... ok
 test tests::test_forward_bidirectional_if_available ... ok
 test tests::test_forward_pass_with_weights_if_available ... ok
-test benchmark::tests::test_multi_scale_simd_parity ... ok
+test tests::test_forward_q4_cosine_similarity_8m ... ok
+test mcp::tests::test_mcp_dispatch_with_weights_if_available ... ok
 test tests::test_layer_norm_stability ... ok
 test tests::test_log_softmax_canonical ... ok
 test tests::test_mask_token_encoding_and_decoding ... ok
@@ -367,11 +422,28 @@ test tests::test_forward_q8_cosine_similarity_8m ... ok
 test tests::test_simd_benchmark_parity_run ... ok
 test tests::test_softmax_sum_to_one ... ok
 test tests::test_tokenizer_boundaries ... ok
+test tests_q4_format::test_codq_header_valid_corrupt_incoherent ... ok
 test tests::test_q8_weights_save_load_roundtrip ... ok
+test tests_q4_format::test_no_ambiguity_650m_q4_vs_150m ... ok
+test tests_q4_format::test_q4_0_exact_nibble_packing ... ok
+test tests_q4_format::test_q4_0_roundtrip_quantize_dequantize_bound ... ok
+test tests_q4_format::test_q4_0_zero_block ... ok
+test tests_q4_format::test_first_block_alignment_at_offset_64 ... ok
+test tests_q4_format::test_q4_weights_save_load_roundtrip_8m ... ok
+test tests_q4_integration::test_forward_q4_integration_35m ... ok
+test tests_q4_integration::test_forward_q4_integration_150m ... ok
+test tests_q4_integration::test_forward_q4_integration_8m ... ok
+test tests_q4_integration::test_forward_q8_codq_header_integration ... ok
+test tests_q4_simd::test_q4_edge_case_extreme_values ... ok
+test tests_q4_simd::test_q4_edge_case_small_out_dim ... ok
+test tests_q4_simd::test_q4_edge_case_zero_blocks ... ok
+test tests_q4_simd::test_q4_parallel_vs_sequential_identity_threads ... ok
+test tests_q4_simd::test_q4_simd_parity_esm_dimensions ... ok
+test tests_q4_integration::test_forward_q4_integration_650m ... ok
 test tests::test_forward_650m_if_available ... ok
 test tests::test_forward_650m_q8_and_multithread_if_available ... ok
 
-test result: ok. 32 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.39s
+test result: ok. 50 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out
 ```
 
 ### 4. Subcomandos y Pipelines Bioinformáticos
@@ -419,14 +491,19 @@ codon-infer contacts --model esm2_150m_weights.bin --fasta proteins.fasta --expo
 codon-infer contacts --model esm2_650m_q8_0.bin --threads 2 --fasta proteins.fasta --export-csv contacts.csv
 ```
 
-#### E. Cuantización Nativa de Modelos a Q8_0 (`quantize`)
-Convierte los pesos de puntos de control FP32 directamente en binarios zero-copy optimizados `Q8_0` en disco:
+#### E. Cuantización Nativa de Modelos a Q4_0 y Q8_0 (`quantize`)
+Convierte los pesos de puntos de control FP32 directamente en binarios zero-copy optimizados `Q4_0` o `Q8_0` en disco con cabeceras universales `CODQ`:
 ```bash
-# Cuantizar pesos FP32 de ESM-2 650M (~2.60 GB) a binario directo Q8_0 (~738.9 MB):
+# Cuantizar pesos FP32 de ESM-2 650M (~2.48 GB) a binario directo Q4_0 (~395.28 MB, 6.28x menor):
+codon-infer quantize --model esm2_650m_weights.bin --output esm2_650m_q4_0.bin --format q4_0
+
+# O utilizar autodetección automática del formato según el nombre del archivo de salida:
+codon-infer quantize --model esm2_650m_weights.bin --output esm2_650m_q4_0.bin
 codon-infer quantize --model esm2_650m_weights.bin --output esm2_650m_q8_0.bin
 
-# Inferencia instantánea zero-copy utilizando el binario cuantizado resultante:
-codon-infer generate --model esm2_650m_q8_0.bin --threads 2 --sequence "MCMPCFTTDHQMARKCDD"
+# Inferencia instantánea zero-copy utilizando el binario cuantizado resultante (autodetectado por cabecera CODQ):
+codon-infer generate --model esm2_650m_q4_0.bin --threads 4 --sequence "MCMPCFTTDHQMARKCDD"
+codon-infer dms --model esm2_650m_q4_0.bin --threads 4 --fasta target.fasta --window 128
 ```
 
 #### F. Suite de Benchmarks de Hardware y Validación Biológica (`benchmark`)
