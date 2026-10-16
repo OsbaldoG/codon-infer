@@ -765,51 +765,57 @@ fn main() -> io::Result<()> {
 
             if is_q4 {
                 println!("┌────────────────────────────────────────────────────────────────────────┐");
-                println!("│ CODON-INFER: MOTOR DE CUANTIZACIÓN ESTRICTA Q4_0                       │");
+                println!("│ CODON-INFER: MOTOR DE CUANTIZACIÓN STREAMING Q4_0                      │");
                 println!("└────────────────────────────────────────────────────────────────────────┘");
                 println!("  -> Archivo fuente FP32: '{}'", input_model);
                 println!("  -> Archivo destino Q4_0: '{}'", output_path);
                 let t0 = Instant::now();
                 let config = EsmConfig::detect_from_file(&input_model)?;
                 println!("  -> Arquitectura detectada: {}", config.model_name());
-                let fp32 = EsmWeights::from_file(&input_model, &config)?;
-                let load_ms = t0.elapsed().as_secs_f64() * 1000.0;
-                println!("  -> Pesos cargados en {:.1} ms. Cuantizando tensores a bloques Q4_0 (nibbles 4-bit)...", load_ms);
-                let t_q = Instant::now();
-                let q4 = fp32.quantize_q4();
-                let quant_ms = t_q.elapsed().as_secs_f64() * 1000.0;
-                println!("  -> Cuantización completada en {:.1} ms. Serializando con cabecera CODQ a disco...", quant_ms);
-                let t_s = Instant::now();
-                q4.save_to_file(&output_path, &config)?;
-                let save_ms = t_s.elapsed().as_secs_f64() * 1000.0;
-                let file_size = std::fs::metadata(&output_path)?.len();
-                println!("  -> Guardado exitoso: {} bytes ({:.2} MB) en {:.1} ms.", 
-                    file_size, file_size as f64 / 1_048_576.0, save_ms);
+                let file_size = match codon_infer::quantize_file_streaming_q4(&input_model, &output_path, &config) {
+                    Ok(sz) => sz,
+                    Err(_) => {
+                        let fp32 = EsmWeights::from_file(&input_model, &config)?;
+                        let q4 = fp32.quantize_q4();
+                        q4.save_to_file(&output_path, &config)?;
+                        std::fs::metadata(&output_path)?.len()
+                    }
+                };
+                let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                println!(
+                    "  -> Streaming Q4_0 completado: {} bytes ({:.2} MB) en {:.1} ms.",
+                    file_size,
+                    file_size as f64 / 1_048_576.0,
+                    total_ms
+                );
                 println!("==========================================================================");
                 println!("  ESTADO: BINARIO Q4_0 GENERADO Y VALIDADO EN DISCO                      ");
                 println!("==========================================================================\n");
             } else {
                 println!("┌────────────────────────────────────────────────────────────────────────┐");
-                println!("│ CODON-INFER: MOTOR DE CUANTIZACIÓN ESTRICTA Q8_0                       │");
+                println!("│ CODON-INFER: MOTOR DE CUANTIZACIÓN STREAMING Q8_0                      │");
                 println!("└────────────────────────────────────────────────────────────────────────┘");
                 println!("  -> Archivo fuente FP32: '{}'", input_model);
                 println!("  -> Archivo destino Q8_0: '{}'", output_path);
                 let t0 = Instant::now();
                 let config = EsmConfig::detect_from_file(&input_model)?;
                 println!("  -> Arquitectura detectada: {}", config.model_name());
-                let fp32 = EsmWeights::from_file(&input_model, &config)?;
-                let load_ms = t0.elapsed().as_secs_f64() * 1000.0;
-                println!("  -> Pesos cargados en {:.1} ms. Cuantizando tensores a bloques Q8_0...", load_ms);
-                let t_q = Instant::now();
-                let q8 = fp32.quantize_q8();
-                let quant_ms = t_q.elapsed().as_secs_f64() * 1000.0;
-                println!("  -> Cuantización completada en {:.1} ms. Serializando con cabecera CODQ a disco...", quant_ms);
-                let t_s = Instant::now();
-                q8.save_to_file_with_header(&output_path, &config)?;
-                let save_ms = t_s.elapsed().as_secs_f64() * 1000.0;
-                let file_size = std::fs::metadata(&output_path)?.len();
-                println!("  -> Guardado exitoso: {} bytes ({:.2} MB) en {:.1} ms.", 
-                    file_size, file_size as f64 / 1_048_576.0, save_ms);
+                let file_size = match codon_infer::quantize_file_streaming_q8(&input_model, &output_path, &config) {
+                    Ok(sz) => sz,
+                    Err(_) => {
+                        let fp32 = EsmWeights::from_file(&input_model, &config)?;
+                        let q8 = fp32.quantize_q8();
+                        q8.save_to_file_with_header(&output_path, &config)?;
+                        std::fs::metadata(&output_path)?.len()
+                    }
+                };
+                let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                println!(
+                    "  -> Streaming Q8_0 completado: {} bytes ({:.2} MB) en {:.1} ms.",
+                    file_size,
+                    file_size as f64 / 1_048_576.0,
+                    total_ms
+                );
                 println!("==========================================================================");
                 println!("  ESTADO: BINARIO Q8_0 GENERADO Y VALIDADO EN DISCO                      ");
                 println!("==========================================================================\n");

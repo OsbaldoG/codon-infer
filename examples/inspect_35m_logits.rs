@@ -47,8 +47,7 @@ fn main() {
     let mut p_fp = vec![0.0f32; 33];
     let mut p_q4 = vec![0.0f32; 33];
 
-    for t in 0..seq_len {
-        let tok = tokens[t];
+    for (t, &tok) in tokens.iter().enumerate().take(seq_len) {
         let tok_ch = id_to_char(tok);
 
         let slice_fp = &state_fp.logits[t * 33..(t + 1) * 33];

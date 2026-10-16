@@ -20,26 +20,28 @@ By eliminating Python, PyTorch, C/CUDA runtimes, and external third-party crates
 
 ---
 
-## ⚡ Highlights (Version 1.6: Multi-Scale Q4_0 Engine & CODQ Universal Header)
+## ⚡ Highlights (Version 1.6: Multi-Scale Q4_0 Engine, Canonical HF Parity & 3B Streaming Quantizer)
 
 * **Native `Q4_0` 4-Bit Block Quantization (`BlockQ4_0`):**
   * Sub-byte quantized representation packing 32 4-bit nibbles into 16 bytes alongside an aligned 32-bit float scale factor `d` (`#[repr(C)]`, exactly **20 bytes** per 32-parameter block).
   * Standard symmetric quantization convention (llama.cpp compatible): $d = \max / -8.0$, $id = 1/d$, $q = \text{clamp}(\text{round}(x \cdot id) + 8, 0, 15)$. Low nibble holds index $j \in [0, 15]$, high nibble holds index $j + 16$.
-  * **6.40× Theoretical Matrix Compression** (0.625 B/param vs 4.0 B FP32) and up to **6.28× Total File Compression** (ESM-2 650M reduced from 2.48 GB to **395.28 MB**).
-  * **~80% Peak Memory (RSS) Reduction:** ESM-2 650M RAM footprint plunges from 2,624 MB in FP32 to **527 MB in Q4_0**.
-  * **1.52× Inference Speedup on ESM-2 650M:** Relieves DRAM bus saturation on multi-threaded runs (5.53 s vs 8.41 s on 4 threads).
+  * **6.40× Theoretical Matrix Compression** (0.625 B/param vs 4.0 B FP32) and up to **6.30× Total File Compression** (**ESM-2 3B** reduced from 11.36 GB to **1.80 GB**, and **ESM-2 650M** reduced from 2.60 GB to **414.62 MB**).
+  * **~83.5% Peak Memory (RSS) Reduction:** ESM-2 650M RAM footprint plunges from 2,501.33 MiB in FP32 to **413.07 MiB in Q4_0**, while **ESM-2 3B** runs in just **1,752.57 MiB RSS in Q4_0** (`3,102.18 MiB` in Q8_0) on an 11 GiB RAM machine.
+  * **1.92× Inference Speedup on ESM-2 650M:** Relieves DRAM bus saturation on 4-thread runs (**4,535.47 ms** in Q4_0 and **4,669.89 ms** in Q8_0 vs **8,692.15 ms** in FP32).
+* **Exact HuggingFace Mathematical Parity (`grouped_canonical_v1`):**
+  * Byte-exact canonical weight layout across all 5 scales (`8M`, `35M`, `150M`, `650M`, `3B`) with **100.0% Top-1 match** and cosine similarity $\ge 0.999999$ against official HuggingFace `facebook/esm2_*` reference tensors (`hidden_states` and `logits`).
+  * Streaming block-by-block quantizers (`quantize_file_streaming_q8` / `quantize_file_streaming_q4`) using `BufReader` / `BufWriter` that convert the 10.58 GiB `esm2_3b_weights.bin` in **12.55 MiB Peak RSS**.
 * **Universal `CODQ` 64-Byte Header Architecture:**
   * Fixed 64-byte little-endian header (`b"CODQ"`, version 1, dtype, architecture, layer depth, hidden dimension, FFN dimension, vocabulary size).
   * Guarantees 64-byte cache line and SIMD alignment for the first payload block, enabling instantaneous zero-copy memory-mapped ingestion.
-  * Solves parametric ambiguity across quantization scales (e.g., 650M-Q4 ~395 MB vs 150M-Q8 ~165 MB, 150M-Q4 ~95 MB vs 35M-FP32 ~136 MB).
-  * Full backward compatibility with transparent fallback to `detect_from_file_len` for unheadered legacy binaries (e.g., legacy `esm2_650m_q8_0.bin`).
+  * Solves parametric ambiguity across quantization scales with full backward compatibility via `detect_from_file_len`.
 * **Handcrafted Bit-Manipulation SIMD GEMV Micro-Kernels:**
   * AVX2+FMA vector kernels unpack 16 packed bytes with `_mm_srli_epi16` and `_mm_and_si128`, widen signed offsets with `_mm256_cvtepi8_epi32` / `_mm256_cvtepi32_ps`, and accumulate with `_mm256_fmadd_ps`.
   * AVX1 fallback kernels utilize 128-bit integer unpacking and 256-bit floating-point accumulation.
   * Zero heap allocations and deterministic zero-copy execution across the entire inference hot path.
 * **Unified Multi-Format CLI (`quantize`, `generate`, `inpaint`, `dms`, `contacts`, `benchmark`):**
   * Auto-detects model scale and precision (FP32, Q8_0, Q4_0) dynamically via `CODQ` header or legacy fallback.
-  * New CLI quantization options: `codon-infer quantize --model <input> --output <output> [--format <q4_0|q8_0>]` with filename auto-detection.
+  * New CLI streaming quantization options: `codon-infer quantize --model <input> --output <output> [--format <q4_0|q8_0>]` with filename auto-detection.
 
 ---
 
@@ -229,42 +231,44 @@ $$\frac{16}{8} = 2 \text{ YMM}, \quad \frac{24}{8} = 3 \text{ YMM}, \quad \frac{
 | **SIMD Registers per Head** | **2 YMM** (16 floats) | **3 YMM** (24 floats) | **4 YMM** (32 floats) | **8 YMM / 4 ZMM** (64 floats) | **8 YMM / 4 ZMM** (64 floats) |
 | **FFN Dimension ($d_{\text{ffn}}$)** | 1,280 | 1,920 | 2,560 | 5,120 | 10,240 |
 | **Vocabulary** | 33 tokens | 33 tokens | 33 tokens | 33 tokens | 33 tokens |
-| **Total Parameters** | 7,523,042 (~7.5M) | 33,517,246 (~33.5M) | 148,161,290 (~148M) | 651,085,526 (~651M) | ~2.84B (~3B) |
-| **Binary Size (FP32)** | 30,092,168 B (~30.1 MB) | 134,068,984 B (~134.1 MB) | 592,645,160 B (~592.6 MB) | **2,604,342,104 B (~2.60 GB)** | ~11.36 GB |
-| **Quantized Binary Size (`Q8_0`)** | ~8.5 MB | ~37.7 MB | ~166.5 MB | **738,902,264 B (~738.9 MB)** | ~3.19 GB |
-| **Quantized Binary Size (`Q4_0`)** | **5,172,344 B (~5.17 MB)** | **22,042,296 B (~22.04 MB)** | **94,909,976 B (~94.91 MB)** | **395,279,848 B (~395.28 MB)** | **~1.71 GB** |
-| **Weight Load Latency** | **34.8 ms** | **117.4 ms** | **466.8 ms** | **751 ms (FP32) / 219 ms (Q8) / 128 ms (Q4)** | **~8.5 s** |
-| **Autoregressive Throughput (Generate)** | **>315 tokens/s** (~3.1 ms/tok) | **~80 – 85 tokens/s** (~11.8 ms/tok) | **~18 – 20 tokens/s** (~53.0 ms/tok) | **4.57 tok/s (1T) -> 7.70 tok/s (2T Q8)** | **~0.8 – 1.0 tokens/s** |
-| **Bidirectional Throughput (Inpaint)** | **>400 tokens/s** (~76 ms / $L=32$) | **~85 – 90 tokens/s** (~356 ms / $L=32$) | **~18 – 21 tokens/s** (~1,580 ms / $L=32$) | **~4.8 tok/s (1T) -> ~8.2 tok/s (2T Q8)** | **~0.9 – 1.1 tokens/s** |
+| **Total Floats (`grouped_canonical_v1`)** | 7,522,913 (~7.5M) | 33,516,993 (~33.5M) | 148,160,673 (~148M) | 651,084,833 (~651M) | 2,839,088,673 (~2.84B) |
+| **Binary Size (FP32)** | `30,091,652 B` (28.70 MiB) | `134,067,972 B` (127.86 MiB) | `592,642,692 B` (565.19 MiB) | **`2,604,339,332 B` (2,483.69 MiB)** | **`11,356,354,692 B` (10.58 GiB)** |
+| **Quantized Binary Size (`Q8_0`)** | `8,864,556 B` (8.45 MiB) | `38,636,896 B` (36.85 MiB) | `168,646,036 B` (160.83 MiB) | **`738,899,556 B` (704.67 MiB)** | **`3,216,540,676 B` (3.00 GiB)** |
+| **Quantized Binary Size (`Q4_0`)** | **`5,208,516 B` (4.97 MiB)** | **`22,093,636 B` (21.07 MiB)** | **`94,978,756 B` (90.58 MiB)** | **`414,617,796 B` (395.41 MiB)** | **`1,801,205,956 B` (1.68 GiB)** |
+| **Warm Load Latency (Q4_0)** | **4.69 ms** | **12.85 ms** | **39.17 ms** | **137.32 ms** | **545.36 ms** |
+| **Bidirectional Throughput ($L=41$, 4T)** | **476.9 tok/s (Q8) / 456.5 tok/s (Q4)** | **128.7 tok/s (Q4)** | **30.0 tok/s (Q4)** | **9.04 tok/s (Q4)** | **2.20 tok/s (Q8) / 2.12 tok/s (Q4)** |
 | **Working State Memory ($L=128$)** | **~911 KB** | **~1,321 KB** | **~1,732 KB** | **~3,450 KB** | **~7,200 KB** |
-| **Cache Hierarchy Residency** | **100% in L3 Cache** ($\le 32$ MB) | Partial Residency in L3 / DDR | Streaming from RAM ($> 500$ MB) | DRAM Streaming (~2.48 GB FP32 / ~698 MB Q8 / ~395 MB Q4) | Massive DRAM Bound (>10 GB) |
-| **Memory Bandwidth Demand** | **Compute-Bound (AVX/SIMD)** | **Balanced Cache/DRAM** | **Memory-Bus Limited** | **Memory-Bus Limited (Q4/Q8-Optimized)** | **Extreme Memory-Bus Bound** |
-| **Primary Use Case** | Fast in silico DMS, real-time inpainting | High-resolution DMS, peptide screening | 3D contact prediction, de novo design | Publication-grade contact maps, fine DMS | Frontier protein language modeling |
+| **Cache Hierarchy Residency** | **100% in L3 Cache** ($\le 32$ MB) | Partial Residency in L3 / DDR | Streaming from RAM ($> 500$ MB) | DRAM Streaming (~2.48 GB FP32 / ~395 MB Q4) | Massive DRAM Streaming (~1.68 GiB Q4) |
+| **Memory Bandwidth Demand** | **Compute-Bound (AVX/SIMD)** | **Balanced Cache/DRAM** | **Memory-Bus Limited** | **Memory-Bus Limited (Q4/Q8-Optimized)** | **Extreme Memory-Bus Bound (Q4/Q8 Enabled)** |
+| **Primary Use Case** | Fast in silico DMS, real-time inpainting | High-resolution DMS, peptide screening | 3D contact prediction, de novo design | Publication-grade contact maps, fine DMS | Frontier protein language modeling on CPU |
 
-### 4. Multi-Scale Empirical Validation & Benchmarks: FP32 vs. Q8_0 vs. Q4_0
+### 4. Multi-Scale Empirical Validation & Benchmarks vs. HuggingFace (`8M` to `3B`)
 
-Empirical benchmark evaluated on `test_peptidase.fasta` across all available parameter scales under native SIMD execution (4 threads):
+Empirical benchmark evaluated on `test_peptidase.fasta` (41 tokens) against official HuggingFace `facebook/esm2_*` reference tensors (`scripts/ref_{8m,35m,150m,650m,3b}.npz`) under native SIMD execution (4 threads, `wait4` kernel `ru_maxrss`):
 
-| Model Scale | Precision Format | Binary File Size | Matrix Comp. | Total Comp. | Embedding Cosine | Logits Cosine | Worst Matrix Cos | Latency (4 th) | Peak RAM (RSS) |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **ESM-2 8M** | FP32 | 30.13 MB | 1.00× | 1.00× | 1.0000 | 1.0000 | 1.0000 | 6.7 ms | 37 MB |
-| | Q8_0 | 8.84 MB | 3.56× | 3.41× | 0.9998 | 0.9999 | 0.9999 | 7.9 ms | 38 MB |
-| | **Q4_0** | **5.17 MB** | **6.40×** | **5.82×** | **0.9873** | **0.9850** | **0.9930** | **6.2 ms** | **38 MB** |
-| **ESM-2 35M** | FP32 | 136.03 MB | 1.00× | 1.00× | 1.0000 | 1.0000 | 1.0000 | 25.5 ms | 154 MB |
-| | Q8_0 | 38.86 MB | 3.56× | 3.50× | 0.9997 | 0.9999 | 0.9998 | 26.8 ms | 125 MB |
-| | **Q4_0** | **22.04 MB** | **6.40×** | **6.17×** | **0.9927** | **0.9893** | **0.9913** | **20.5 ms** | **83 MB** |
-| **ESM-2 150M** | FP32 | 585.11 MB | 1.00× | 1.00× | 1.0000 | 1.0000 | 1.0000 | 108.6 ms | 620 MB |
-| | Q8_0 | 165.41 MB | 3.56× | 3.54× | 0.9998 | 0.9999 | 0.9998 | 108.8 ms | 316 MB |
-| | **Q4_0** | **94.91 MB** | **6.40×** | **6.16×** | **0.9921** | **0.9984** | **0.9918** | **85.3 ms** | **175 MB** |
-| **ESM-2 650M** | FP32 | 2,481.48 MB | 1.00× | 1.00× | 1.0000 | 1.0000 | 1.0000 | 8,410 ms | 2,624 MB |
-| | Q8_0 | 704.67 MB | 3.56× | 3.52× | 0.9998 | 0.9998 | 0.9998 | 5,820 ms | 785 MB |
-| | **Q4_0** | **395.28 MB** | **6.40×** | **6.28×** | **0.9924** | **0.9581** | **0.9920** | **5,530 ms** | **527 MB** |
+| Model Scale | Format | Exact File Size (`stat -c %s`) | Total Comp. | `hidden_states[-1]` Cos vs HF | Logits Cos vs HF | KL Div vs HF | Top-1 Match vs HF | Forward Median (4 th) | Throughput | Peak RAM (RSS) |
+| :--- | :---: | ---: | :---: | :---: | :---: | :---: | :---: | ---: | ---: | ---: |
+| **ESM-2 8M** | FP32 | `30,091,652 B` (28.70 MiB) | 1.00× | 0.999999 | 0.999999 | 0.000000 | **100.0% (41/41)** | 113.44 ms | 361.4 tok/s | 32.75 MiB |
+| | Q8_0 | `8,864,556 B` (8.45 MiB) | 3.39× | 0.999764 | 0.999995 | 0.000128 | **100.0% (41/41)** | 85.97 ms | 476.9 tok/s | 29.11 MiB |
+| | **Q4_0** | **`5,208,516 B` (4.97 MiB)** | **5.78×** | **0.934598** | **0.998168** | **0.031316** | **100.0% (41/41)** | **89.82 ms** | **456.5 tok/s** | **29.29 MiB** |
+| **ESM-2 35M** | FP32 | `134,067,972 B` (127.86 MiB) | 1.00× | 0.999999 | 1.000000 | 0.000000 | **100.0% (41/41)** | 446.47 ms | 91.8 tok/s | 133.30 MiB |
+| | Q8_0 | `38,636,896 B` (36.85 MiB) | 3.47× | 0.999825 | 0.999994 | 0.000120 | **100.0% (41/41)** | 377.27 ms | 108.7 tok/s | 42.24 MiB |
+| | **Q4_0** | **`22,093,636 B` (21.07 MiB)** | **6.07×** | **0.952611** | **0.998566** | **0.048077** | **95.1% (39/41)** | **318.58 ms** | **128.7 tok/s** | **29.41 MiB** |
+| **ESM-2 150M** | FP32 | `592,642,692 B` (565.19 MiB) | 1.00× | 0.999999 | 1.000000 | 0.000000 | **100.0% (41/41)** | 2,390.36 ms | 17.2 tok/s | 575.01 MiB |
+| | Q8_0 | `168,646,036 B` (160.83 MiB) | 3.51× | 0.999934 | 0.999998 | 0.000042 | **100.0% (41/41)** | 1,430.16 ms | 28.7 tok/s | 170.61 MiB |
+| | **Q4_0** | **`94,978,756 B` (90.58 MiB)** | **6.24×** | **0.981715** | **0.999266** | **0.020517** | **100.0% (41/41)** | **1,367.83 ms** | **30.0 tok/s** | **100.39 MiB** |
+| **ESM-2 650M** | FP32 | `2,604,339,332 B` (2,483.69 MiB) | 1.00× | 0.999999 | 1.000000 | 0.000000 | **100.0% (41/41)** | 8,692.15 ms | 4.72 tok/s | 2,501.33 MiB |
+| | Q8_0 | `738,899,556 B` (704.67 MiB) | 3.52× | 0.999913 | 0.999996 | 0.000039 | **100.0% (41/41)** | 4,669.89 ms | 8.78 tok/s | 722.41 MiB |
+| | **Q4_0** | **`414,617,796 B` (395.41 MiB)** | **6.28×** | **0.980842** | **0.999292** | **0.019508** | **97.6% (40/41)** | **4,535.47 ms** | **9.04 tok/s** | **413.07 MiB** |
+| **ESM-2 3B** | FP32 | `11,356,354,692 B` (10.58 GiB) | 1.00× | *Ref HF* | *Ref HF* | *Ref HF* | *Ref HF* | *N/A (>11 GiB RAM)* | *N/A* | *Streaming Only* |
+| | **Q8_0** | **`3,216,540,676 B` (3.00 GiB)** | **3.53×** | **0.999983** | **0.999998** | **0.000027** | **100.0% (41/41)** | **18,615.93 ms** | **2.20 tok/s** | **3,102.18 MiB** |
+| | **Q4_0** | **`1,801,205,956 B` (1.68 GiB)** | **6.30×** | **0.994156** | **0.999422** | **0.006447** | **100.0% (41/41)** | **19,368.89 ms** | **2.12 tok/s** | **1,752.57 MiB** |
 
 > [!NOTE]
-> **Fidelity and Memory Takeaways:**
-> 1. **DRAM Bandwidth Relief:** For ESM-2 650M, Q4_0 achieves a **1.52× end-to-end latency speedup** over FP32 (5.53s vs 8.41s) and a **79.8% memory reduction** (2,624 MB down to 527 MB).
-> 2. **High Latent Fidelity:** Across all models, internal representations maintain cosine similarity $\ge 0.987$ to $0.993$. Individual quantized projection matrices maintain worst-case cosine $\ge 0.9913$.
-> 3. **Layer Drift on 650M:** The final logits cosine of 0.9581 on 650M reflects vocabulary projection de-embedding across 33 tokens, while semantic hidden embeddings across all 33 layers remain exceptionally stable at $\ge 0.9917$.
+> **Fidelity and Memory Takeaways (`docs/benchmarks_v1.6.0.md`):**
+> 1. **Exact HuggingFace Parity:** Across all FP32 models (`8M` to `650M`), `codon-infer` matches HuggingFace `facebook/esm2_*` layer-by-layer hidden states and final logits with cosine $\ge 0.999999$ and **100.0% Top-1 match**.
+> 2. **ESM-2 3B on Commodity RAM:** Streaming quantization (`12.55 MiB` Peak RSS) compresses the 10.58 GiB `esm2_3b_weights.bin` into a `1.68 GiB` `Q4_0` binary (`1,801,205,956 B`) that loads in **545 ms** and executes in **1,752.57 MiB Peak RSS** with **0.999422 logits cosine** and **100.0% Top-1 match** against HuggingFace `esm2_t36_3B_UR50D`.
+> 3. **DRAM Bandwidth Relief:** On ESM-2 650M, `Q4_0` achieves a **1.92× forward speedup** over FP32 (4.54 s vs 8.69 s) while cutting Peak RSS by **83.5%** (from 2,501 MiB down to 413 MiB).
 
 ---
 

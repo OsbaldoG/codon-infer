@@ -23,8 +23,8 @@ impl SimpleRng {
 
 fn softmax_canonical(logits: &[f32]) -> [f32; 20] {
     let mut max_val = f32::NEG_INFINITY;
-    for i in 4..=23 {
-        if logits[i] > max_val { max_val = logits[i]; }
+    for &v in &logits[4..=23] {
+        if v > max_val { max_val = v; }
     }
     let mut sum_exp = 0.0f32;
     let mut exps = [0.0f32; 20];
@@ -33,8 +33,8 @@ fn softmax_canonical(logits: &[f32]) -> [f32; 20] {
         exps[i - 4] = e;
         sum_exp += e;
     }
-    for i in 0..20 {
-        exps[i] /= sum_exp;
+    for v in &mut exps {
+        *v /= sum_exp;
     }
     exps
 }
@@ -76,9 +76,9 @@ fn centered_cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 fn argmax_canonical(logits: &[f32]) -> usize {
     let mut best_i = 4;
     let mut best_v = f32::NEG_INFINITY;
-    for i in 4..=23 {
-        if logits[i] > best_v {
-            best_v = logits[i];
+    for (i, &v) in logits.iter().enumerate().take(24).skip(4) {
+        if v > best_v {
+            best_v = v;
             best_i = i;
         }
     }

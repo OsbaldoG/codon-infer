@@ -143,12 +143,56 @@ impl EsmConfig {
         }
     }
 
+    #[inline]
+    pub fn lm_head_floats(&self) -> usize {
+        3 * self.dim + self.dim * self.dim + self.vocab_size * self.dim + self.vocab_size
+    }
+
+    #[inline]
+    pub fn grouped_canonical_floats(&self) -> usize {
+        self.vocab_size * self.dim
+            + self.n_layers
+                * (4 * self.dim * self.dim
+                    + 9 * self.dim
+                    + 2 * self.dim * self.hidden_dim
+                    + self.hidden_dim)
+            + 2 * self.dim
+            + self.lm_head_floats()
+    }
+
+    #[inline]
+    pub fn grouped_canonical_bytes(&self) -> u64 {
+        (self.grouped_canonical_floats() as u64) * 4
+    }
+
+    #[inline]
+    pub fn sequential_hf_floats(&self) -> usize {
+        let head_dim = self.dim / self.n_heads;
+        let inv_freq_len = head_dim / 2;
+        let contact_head_len = self.n_layers * self.n_heads + 1;
+        self.grouped_canonical_floats() + inv_freq_len + contact_head_len
+    }
+
+    #[inline]
+    pub fn sequential_hf_bytes(&self) -> u64 {
+        (self.sequential_hf_floats() as u64) * 4
+    }
+
     /// Autodetects ESM-2 model architecture from weights file length in bytes.
-    /// Deterministically supports both FP32 (~4 bytes/param) and Q8_0 (~1.125 bytes/param)
-    /// representations across all 5 scales (8M, 35M, 150M, 650M, 3B) without collisions or gaps.
+    /// Deterministically supports exact `grouped_canonical_v1` FP32 sizes (`30,091,652`,
+    /// `134,067,972`, `592,642,692`, `2,604,339,332`, `11,356,354,692`), `sequential_hf` FP32 sizes,
+    /// and Q8_0 (~1.125 bytes/param) representations across all 5 scales (8M, 35M, 150M, 650M, 3B).
     pub fn detect_from_file_len(file_len: u64) -> io::Result<Self> {
+        match file_len {
+            30_091_652 | 30_092_168 => return Ok(Self::esm2_8m()),
+            134_067_972 | 134_068_984 => return Ok(Self::esm2_35m()),
+            592_642_692 | 592_645_160 => return Ok(Self::esm2_150m()),
+            2_604_339_332 | 2_604_342_104 => return Ok(Self::esm2_650m()),
+            11_356_354_692 | 11_356_360_584 | 11_357_091_972 => return Ok(Self::esm2_3b()),
+            _ => {}
+        }
         if file_len >= 3_000_000_000 {
-            // ESM-2 3B: ~11.4 GB (FP32) or ~3.2 GB - 3.4 GB (Q8_0)
+            // ESM-2 3B: ~11.36 GB (FP32) or ~3.2 GB - 3.4 GB (Q8_0)
             Ok(Self::esm2_3b())
         } else if file_len >= 2_000_000_000 {
             // ESM-2 650M: ~2.60 GB (FP32)
@@ -157,19 +201,19 @@ impl EsmConfig {
             // ESM-2 650M: ~698.5 MB - 780 MB (Q8_0)
             Ok(Self::esm2_650m())
         } else if file_len >= 450_000_000 {
-            // ESM-2 150M: ~592.5 MB (FP32)
+            // ESM-2 150M: ~592.6 MB (FP32)
             Ok(Self::esm2_150m())
         } else if file_len >= 140_000_000 {
             // ESM-2 150M: ~166 MB - 178 MB (Q8_0)
             Ok(Self::esm2_150m())
         } else if file_len >= 80_000_000 {
-            // ESM-2 35M: ~134 MB (FP32)
+            // ESM-2 35M: ~134.1 MB (FP32)
             Ok(Self::esm2_35m())
         } else if file_len >= 30_500_000 {
             // ESM-2 35M: ~38 MB - 48 MB (Q8_0)
             Ok(Self::esm2_35m())
         } else if file_len >= 20_000_000 {
-            // ESM-2 8M: ~30 MB (FP32)
+            // ESM-2 8M: ~30.1 MB (FP32)
             Ok(Self::esm2_8m())
         } else if file_len >= 6_000_000 {
             // ESM-2 8M: ~8.5 MB - 12 MB (Q8_0)
@@ -178,7 +222,7 @@ impl EsmConfig {
             Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "Unrecognized ESM-2 weights size: {} bytes. Expected ~30MB/9MB (8M), ~134MB/38MB (35M), ~592MB/167MB (150M), ~2.6GB/698MB (650M), or ~11.4GB/3.2GB (3B).",
+                    "Unrecognized ESM-2 weights size: {} bytes. Expected 30,091,652 B (8M), 134,067,972 B (35M), 592,642,692 B (150M), 2,604,339,332 B (650M), or 11,356,354,692 B (3B).",
                     file_len
                 ),
             ))
@@ -240,32 +284,23 @@ impl EsmWeights {
         let head_dim = config.dim / config.n_heads;
         let inv_freq_len = head_dim / 2;
         let contact_head_len = config.n_layers * config.n_heads + 1;
-        let lm_head_len = config.vocab_size + config.dim * config.dim + 3 * config.dim + config.vocab_size * config.dim;
-        let sequential_hf_floats = config.vocab_size * config.dim
-            + inv_freq_len
-            + config.n_layers * (
-                4 * config.dim * config.dim + 4 * config.dim
-                + 2 * config.dim
-                + 2 * config.dim * config.hidden_dim + config.hidden_dim + config.dim
-                + 2 * config.dim
-            )
-            + 2 * config.dim
-            + contact_head_len
-            + lm_head_len;
+        let lm_head_len = config.lm_head_floats();
+        let grouped_canonical_floats = config.grouped_canonical_floats();
+        let sequential_hf_floats = config.sequential_hf_floats();
 
         let start_pos = file.stream_position()?;
         let file_len = file.metadata()?.len();
         if start_pos > file_len {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Stream position exceeds file length"));
         }
-        let remaining_bytes = (file_len - start_pos) as usize;
-        if remaining_bytes % 4 != 0 {
+        let remaining_bytes_u64 = file_len - start_pos;
+        if remaining_bytes_u64 % 4 != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("Unaligned trailing bytes: {} is not a multiple of 4", remaining_bytes),
+                format!("Unaligned trailing bytes: {} is not a multiple of 4", remaining_bytes_u64),
             ));
         }
-        let remaining_floats = remaining_bytes / 4;
+        let remaining_floats = (remaining_bytes_u64 / 4) as usize;
 
         let (
             token_embedding_table,
@@ -288,7 +323,34 @@ impl EsmWeights {
             ln_f_weight,
             ln_f_bias,
             classifier_weights,
-        ) = if remaining_floats == sequential_hf_floats {
+        ) = if remaining_floats == grouped_canonical_floats {
+            // Strict grouped_canonical_v1 layout
+            let token_emb = read_floats(&mut file, config.vocab_size * config.dim)?;
+            let ln_1_w = read_floats(&mut file, config.n_layers * config.dim)?;
+            let ln_1_b = read_floats(&mut file, config.n_layers * config.dim)?;
+            let w_q = read_floats(&mut file, config.n_layers * config.dim * config.dim)?;
+            let b_q = read_floats(&mut file, config.n_layers * config.dim)?;
+            let w_k = read_floats(&mut file, config.n_layers * config.dim * config.dim)?;
+            let b_k = read_floats(&mut file, config.n_layers * config.dim)?;
+            let w_v = read_floats(&mut file, config.n_layers * config.dim * config.dim)?;
+            let b_v = read_floats(&mut file, config.n_layers * config.dim)?;
+            let w_o = read_floats(&mut file, config.n_layers * config.dim * config.dim)?;
+            let b_o = read_floats(&mut file, config.n_layers * config.dim)?;
+            let ln_2_w = read_floats(&mut file, config.n_layers * config.dim)?;
+            let ln_2_b = read_floats(&mut file, config.n_layers * config.dim)?;
+            let fc1_w = read_floats(&mut file, config.n_layers * config.dim * config.hidden_dim)?;
+            let fc1_b = read_floats(&mut file, config.n_layers * config.hidden_dim)?;
+            let fc2_w = read_floats(&mut file, config.n_layers * config.hidden_dim * config.dim)?;
+            let fc2_b = read_floats(&mut file, config.n_layers * config.dim)?;
+            let ln_f_w = read_floats(&mut file, config.dim)?;
+            let ln_f_b = read_floats(&mut file, config.dim)?;
+            let classifier_w = read_floats(&mut file, lm_head_len)?;
+
+            (
+                token_emb, ln_1_w, ln_1_b, w_q, b_q, w_k, b_k, w_v, b_v, w_o, b_o,
+                ln_2_w, ln_2_b, fc1_w, fc1_b, fc2_w, fc2_b, ln_f_w, ln_f_b, classifier_w,
+            )
+        } else if remaining_floats == sequential_hf_floats {
             // Sequential HuggingFace / fair-esm dump layout
             let token_emb = read_floats(&mut file, config.vocab_size * config.dim)?;
             let _inv_freq = read_floats(&mut file, inv_freq_len)?;
@@ -380,9 +442,7 @@ impl EsmWeights {
             let lm_ln_b = read_floats(&mut file, config.dim)?;
             let lm_dec_w = read_floats(&mut file, config.vocab_size * config.dim)?;
 
-            let mut classifier_w = Vec::with_capacity(
-                3 * config.dim + config.dim * config.dim + config.vocab_size * config.dim + config.vocab_size
-            );
+            let mut classifier_w = Vec::with_capacity(lm_head_len);
             classifier_w.extend_from_slice(&lm_ln_w);
             classifier_w.extend_from_slice(&lm_ln_b);
             classifier_w.extend_from_slice(&lm_dense_w);
@@ -395,42 +455,20 @@ impl EsmWeights {
                 ln_2_w, ln_2_b, fc1_w, fc1_b, fc2_w, fc2_b, ln_f_w, ln_f_b, classifier_w,
             )
         } else {
-            // Grouped columnar / CODQ layout fallback
-            let token_emb = read_floats(&mut file, config.vocab_size * config.dim)?;
-            let ln_1_w = read_floats(&mut file, config.n_layers * config.dim)?;
-            let ln_1_b = read_floats(&mut file, config.n_layers * config.dim)?;
-            let w_q = read_floats(&mut file, config.n_layers * config.dim * config.dim)?;
-            let b_q = read_floats(&mut file, config.n_layers * config.dim)?;
-            let w_k = read_floats(&mut file, config.n_layers * config.dim * config.dim)?;
-            let b_k = read_floats(&mut file, config.n_layers * config.dim)?;
-            let w_v = read_floats(&mut file, config.n_layers * config.dim * config.dim)?;
-            let b_v = read_floats(&mut file, config.n_layers * config.dim)?;
-            let w_o = read_floats(&mut file, config.n_layers * config.dim * config.dim)?;
-            let b_o = read_floats(&mut file, config.n_layers * config.dim)?;
-            let ln_2_w = read_floats(&mut file, config.n_layers * config.dim)?;
-            let ln_2_b = read_floats(&mut file, config.n_layers * config.dim)?;
-            let fc1_w = read_floats(&mut file, config.n_layers * config.dim * config.hidden_dim)?;
-            let fc1_b = read_floats(&mut file, config.n_layers * config.hidden_dim)?;
-            let fc2_w = read_floats(&mut file, config.n_layers * config.hidden_dim * config.dim)?;
-            let fc2_b = read_floats(&mut file, config.n_layers * config.dim)?;
-            let ln_f_w = read_floats(&mut file, config.dim)?;
-            let ln_f_b = read_floats(&mut file, config.dim)?;
-
-            let cur_pos = file.stream_position()?;
-            let rem_bytes = (file_len - cur_pos) as usize;
-            if rem_bytes % 4 != 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("Unaligned trailing bytes: {} is not a multiple of 4", rem_bytes),
-                ));
-            }
-            let rem_floats = rem_bytes / 4;
-            let classifier_w = read_floats(&mut file, rem_floats)?;
-
-            (
-                token_emb, ln_1_w, ln_1_b, w_q, b_q, w_k, b_k, w_v, b_v, w_o, b_o,
-                ln_2_w, ln_2_b, fc1_w, fc1_b, fc2_w, fc2_b, ln_f_w, ln_f_b, classifier_w,
-            )
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Invalid FP32 weights size for {} ('{}'): found {} bytes ({} floats), expected exactly {} bytes ({} floats, grouped_canonical_v1) or {} bytes ({} floats, sequential_hf).",
+                    config.model_name(),
+                    model_path,
+                    remaining_bytes_u64,
+                    remaining_floats,
+                    config.grouped_canonical_bytes(),
+                    grouped_canonical_floats,
+                    config.sequential_hf_bytes(),
+                    sequential_hf_floats,
+                ),
+            ));
         };
 
         let final_pos = file.stream_position()?;
@@ -1175,6 +1213,396 @@ impl EsmWeightsQ4 {
             Ok(fp32.quantize_q4())
         }
     }
+}
+
+fn stream_copy_floats<R: Read, W: Write>(reader: &mut R, writer: &mut W, num_floats: usize) -> io::Result<()> {
+    let mut rem_bytes = (num_floats as u64) * 4;
+    let mut buf = [0u8; 65536];
+    while rem_bytes > 0 {
+        let chunk = (rem_bytes.min(buf.len() as u64)) as usize;
+        reader.read_exact(&mut buf[..chunk])?;
+        writer.write_all(&buf[..chunk])?;
+        rem_bytes -= chunk as u64;
+    }
+    Ok(())
+}
+
+/// Streams a `grouped_canonical_v1` FP32 weights file and writes a `CODQ` `Q8_0` binary
+/// block-by-block using `BufReader` and `BufWriter` (< 10 MB RAM, safe for 3B on 11 GiB machines).
+pub fn quantize_file_streaming_q8(src_path: &str, dst_path: &str, config: &EsmConfig) -> io::Result<u64> {
+    let mut src_file = File::open(src_path)?;
+    let file_len = src_file.metadata()?.len();
+    let mut magic = [0u8; 4];
+    let start_pos = if file_len >= 64 && src_file.read_exact(&mut magic).is_ok() && magic == CODQ_MAGIC {
+        src_file.seek(io::SeekFrom::Start(0))?;
+        let hdr = CodqHeader::read_from(&mut src_file)?;
+        hdr.validate(config)?;
+        if hdr.dtype != DTYPE_FP32 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Expected FP32 source in quantize_file_streaming_q8, found dtype={}", hdr.dtype),
+            ));
+        }
+        64u64
+    } else {
+        src_file.seek(io::SeekFrom::Start(0))?;
+        0u64
+    };
+
+    let rem_bytes = file_len.saturating_sub(start_pos);
+    let expected_bytes = config.grouped_canonical_bytes();
+    if rem_bytes != expected_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "quantize_file_streaming_q8 requires grouped_canonical_v1 layout ({} bytes) for {}, found {} bytes in '{}'",
+                expected_bytes,
+                config.model_name(),
+                rem_bytes,
+                src_path
+            ),
+        ));
+    }
+
+    let mut reader = io::BufReader::with_capacity(4 * 1024 * 1024, src_file);
+    let dst_file = File::create(dst_path)?;
+    let mut writer = io::BufWriter::with_capacity(4 * 1024 * 1024, dst_file);
+
+    let header = CodqHeader::new(DTYPE_Q8_0, config);
+    let header_bytes = unsafe {
+        std::slice::from_raw_parts(
+            &header as *const CodqHeader as *const u8,
+            std::mem::size_of::<CodqHeader>(),
+        )
+    };
+    writer.write_all(header_bytes)?;
+
+    let schedule: [(usize, bool); 20] = [
+        (config.vocab_size * config.dim, true),
+        (config.n_layers * config.dim, false),
+        (config.n_layers * config.dim, false),
+        (config.n_layers * config.dim * config.dim, true),
+        (config.n_layers * config.dim, false),
+        (config.n_layers * config.dim * config.dim, true),
+        (config.n_layers * config.dim, false),
+        (config.n_layers * config.dim * config.dim, true),
+        (config.n_layers * config.dim, false),
+        (config.n_layers * config.dim * config.dim, true),
+        (config.n_layers * config.dim, false),
+        (config.n_layers * config.dim, false),
+        (config.n_layers * config.dim, false),
+        (config.n_layers * config.dim * config.hidden_dim, true),
+        (config.n_layers * config.hidden_dim, false),
+        (config.n_layers * config.hidden_dim * config.dim, true),
+        (config.n_layers * config.dim, false),
+        (config.dim, false),
+        (config.dim, false),
+        (config.lm_head_floats(), false),
+    ];
+
+    const BATCH_BLOCKS: usize = 2048;
+    let mut in_buf = vec![0u8; BATCH_BLOCKS * 32 * 4];
+    let mut out_buf = vec![0u8; BATCH_BLOCKS * 36];
+
+    for (num_floats, quantize) in schedule {
+        if !quantize {
+            stream_copy_floats(&mut reader, &mut writer, num_floats)?;
+        } else {
+            if num_floats % 32 != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Quantized tensor length {} is not a multiple of 32", num_floats),
+                ));
+            }
+            let mut rem_blocks = num_floats / 32;
+            while rem_blocks > 0 {
+                let batch = rem_blocks.min(BATCH_BLOCKS);
+                let in_len = batch * 32 * 4;
+                reader.read_exact(&mut in_buf[..in_len])?;
+                for b in 0..batch {
+                    let mut vals = [0.0f32; 32];
+                    let b_in = &in_buf[b * 128..(b + 1) * 128];
+                    for i in 0..32 {
+                        vals[i] = f32::from_le_bytes([
+                            b_in[i * 4],
+                            b_in[i * 4 + 1],
+                            b_in[i * 4 + 2],
+                            b_in[i * 4 + 3],
+                        ]);
+                    }
+                    let blk = BlockQ8_0::quantize(&vals);
+                    let b_out = &mut out_buf[b * 36..(b + 1) * 36];
+                    b_out[0..4].copy_from_slice(&blk.d.to_le_bytes());
+                    for i in 0..32 {
+                        b_out[4 + i] = blk.qs[i] as u8;
+                    }
+                }
+                writer.write_all(&out_buf[..batch * 36])?;
+                rem_blocks -= batch;
+            }
+        }
+    }
+
+    writer.flush()?;
+    let out_file = writer.into_inner().map_err(|e| e.into_error())?;
+    out_file.metadata().map(|m| m.len())
+}
+
+/// Streams a `grouped_canonical_v1` FP32 weights file and writes a `CODQ` `Q4_0` binary
+/// block-by-block using `BufReader` and `BufWriter` (< 10 MB RAM, safe for 3B on 11 GiB machines).
+pub fn quantize_file_streaming_q4(src_path: &str, dst_path: &str, config: &EsmConfig) -> io::Result<u64> {
+    let mut src_file = File::open(src_path)?;
+    let file_len = src_file.metadata()?.len();
+    let mut magic = [0u8; 4];
+    let start_pos = if file_len >= 64 && src_file.read_exact(&mut magic).is_ok() && magic == CODQ_MAGIC {
+        src_file.seek(io::SeekFrom::Start(0))?;
+        let hdr = CodqHeader::read_from(&mut src_file)?;
+        hdr.validate(config)?;
+        if hdr.dtype != DTYPE_FP32 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Expected FP32 source in quantize_file_streaming_q4, found dtype={}", hdr.dtype),
+            ));
+        }
+        64u64
+    } else {
+        src_file.seek(io::SeekFrom::Start(0))?;
+        0u64
+    };
+
+    let rem_bytes = file_len.saturating_sub(start_pos);
+    let expected_bytes = config.grouped_canonical_bytes();
+    if rem_bytes != expected_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "quantize_file_streaming_q4 requires grouped_canonical_v1 layout ({} bytes) for {}, found {} bytes in '{}'",
+                expected_bytes,
+                config.model_name(),
+                rem_bytes,
+                src_path
+            ),
+        ));
+    }
+
+    let mut reader = io::BufReader::with_capacity(4 * 1024 * 1024, src_file);
+    let dst_file = File::create(dst_path)?;
+    let mut writer = io::BufWriter::with_capacity(4 * 1024 * 1024, dst_file);
+
+    let header = CodqHeader::new(DTYPE_Q4_0, config);
+    let header_bytes = unsafe {
+        std::slice::from_raw_parts(
+            &header as *const CodqHeader as *const u8,
+            std::mem::size_of::<CodqHeader>(),
+        )
+    };
+    writer.write_all(header_bytes)?;
+
+    let schedule: [(usize, bool); 20] = [
+        (config.vocab_size * config.dim, false),
+        (config.n_layers * config.dim, false),
+        (config.n_layers * config.dim, false),
+        (config.n_layers * config.dim * config.dim, true),
+        (config.n_layers * config.dim, false),
+        (config.n_layers * config.dim * config.dim, true),
+        (config.n_layers * config.dim, false),
+        (config.n_layers * config.dim * config.dim, true),
+        (config.n_layers * config.dim, false),
+        (config.n_layers * config.dim * config.dim, true),
+        (config.n_layers * config.dim, false),
+        (config.n_layers * config.dim, false),
+        (config.n_layers * config.dim, false),
+        (config.n_layers * config.dim * config.hidden_dim, true),
+        (config.n_layers * config.hidden_dim, false),
+        (config.n_layers * config.hidden_dim * config.dim, true),
+        (config.n_layers * config.dim, false),
+        (config.dim, false),
+        (config.dim, false),
+        (config.lm_head_floats(), false),
+    ];
+
+    const BATCH_BLOCKS: usize = 2048;
+    let mut in_buf = vec![0u8; BATCH_BLOCKS * 32 * 4];
+    let mut out_buf = vec![0u8; BATCH_BLOCKS * 20];
+
+    for (num_floats, quantize) in schedule {
+        if !quantize {
+            stream_copy_floats(&mut reader, &mut writer, num_floats)?;
+        } else {
+            if num_floats % 32 != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Quantized tensor length {} is not a multiple of 32", num_floats),
+                ));
+            }
+            let mut rem_blocks = num_floats / 32;
+            while rem_blocks > 0 {
+                let batch = rem_blocks.min(BATCH_BLOCKS);
+                let in_len = batch * 32 * 4;
+                reader.read_exact(&mut in_buf[..in_len])?;
+                for b in 0..batch {
+                    let mut vals = [0.0f32; 32];
+                    let b_in = &in_buf[b * 128..(b + 1) * 128];
+                    for i in 0..32 {
+                        vals[i] = f32::from_le_bytes([
+                            b_in[i * 4],
+                            b_in[i * 4 + 1],
+                            b_in[i * 4 + 2],
+                            b_in[i * 4 + 3],
+                        ]);
+                    }
+                    let blk = BlockQ4_0::quantize(&vals);
+                    let b_out = &mut out_buf[b * 20..(b + 1) * 20];
+                    b_out[0..4].copy_from_slice(&blk.d.to_le_bytes());
+                    b_out[4..20].copy_from_slice(&blk.qs);
+                }
+                writer.write_all(&out_buf[..batch * 20])?;
+                rem_blocks -= batch;
+            }
+        }
+    }
+
+    writer.flush()?;
+    let out_file = writer.into_inner().map_err(|e| e.into_error())?;
+    out_file.metadata().map(|m| m.len())
+}
+
+/// Reads a float32 `.npy` array from an uncompressed `.npz` archive (`np.savez` STORE format)
+/// by parsing the ZIP Local File Header (including ZIP64 if present) and the `.npy` shape header
+/// to compute the exact byte length without scanning float data for `b"PK"`.
+pub fn read_npz_floats(npz_path: &str, target_name: &str) -> io::Result<Vec<f32>> {
+    let data = std::fs::read(npz_path)?;
+    let target_bytes = target_name.as_bytes();
+    let mut pos = 0usize;
+    while pos + 30 <= data.len() && &data[pos..pos + 4] == b"PK\x03\x04" {
+        let comp_method = u16::from_le_bytes([data[pos + 8], data[pos + 9]]);
+        let mut comp_size = u32::from_le_bytes([data[pos + 18], data[pos + 19], data[pos + 20], data[pos + 21]]) as usize;
+        let mut uncomp_size = u32::from_le_bytes([data[pos + 22], data[pos + 23], data[pos + 24], data[pos + 25]]) as usize;
+        let fn_len = u16::from_le_bytes([data[pos + 26], data[pos + 27]]) as usize;
+        let extra_len = u16::from_le_bytes([data[pos + 28], data[pos + 29]]) as usize;
+        let fn_start = pos + 30;
+        let fn_end = fn_start + fn_len;
+        let data_start = fn_end + extra_len;
+        if data_start > data.len() {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Truncated ZIP local header in .npz"));
+        }
+
+        // Check ZIP64 extra field (0x0001) if sizes are 0xFFFFFFFF
+        if uncomp_size == 0xFFFF_FFFF || comp_size == 0xFFFF_FFFF {
+            let extra = &data[fn_end..data_start];
+            let mut epos = 0usize;
+            while epos + 4 <= extra.len() {
+                let tag = u16::from_le_bytes([extra[epos], extra[epos + 1]]);
+                let sz = u16::from_le_bytes([extra[epos + 2], extra[epos + 3]]) as usize;
+                if tag == 0x0001 && epos + 4 + sz <= extra.len() && sz >= 16 {
+                    let u64_uncomp = u64::from_le_bytes(extra[epos + 4..epos + 12].try_into().unwrap()) as usize;
+                    let u64_comp = u64::from_le_bytes(extra[epos + 12..epos + 20].try_into().unwrap()) as usize;
+                    uncomp_size = u64_uncomp;
+                    comp_size = u64_comp;
+                    break;
+                }
+                epos += 4 + sz;
+            }
+        }
+
+        // Parse .npy header to determine exact payload size even if ZIP local header has sizes in data descriptor
+        if data_start + 10 > data.len() || &data[data_start..data_start + 6] != b"\x93NUMPY" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Invalid or compressed .npy entry in '{}' (method={})", npz_path, comp_method),
+            ));
+        }
+        let major = data[data_start + 6];
+        let (prefix_len, header_len) = if major == 1 {
+            (10usize, u16::from_le_bytes([data[data_start + 8], data[data_start + 9]]) as usize)
+        } else {
+            if data_start + 12 > data.len() {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Truncated .npy v2 header"));
+            }
+            (
+                12usize,
+                u32::from_le_bytes([
+                    data[data_start + 8],
+                    data[data_start + 9],
+                    data[data_start + 10],
+                    data[data_start + 11],
+                ]) as usize,
+            )
+        };
+        let raw_start = data_start + prefix_len + header_len;
+        if raw_start > data.len() {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Truncated .npy dictionary header"));
+        }
+
+        let hdr_str = std::str::from_utf8(&data[data_start + prefix_len..raw_start]).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("Invalid UTF-8 in .npy header: {}", e))
+        })?;
+
+        // Parse shape tuple from "'shape': (...)"
+        let shape_idx = hdr_str.find("'shape':").ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "Missing 'shape' in .npy header")
+        })?;
+        let after_shape = &hdr_str[shape_idx..];
+        let open_paren = after_shape.find('(').ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "Missing '(' in .npy shape")
+        })?;
+        let close_paren = after_shape[open_paren..].find(')').ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "Missing ')' in .npy shape")
+        })?;
+        let shape_inner = &after_shape[open_paren + 1..open_paren + close_paren];
+        let mut num_elements = 1usize;
+        for part in shape_inner.split(',') {
+            let trimmed = part.trim();
+            if !trimmed.is_empty() {
+                let dim = trimmed.parse::<usize>().map_err(|e| {
+                    io::Error::new(io::ErrorKind::InvalidData, format!("Invalid dimension '{}': {}", trimmed, e))
+                })?;
+                num_elements = num_elements.saturating_mul(dim);
+            }
+        }
+
+        // Determine element byte size from "'descr':" or ZIP uncomp_size
+        let payload_bytes = if uncomp_size > prefix_len + header_len {
+            uncomp_size - (prefix_len + header_len)
+        } else {
+            num_elements * 4
+        };
+
+        if &data[fn_start..fn_end] == target_bytes {
+            if comp_method != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Entry '{}' in '{}' is compressed (method={}); repackage with np.savez", target_name, npz_path, comp_method),
+                ));
+            }
+            let n_floats = num_elements;
+            let expected_float_bytes = n_floats * 4;
+            let raw_end = raw_start + expected_float_bytes;
+            if raw_end > data.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("Entry '{}' in '{}' truncated: need {}..{}, file len {}", target_name, npz_path, raw_start, raw_end, data.len()),
+                ));
+            }
+            let float_bytes = &data[raw_start..raw_end];
+            let mut floats = Vec::with_capacity(n_floats);
+            for chunk in float_bytes.chunks_exact(4) {
+                floats.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+            }
+            return Ok(floats);
+        }
+
+        let entry_total = if comp_size > 0 {
+            comp_size
+        } else {
+            prefix_len + header_len + payload_bytes
+        };
+        pos = data_start + entry_total;
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("{} not found in {}", target_name, npz_path),
+    ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3359,6 +3787,7 @@ pub fn forward_bidirectional_parallel_ext(
     for p in 0..seq_len {
         let xp = &state.x[p * dim..(p + 1) * dim];
         layer_norm(&mut state.xb, xp, &weights.ln_f_weight, &weights.ln_f_bias);
+        state.x[p * dim..(p + 1) * dim].copy_from_slice(&state.xb);
         let logits_p = &mut state.logits[p * config.vocab_size..(p + 1) * config.vocab_size];
         project_lm_head_parallel(logits_p, &state.xb, &weights.classifier_weights, &weights.token_embedding_table, config, &mut state.hb, &mut state.hb2, num_threads);
     }
@@ -3540,6 +3969,7 @@ pub fn forward_bidirectional_q8(
     for p in 0..seq_len {
         let xp = &state.x[p * dim..(p + 1) * dim];
         layer_norm(&mut state.xb, xp, &weights.ln_f_weight, &weights.ln_f_bias);
+        state.x[p * dim..(p + 1) * dim].copy_from_slice(&state.xb);
         let logits_p = &mut state.logits[p * config.vocab_size..(p + 1) * config.vocab_size];
         project_lm_head_q8(logits_p, &state.xb, &weights.classifier_weights, &weights.token_embedding_table, config, &mut state.hb, &mut state.hb2, num_threads);
     }
@@ -3732,6 +4162,7 @@ pub fn forward_bidirectional_q4_ext(
     for p in 0..seq_len {
         let xp = &state.x[p * dim..(p + 1) * dim];
         layer_norm(&mut state.xb, xp, &weights.ln_f_weight, &weights.ln_f_bias);
+        state.x[p * dim..(p + 1) * dim].copy_from_slice(&state.xb);
         let logits_p = &mut state.logits[p * config.vocab_size..(p + 1) * config.vocab_size];
         project_lm_head_q4(logits_p, &state.xb, &weights.classifier_weights, &weights.token_embedding_table, config, &mut state.hb, &mut state.hb2, num_threads);
     }
@@ -4138,8 +4569,8 @@ mod tests {
 
     #[test]
     fn test_esm_config_autodetection() {
-        // 8M ~ FP32 (~30MB) and Q8_0 (~8.5-12MB)
-        let cfg_8m = EsmConfig::detect_from_file_len(30_092_168).expect("8M FP32 detection");
+        // 8M ~ FP32 (30,091,652 B grouped_canonical_v1) and Q8_0 (~8.5-12MB)
+        let cfg_8m = EsmConfig::detect_from_file_len(30_091_652).expect("8M FP32 detection");
         assert_eq!(cfg_8m.arch, EsmModelArch::Esm2_8M);
         assert_eq!(cfg_8m.dim, 320);
         assert_eq!(cfg_8m.hidden_dim, 1280);
@@ -4149,8 +4580,8 @@ mod tests {
         let cfg_8m_q8 = EsmConfig::detect_from_file_len(8_500_000).expect("8M Q8_0 detection");
         assert_eq!(cfg_8m_q8.arch, EsmModelArch::Esm2_8M);
 
-        // 35M ~ FP32 (~134MB) and Q8_0 (~38-48MB)
-        let cfg_35m = EsmConfig::detect_from_file_len(134_068_984).expect("35M FP32 detection");
+        // 35M ~ FP32 (134,067,972 B grouped_canonical_v1) and Q8_0 (~38-48MB)
+        let cfg_35m = EsmConfig::detect_from_file_len(134_067_972).expect("35M FP32 detection");
         assert_eq!(cfg_35m.arch, EsmModelArch::Esm2_35M);
         assert_eq!(cfg_35m.dim, 480);
         assert_eq!(cfg_35m.hidden_dim, 1920);
@@ -4160,8 +4591,8 @@ mod tests {
         let cfg_35m_q8 = EsmConfig::detect_from_file_len(38_000_000).expect("35M Q8_0 detection");
         assert_eq!(cfg_35m_q8.arch, EsmModelArch::Esm2_35M);
 
-        // 150M ~ FP32 (~592MB) and Q8_0 (~166-178MB)
-        let cfg_150m = EsmConfig::detect_from_file_len(592_645_160).expect("150M FP32 detection");
+        // 150M ~ FP32 (592,642,692 B grouped_canonical_v1) and Q8_0 (~166-178MB)
+        let cfg_150m = EsmConfig::detect_from_file_len(592_642_692).expect("150M FP32 detection");
         assert_eq!(cfg_150m.arch, EsmModelArch::Esm2_150M);
         assert_eq!(cfg_150m.dim, 640);
         assert_eq!(cfg_150m.hidden_dim, 2560);
@@ -4171,8 +4602,8 @@ mod tests {
         let cfg_150m_q8 = EsmConfig::detect_from_file_len(170_000_000).expect("150M Q8_0 detection");
         assert_eq!(cfg_150m_q8.arch, EsmModelArch::Esm2_150M);
 
-        // 650M ~ FP32 (~2.60GB) and Q8_0 (~732-780MB)
-        let cfg_650m = EsmConfig::detect_from_file_len(2_604_342_104).expect("650M FP32 detection");
+        // 650M ~ FP32 (2,604,339,332 B grouped_canonical_v1) and Q8_0 (~732-780MB)
+        let cfg_650m = EsmConfig::detect_from_file_len(2_604_339_332).expect("650M FP32 detection");
         assert_eq!(cfg_650m.arch, EsmModelArch::Esm2_650M);
         assert_eq!(cfg_650m.dim, 1280);
         assert_eq!(cfg_650m.hidden_dim, 5120);
@@ -4182,8 +4613,8 @@ mod tests {
         let cfg_650m_q8 = EsmConfig::detect_from_file_len(750_000_000).expect("650M Q8_0 detection");
         assert_eq!(cfg_650m_q8.arch, EsmModelArch::Esm2_650M);
 
-        // 3B ~ FP32 (~11.4GB) and Q8_0 (~3.19-3.4GB)
-        let cfg_3b = EsmConfig::detect_from_file_len(11_357_091_972).expect("3B FP32 detection");
+        // 3B ~ FP32 (11,356,354,692 B grouped_canonical_v1) and Q8_0 (~3.19-3.4GB)
+        let cfg_3b = EsmConfig::detect_from_file_len(11_356_354_692).expect("3B FP32 detection");
         assert_eq!(cfg_3b.arch, EsmModelArch::Esm2_3B);
         assert_eq!(cfg_3b.dim, 2560);
         assert_eq!(cfg_3b.hidden_dim, 10240);
@@ -4325,6 +4756,7 @@ mod tests {
 
     #[test]
     fn test_forward_650m_if_available() {
+        let _guard = crate::HEAVY_MODEL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let model_path = "esm2_650m_weights.bin";
         if !std::path::Path::new(model_path).exists() {
             return;
@@ -4536,6 +4968,7 @@ mod tests {
 
     #[test]
     fn test_forward_650m_q8_and_multithread_if_available() {
+        let _guard = crate::HEAVY_MODEL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let model_path = "esm2_650m_weights.bin";
         if !std::path::Path::new(model_path).exists() {
             return;
@@ -4574,6 +5007,9 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+pub(crate) static HEAVY_MODEL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 mod tests_q4_format {
@@ -5127,6 +5563,7 @@ mod tests_q4_integration {
 
     #[test]
     fn test_forward_q4_integration_150m() {
+        let _guard = crate::HEAVY_MODEL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let q4_path = "esm2_150m_q4_0.bin";
         if !std::path::Path::new(q4_path).exists() {
             println!("Skipping test_forward_q4_integration_150m: file not found");
@@ -5157,6 +5594,7 @@ mod tests_q4_integration {
 
     #[test]
     fn test_forward_q4_integration_650m() {
+        let _guard = crate::HEAVY_MODEL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let q4_path = "esm2_650m_q4_0.bin";
         if !std::path::Path::new(q4_path).exists() {
             println!("Skipping test_forward_q4_integration_650m: file not found");
@@ -5187,11 +5625,12 @@ mod tests_q4_integration {
 
     #[test]
     fn test_forward_q8_codq_header_integration() {
+        let _guard = crate::HEAVY_MODEL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let models = [
             ("esm2_8m_q8_0.bin", EsmModelArch::Esm2_8M),
             ("esm2_35m_q8_0.bin", EsmModelArch::Esm2_35M),
             ("esm2_150m_q8_0.bin", EsmModelArch::Esm2_150M),
-            ("esm2_650m_q8_0_header.bin", EsmModelArch::Esm2_650M),
+            ("esm2_650m_q8_0.bin", EsmModelArch::Esm2_650M),
         ];
 
         for (path, expected_arch) in &models {
@@ -5222,7 +5661,7 @@ mod tests_q4_integration {
             ("8M", "esm2_8m_weights.bin", "esm2_8m_q8_0.bin", "esm2_8m_q4_0.bin", EsmConfig::esm2_8m()),
             ("35M", "esm2_35m_weights.bin", "esm2_35m_q8_0.bin", "esm2_35m_q4_0.bin", EsmConfig::esm2_35m()),
             ("150M", "esm2_150m_weights.bin", "esm2_150m_q8_0.bin", "esm2_150m_q4_0.bin", EsmConfig::esm2_150m()),
-            ("650M", "esm2_650m_weights.bin", "esm2_650m_q8_0_header.bin", "esm2_650m_q4_0.bin", EsmConfig::esm2_650m()),
+            ("650M", "esm2_650m_weights.bin", "esm2_650m_q8_0.bin", "esm2_650m_q4_0.bin", EsmConfig::esm2_650m()),
         ];
 
         let seq = "AQVGDSGGPMLCNGQLQGVTSWGYVCAQPEYPGVYTEVS";
@@ -5417,67 +5856,27 @@ mod tests_regression {
     use super::*;
 
     pub fn read_npz_floats(npz_path: &str, target_name: &str) -> io::Result<Vec<f32>> {
-        let data = std::fs::read(npz_path)?;
-        let target_bytes = target_name.as_bytes();
-        let mut pos = 0;
-        while pos + 30 < data.len() {
-            if &data[pos..pos + 4] == b"PK\x03\x04" {
-                let fn_len = u16::from_le_bytes([data[pos + 26], data[pos + 27]]) as usize;
-                let extra_len = u16::from_le_bytes([data[pos + 28], data[pos + 29]]) as usize;
-                let _uncomp_size = u32::from_le_bytes([data[pos + 22], data[pos + 23], data[pos + 24], data[pos + 25]]) as usize;
-                let fn_start = pos + 30;
-                let fn_end = fn_start + fn_len;
-                if fn_end <= data.len() && &data[fn_start..fn_end] == target_bytes {
-                    let data_start = fn_end + extra_len;
-                    if data_start + 10 <= data.len() && &data[data_start..data_start + 6] == b"\x93NUMPY" {
-                        let header_len = u16::from_le_bytes([data[data_start + 8], data[data_start + 9]]) as usize;
-                        let raw_start = data_start + 10 + header_len;
-
-                        let mut raw_end = data.len();
-                        for i in raw_start..data.len().saturating_sub(4) {
-                            if &data[i..i + 2] == b"PK" {
-                                raw_end = i;
-                                break;
-                            }
-                        }
-
-                        let float_bytes = &data[raw_start..raw_end];
-                        let n_floats = float_bytes.len() / 4;
-                        let mut floats = Vec::with_capacity(n_floats);
-                        for chunk in float_bytes[..n_floats * 4].chunks_exact(4) {
-                            floats.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
-                        }
-                        return Ok(floats);
-                    }
-                }
-            }
-            pos += 1;
-        }
-        Err(io::Error::new(io::ErrorKind::NotFound, format!("{} not found in {}", target_name, npz_path)))
+        crate::read_npz_floats(npz_path, target_name)
     }
 
     #[test]
-    fn test_regression_esm2_8m_against_ref_npz() {
-        let model_path = "esm2_8m_weights.bin";
-        let ref_path = "scripts/ref_8m.npz";
-
-        if !std::path::Path::new(model_path).exists() {
-            println!("Skipping test_regression_esm2_8m_against_ref_npz: {} not found", model_path);
-            return;
+    fn test_strict_fp32_loader_rejects_corrupted_size() {
+        let temp_path = "target/test_corrupt_fp32_size.bin";
+        {
+            let file = File::create(temp_path).expect("Create temp file");
+            file.set_len(30_091_656).expect("Set corrupted length (expected 30,091,652)");
         }
-        if !std::path::Path::new(ref_path).exists() {
-            println!("Skipping test_regression_esm2_8m_against_ref_npz: {} not found", ref_path);
-            return;
-        }
+        let cfg = EsmConfig::esm2_8m();
+        let err = EsmWeights::from_file(temp_path, &cfg)
+            .err()
+            .expect("Must reject non-canonical FP32 length");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let _ = std::fs::remove_file(temp_path);
+    }
 
-        let ref_logits = match read_npz_floats(ref_path, "logits.npy") {
-            Ok(logits) => logits,
-            Err(e) => {
-                println!("Skipping test_regression_esm2_8m_against_ref_npz: failed to read logits from npz ({})", e);
-                return;
-            }
-        };
-
+    #[test]
+    fn test_regression_esm2_fp32_all_scales_against_ref_npz() {
+        let _guard = crate::HEAVY_MODEL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let fasta_path = "test_peptidase.fasta";
         let raw_seq = if std::path::Path::new(fasta_path).exists() {
             let content = std::fs::read_to_string(fasta_path).expect("Read fasta");
@@ -5489,53 +5888,150 @@ mod tests_regression {
         let tokens = Tokenizer::encode(&raw_seq);
         let seq_len = tokens.len();
         assert_eq!(seq_len, 41, "Sequence must be 39 aa + BOS/EOS = 41 tokens");
-        assert_eq!(ref_logits.len(), seq_len * 33, "Ref logits length mismatch");
 
-        let config = EsmConfig::esm2_8m();
-        let weights = EsmWeights::from_file(model_path, &config).expect("Load 8M weights");
-        let mut state = BidirectionalRunState::new(&config, seq_len);
-        forward_bidirectional(&tokens, &config, &weights, &mut state);
+        let scales = [
+            ("8M", "esm2_8m_weights.bin", "scripts/ref_8m.npz", EsmConfig::esm2_8m()),
+            ("35M", "esm2_35m_weights.bin", "scripts/ref_35m.npz", EsmConfig::esm2_35m()),
+            ("150M", "esm2_150m_weights.bin", "scripts/ref_150m.npz", EsmConfig::esm2_150m()),
+            ("650M", "esm2_650m_weights.bin", "scripts/ref_650m.npz", EsmConfig::esm2_650m()),
+        ];
 
-        let rust_logits = &state.logits[0..seq_len * 33];
-        let cos_sim = compute_cosine_similarity(rust_logits, &ref_logits);
-        println!("8M Regression: Logits Cosine Similarity vs HF = {:.6}", cos_sim);
-        assert!(
-            cos_sim >= 0.9999,
-            "Logits cosine similarity ({:.6}) must be >= 0.9999",
-            cos_sim
-        );
+        for (name, model_path, ref_path, config) in scales {
+            if !std::path::Path::new(model_path).exists() || !std::path::Path::new(ref_path).exists() {
+                println!("Skipping {} FP32 regression: {} or {} not found", name, model_path, ref_path);
+                continue;
+            }
 
-        // Check Top-1 unmasked reconstruction against input sequence
-        let mut top1_matches = 0;
-        let aa_tokens = &tokens[1..seq_len - 1];
-        for (i, &expected_token) in aa_tokens.iter().enumerate() {
-            let pos = i + 1;
-            let logits_pos = &state.logits[pos * config.vocab_size..(pos + 1) * config.vocab_size];
-            let mut best_tok = 0;
-            let mut best_val = f32::NEG_INFINITY;
-            for (tok_id, &val) in logits_pos.iter().enumerate() {
-                if val > best_val {
-                    best_val = val;
-                    best_tok = tok_id;
+            let ref_logits = read_npz_floats(ref_path, "logits.npy").expect("Read ref logits.npy");
+            let ref_hs = read_npz_floats(ref_path, "hidden_states.npy").expect("Read ref hidden_states.npy");
+            assert_eq!(ref_logits.len(), seq_len * 33, "{} ref logits length mismatch", name);
+            assert_eq!(
+                ref_hs.len(),
+                (config.n_layers + 1) * seq_len * config.dim,
+                "{} ref hidden_states length mismatch",
+                name
+            );
+
+            let weights = EsmWeights::from_file(model_path, &config).expect("Load FP32 weights");
+            let mut state = BidirectionalRunState::new(&config, seq_len);
+            let mut layer_outputs: Vec<Vec<f32>> = Vec::with_capacity(config.n_layers);
+            forward_bidirectional_parallel_ext(
+                &tokens,
+                &config,
+                &weights,
+                &mut state,
+                4,
+                Some(&mut |_l, x_slice| {
+                    layer_outputs.push(x_slice.to_vec());
+                }),
+            );
+
+            // Check intermediate layers (0..n_layers-1) and final post-LN hidden state against hidden_states
+            let hs_stride = seq_len * config.dim;
+            let mut min_layer_cos = 1.0f32;
+            for l in 0..config.n_layers.saturating_sub(1) {
+                let ref_l = &ref_hs[(l + 1) * hs_stride..(l + 2) * hs_stride];
+                let cos_l = compute_cosine_similarity(&layer_outputs[l], ref_l);
+                if cos_l < min_layer_cos {
+                    min_layer_cos = cos_l;
                 }
             }
-            if best_tok == expected_token {
-                top1_matches += 1;
+            let ref_final_hs = &ref_hs[config.n_layers * hs_stride..(config.n_layers + 1) * hs_stride];
+            let rust_final_hs = &state.x[0..hs_stride];
+            let hs_cos = compute_cosine_similarity(rust_final_hs, ref_final_hs);
+
+            let rust_logits = &state.logits[0..seq_len * 33];
+            let logits_cos = compute_cosine_similarity(rust_logits, &ref_logits);
+            let top1_vs_hf = compute_top1_match_rate(&ref_logits, rust_logits, 33);
+
+            println!(
+                "{} FP32 Regression vs HF: Min Layer Cos = {:.7}, Final HS Cos = {:.7}, Logits Cos = {:.7}, Top-1 vs HF = {:.2}%",
+                name,
+                min_layer_cos,
+                hs_cos,
+                logits_cos,
+                top1_vs_hf * 100.0
+            );
+
+            assert!(
+                min_layer_cos >= 0.99999,
+                "{} Min intermediate layer HS cosine ({:.7}) must be >= 0.99999",
+                name,
+                min_layer_cos
+            );
+            assert!(
+                hs_cos >= 0.99999,
+                "{} Final HS cosine ({:.7}) must be >= 0.99999",
+                name,
+                hs_cos
+            );
+            assert!(
+                logits_cos >= 0.99999,
+                "{} Logits cosine ({:.7}) must be >= 0.99999",
+                name,
+                logits_cos
+            );
+            assert!(
+                (top1_vs_hf - 1.0).abs() < 1e-6,
+                "{} Top-1 match vs HF ({:.2}%) must be 100%",
+                name,
+                top1_vs_hf * 100.0
+            );
+        }
+    }
+
+    #[test]
+    fn test_regression_quantized_q8_q4_against_ref_npz_including_3b() {
+        let _guard = crate::HEAVY_MODEL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let fasta_path = "test_peptidase.fasta";
+        let raw_seq = if std::path::Path::new(fasta_path).exists() {
+            let content = std::fs::read_to_string(fasta_path).expect("Read fasta");
+            content.lines().filter(|l| !l.is_empty() && !l.starts_with('>')).collect::<Vec<_>>().join("")
+        } else {
+            "AQVGDSGGPMLCNGQLQGVTSWGYVCAQPEYPGVYTEVS".to_string()
+        };
+        let tokens = Tokenizer::encode(&raw_seq);
+        let seq_len = tokens.len();
+
+        let scales = [
+            ("8M", "esm2_8m_q8_0.bin", "esm2_8m_q4_0.bin", "scripts/ref_8m.npz", EsmConfig::esm2_8m()),
+            ("35M", "esm2_35m_q8_0.bin", "esm2_35m_q4_0.bin", "scripts/ref_35m.npz", EsmConfig::esm2_35m()),
+            ("150M", "esm2_150m_q8_0.bin", "esm2_150m_q4_0.bin", "scripts/ref_150m.npz", EsmConfig::esm2_150m()),
+            ("650M", "esm2_650m_q8_0.bin", "esm2_650m_q4_0.bin", "scripts/ref_650m.npz", EsmConfig::esm2_650m()),
+            ("3B", "esm2_3b_q8_0.bin", "esm2_3b_q4_0.bin", "scripts/ref_3b.npz", EsmConfig::esm2_3b()),
+        ];
+
+        for (name, q8_path, q4_path, ref_path, config) in scales {
+            if !std::path::Path::new(ref_path).exists() {
+                continue;
+            }
+            let ref_logits = read_npz_floats(ref_path, "logits.npy").expect("Read ref logits");
+            let ref_hs = read_npz_floats(ref_path, "hidden_states.npy").expect("Read ref hidden_states");
+            let hs_stride = seq_len * config.dim;
+            let ref_final_hs = &ref_hs[config.n_layers * hs_stride..(config.n_layers + 1) * hs_stride];
+
+            if std::path::Path::new(q8_path).exists() {
+                let (_, weights_q8) = EsmWeightsQ8::load_from_file(q8_path).expect("Load Q8_0");
+                let mut state_q8 = BidirectionalRunState::new(&config, seq_len);
+                forward_bidirectional_q8(&tokens, &config, &weights_q8, &mut state_q8, 4);
+                let cos_hs = compute_cosine_similarity(&state_q8.x[0..hs_stride], ref_final_hs);
+                let cos_log = compute_cosine_similarity(&state_q8.logits[0..seq_len * 33], &ref_logits);
+                println!("{} Q8_0 vs HF: HS Cos = {:.6}, Logits Cos = {:.6}", name, cos_hs, cos_log);
+                assert!(cos_hs >= 0.990, "{} Q8_0 HS cosine {:.6} < 0.990", name, cos_hs);
+                assert!(cos_log >= 0.990, "{} Q8_0 Logits cosine {:.6} < 0.990", name, cos_log);
+            }
+
+            if std::path::Path::new(q4_path).exists() {
+                let (_, weights_q4) = EsmWeightsQ4::load_from_file(q4_path).expect("Load Q4_0");
+                let mut state_q4 = BidirectionalRunState::new(&config, seq_len);
+                forward_bidirectional_q4(&tokens, &config, &weights_q4, &mut state_q4, 4);
+                let cos_hs = compute_cosine_similarity(&state_q4.x[0..hs_stride], ref_final_hs);
+                let cos_log = compute_cosine_similarity(&state_q4.logits[0..seq_len * 33], &ref_logits);
+                println!("{} Q4_0 vs HF: HS Cos = {:.6}, Logits Cos = {:.6}", name, cos_hs, cos_log);
+                assert!(cos_hs >= 0.900, "{} Q4_0 HS cosine {:.6} < 0.900", name, cos_hs);
+                assert!(cos_log >= 0.900, "{} Q4_0 Logits cosine {:.6} < 0.900", name, cos_log);
             }
         }
-
-        let accuracy = top1_matches as f32 / aa_tokens.len() as f32;
-        println!(
-            "8M Regression: Top-1 unmasked match = {}/{} ({:.2}%)",
-            top1_matches,
-            aa_tokens.len(),
-            accuracy * 100.0
-        );
-        assert!(
-            accuracy >= 0.90,
-            "Unmasked Top-1 accuracy ({:.2}%) must be >= 90.0%",
-            accuracy * 100.0
-        );
     }
 }
 

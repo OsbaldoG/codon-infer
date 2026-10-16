@@ -37,8 +37,7 @@ fn main() {
         let mut fp_top = String::new();
         let mut q4_top = String::new();
         let mut in_str = String::new();
-        for t in 0..seq_len {
-            let tok = tokens[t];
+        for (t, &tok) in tokens.iter().enumerate().take(seq_len) {
             let s_fp = &st_fp.logits[t * 33..(t + 1) * 33];
             let s_q4 = &st_q4.logits[t * 33..(t + 1) * 33];
             let top_fp = s_fp.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0;
