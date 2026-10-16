@@ -26,12 +26,12 @@ Al prescindir por completo de los ecosistemas de Python, PyTorch, C/CUDA y crate
 
 * **Motor de Cuantización Nativa por Bloques `Q4_0` a 4 Bits (`BlockQ4_0`):**
   * Representación sub-byte que empaqueta 32 nibbles de 4 bits en 16 bytes junto a un factor de escala flotante `d` de 32 bits (`#[repr(C)]`, exactamente **20 bytes** por bloque de 32 parámetros).
-  * Convención de cuantización simétrica estándar compatible con llama.cpp: $d = \max / -8.0$, $id = 1/d$, $q = \text{clamp}(\text{round}(x \cdot id) + 8, 0, 15)$. El nibble bajo almacena el índice $j \in [0, 15]$ y el nibble alto el índice $j + 16$.
+  * Convención de cuantización simétrica estándar compatible con llama.cpp: `d = max / -8.0`, `id = 1/d`, `q = clamp(round(x · id) + 8, 0, 15)`. El nibble bajo almacena el índice `j ∈ [0, 15]` y el nibble alto el índice `j + 16`.
   * **Compresión Teórica de Matrices de 6.40×** (0.625 B/parámetro frente a 4.0 B en FP32) y hasta **6.30× de Reducción Total del Archivo** (**ESM-2 3B** reducido de 11.36 GB a **1.80 GB**, y **ESM-2 650M** reducido de 2.60 GB a **414.62 MB**).
   * **Reducción de ~83.5% en Memoria Pico (RSS):** La huella de memoria en RAM de ESM-2 650M pasa de 2,501.33 MiB en FP32 a **413.07 MiB en Q4_0**, mientras que **ESM-2 3B** se ejecuta en apenas **1,752.57 MiB RSS en Q4_0** (`3,102.18 MiB` en Q8_0) sobre una máquina de 11 GiB de RAM.
   * **Aceleración de 1.92× en Inferencia para ESM-2 650M:** Alivia el cuello de botella de ancho de banda DRAM en ejecuciones con 4 hilos (**4,535.47 ms** en Q4_0 y **4,669.89 ms** en Q8_0 frente a **8,692.15 ms** en FP32).
 * **Paridad Matemática Exacta con HuggingFace (`grouped_canonical_v1`):**
-  * Validación estricta al byte exacto en las 5 escalas (`8M`, `35M`, `150M`, `650M`, `3B`) con **100.0% de coincidencia Top-1** y similitud de coseno $\ge 0.999999$ frente a las referencias oficiales de HuggingFace `facebook/esm2_*` (`hidden_states` y `logits`).
+  * Validación estricta al byte exacto en las 5 escalas (`8M`, `35M`, `150M`, `650M`, `3B`) con **100.0% de coincidencia Top-1** y similitud de coseno ≥ 0.999999 frente a las referencias oficiales de HuggingFace `facebook/esm2_*` (`hidden_states` y `logits`).
   * Cuantizadores por streaming bloque a bloque (`quantize_file_streaming_q8` / `quantize_file_streaming_q4`) mediante `BufReader` / `BufWriter` que convierten los 10.58 GiB de `esm2_3b_weights.bin` con un **Peak RSS de solo 12.55 MiB**.
 * **Arquitectura de Cabecera Universal `CODQ` de 64 Bytes:**
   * Cabecera fija little-endian de 64 bytes (`b"CODQ"`, versión 1, tipo de datos, arquitectura, profundidad de capas, dimensión oculta, dimensión FFN, vocabulario).
@@ -60,22 +60,22 @@ Al prescindir por completo de los ecosistemas de Python, PyTorch, C/CUDA y crate
   * Detección automática de la topología del procesador (`detect_optimal_threads` vía `/proc/cpuinfo`) que prioriza núcleos físicos de cómputo sobre hilos lógicos SMT/Hyper-Threading, saturando los puertos vectoriales AVX de 256 bits sin contención.
 * **Arquitectura Multi-Escala y Autodetección Paramétrica (`detect_from_file_len`):**
   * Instanciación instantánea y sin configuración manual para las variantes **ESM-2 8M**, **35M**, **150M**, **650M** y **3B** a partir de la longitud en bytes del archivo binario de pesos, eliminando la necesidad de archivos de configuración JSON o manifiestos auxiliares.
-* **Kernels de Atención SIMD Dinámicos y Heterogéneos ($d_k \in \{16, 24, 32, 64\}$):**
-  * Micro-kernels vectoriales AVX de 256 bits y AVX-512 de 512 bits optimizados a mano y mapeados a 2, 3, 4 u 8 registros `__m256` (o 4 registros `__m512` ZMM) por cabeza de atención, maximizando la densidad de cómputo vectorial con paridad escalar bit a bit ($\Delta < 10^{-5}$) tanto en pasadas autorregresivas causales como bidireccionales completas.
+* **Kernels de Atención SIMD Dinámicos y Heterogéneos (`d_k` ∈ {16, 24, 32, 64}):**
+  * Micro-kernels vectoriales AVX de 256 bits y AVX-512 de 512 bits optimizados a mano y mapeados a 2, 3, 4 u 8 registros `__m256` (o 4 registros `__m512` ZMM) por cabeza de atención, maximizando la densidad de cómputo vectorial con paridad escalar bit a bit (Δ < 10⁻⁵) tanto en pasadas autorregresivas causales como bidireccionales completas.
 * **Subcomandos de CLI para Entornos de Producción (`generate`, `inpaint`, `dms`, `contacts`, `benchmark`, `quantize`):**
   * Interfaz de terminal expresiva y unificada con soporte de subcomandos, banderas globales (`--model`, `--threads`, `--quantize`, `--color`, `--no-color`), detección automática de TTY y diagnósticos claros de errores.
 * **Experiencia de Usuario TrueColor ANSI sin Dependencias (`ui.rs`):**
   * **Paleta Fisicoquímica:** Residuos de aminoácidos formateados en colores ANSI RGB TrueColor según sus propiedades bioquímicas (Alifáticos, Aromáticos, Básicos, Ácidos, Polares, Cisteínas y de Flexibilidad Conformacional).
-  * **Mapa de Calor Térmico Continuo:** Interpolación RGB dinámica (`lerp_rgb`) desde Carmesí Profundo (`#7F1D1D`) para mutaciones deletéreas/letales ($\Delta \log P \le -4.0$) pasando por Ámbar y Pizarra Neutro, hasta Azul Eléctrico (`#1E3A8A`) para variantes benéficas, preservando glifos de densidad ASCII (`█`, `▓`, `▒`, `░`, `·`) en terminales sin soporte de color.
+  * **Mapa de Calor Térmico Continuo:** Interpolación RGB dinámica (`lerp_rgb`) desde Carmesí Profundo (`#7F1D1D`) para mutaciones deletéreas/letales (Δ log P ≤ -4.0) pasando por Ámbar y Pizarra Neutro, hasta Azul Eléctrico (`#1E3A8A`) para variantes benéficas, preservando glifos de densidad ASCII (`█`, `▓`, `▒`, `░`, `·`) en terminales sin soporte de color.
   * **Barra de Progreso Dinámica en Stderr:** Actualizaciones limpias con retornos de carro ANSI `\r` reportando rendimiento instantáneo (`muts/s`) y tiempo estimado de finalización (`ETA`) sin contaminar las salidas redirigidas a `stdout`.
 * **Pipeline Multi-FASTA y Transmisión por Flujos (`fasta.rs`):**
   * Parser de streaming de alto rendimiento y cero copias para archivos multi-FASTA (`--fasta <FICHERO>`), entrada estándar (`--fasta -`) o secuencias pasadas directamente como argumento (`--sequence <CADENA>`).
 * **Formatos de Exportación con Calidad de Publicación (`export.rs`):**
   * Generación de matrices rectangulares en formato CSV e informes exhaustivos en JSON con tolerancias mutacionales por residuo, entropía informacional de Shannon y pares de contacto de alta probabilidad.
 * **Evaluador de Ventana Deslizante para Proteínas de Longitud Completa (`pipeline.rs`):**
-  * Procesa proteínas de longitud arbitraria mediante ventanas deslizantes adaptativas ($W=128, S=64$) centradas en los residuos evaluados, evitando distorsiones en los bordes por RoPE y garantizando localidad en caché.
+  * Procesa proteínas de longitud arbitraria mediante ventanas deslizantes adaptativas (W = 128, S = 64) centradas en los residuos evaluados, evitando distorsiones en los bordes por RoPE y garantizando localidad en caché.
 * **Aceleración por Hardware Multi-SIMD y Núcleo en Rust Puro:**
-  * **AVX-512:** Pipeline vectorial de 512 bits para procesamiento ultraveloz de atención con $d_k=64$ en arquitecturas Intel Xeon y AMD Zen 4+.
+  * **AVX-512:** Pipeline vectorial de 512 bits para procesamiento ultraveloz de atención con `d_k = 64` en arquitecturas Intel Xeon y AMD Zen 4+.
   * **AVX2 + FMA:** Pipeline vectorial con instrucciones Fused Multiply-Add de 256 bits para arquitecturas AMD Ryzen e Intel Haswell o superiores.
   * **AVX1:** Kernel SIMD de 256 bits compatible con procesadores Intel Sandy Bridge / Ivy Bridge heredados.
   * **Despacho Dinámico en Tiempo de Ejecución:** Detección de capacidades del microprocesador al inicio mediante `is_x86_feature_detected!`.
@@ -92,36 +92,37 @@ Evaluado en Linux x86_64 (ejecución monohilo en CPU con instrucciones vectorial
 ### 1. Contraste frente a la Línea Base de Python / PyTorch
 La migración arquitectónica a Rust puro con garantías deterministas de cero asignaciones en memoria supera drásticamente al ecosistema tradicional de Python/PyTorch en todas las métricas operativas:
 
-| Métrica | Referencia PyTorch / Python (ESM-2 8M) | `codon-infer` v1.5 (Rust Puro + SIMD) | Ventaja de Ingeniería |
+| Métrica | Referencia PyTorch / Python (ESM-2 8M) | `codon-infer` v1.6 (Rust Puro + SIMD) | Ventaja de Ingeniería |
 | :--- | :--- | :--- | :--- |
 | **Dependencias** | Python, PyTorch, LibTorch, CUDA (~4–7 GB) | **`std` puro (0 crates, 0 dependencias dinámicas)** | **~99.9% más liviano** |
-| **Tamaño del Ejecutable** | Entorno multigiagabyte | **~1.5 MB binario release compilado** | **Binario único ultra-portable** |
-| **Latencia de Carga** | ~2,500 – 4,000 ms (inicialización PyTorch) | **34.8 ms (8M) / 117.4 ms (35M) / 219.98 ms (650M Q8)** | **~12x – 100x arranque más rápido** |
-| **Huella en Memoria (RAM)** | ~1.5 – 2.5 GB RSS base | **~35 MB RSS estático (8M) / ~698.5 MB (650M Q8)** | **~4x – 50x más eficiente en memoria** |
-| **Rendimiento de Inferencia** | ~15 – 35 tokens/seg (CPU monohilo) | **~333.3 tok/s (8M) / 7.70 tok/s (650M Q8_0 -t 2)** | **Máxima densidad de cómputo, 0 asignaciones** |
+| **Tamaño del Ejecutable** | Entorno multigigabyte | **~1.1 MB binario release compilado** | **Binario único ultra-portable** |
+| **Latencia de Carga** | ~2,500 – 4,000 ms (inicialización PyTorch) | **4.69 ms (8M Q4) / 12.85 ms (35M Q4) / 137.3 ms (650M Q4)** | **~20x – 850x arranque más rápido** |
+| **Huella en Memoria (RAM)** | ~1.5 – 2.5 GB RSS base | **29.3 MB RSS (8M Q4) / 413.1 MB (650M Q4) / 1.75 GB (3B Q4)** | **~4x – 85x más eficiente en memoria** |
+| **Rendimiento de Inferencia** | ~15 – 35 tokens/seg (CPU monohilo) | **456.5 tok/s (8M Q4) / 9.04 tok/s (650M Q4) / 2.12 tok/s (3B Q4)** | **Máxima densidad de cómputo, 0 asignaciones** |
 | **Asignación de Memoria** | Pausas continuas de GC y churn de tensores | **0 asignaciones de heap en el hot-path** | **Garantías deterministas en tiempo real** |
 
-### 2. Matriz de Rendimiento Multi-Escala Real (ESM-2 8M a 650M)
-Medido empíricamente con `codon-infer benchmark --suite full` bajo ejecución en CPU con despacho SIMD nativo:
+### 2. Matriz de Rendimiento Multi-Escala Real (ESM-2 8M a 3B)
+Métricas empíricas auditadas en Linux x86_64 (AVX2+FMA, 4 hilos, 41 tokens, kernel `wait4 ru_maxrss` de `docs/benchmarks_v1.6.0.md`):
 
-| Escala del Modelo | Capas ($L$) | Dimensión Oculta ($d$) | Cabezas Atención ($H \times d_k$) | Latencia Carga Pesos | Throughput Autorregresivo | Throughput Bidireccional ($L=32$) | Buffer Estado Trabajo ($L=128$) | Jerarquía de Caché y Memoria |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **ESM-2 8M** | 6 | 320 | $20 \times 16$ (2 reg AVX) | **34.8 ms** | **~333.3 tokens/s** (3.0 ms/tok) | **~418.8 tokens/s** (76.4 ms) | **911.0 KB** | **100% en Caché L3** ($\le 32$ MB) · Limitado por Cómputo |
-| **ESM-2 35M** | 12 | 480 | $20 \times 24$ (3 reg AVX) | **117.4 ms** | **~84.7 tokens/s** (11.8 ms/tok) | **~89.9 tokens/s** (356.1 ms) | **1,321.2 KB** | **Residencia Parcial L3 / DDR** · Balanceado Caché/DRAM |
-| **ESM-2 150M** | 30 | 640 | $20 \times 32$ (4 reg AVX) | **466.8 ms** | **~18.9 tokens/s** (53.0 ms/tok) | **~20.2 tokens/s** (1,583.7 ms) | **1,731.5 KB** | **Streaming desde RAM** ($>500$ MB) · Limitado por Bus de Memoria |
-| **ESM-2 650M (FP32)** | 33 | 1280 | $20 \times 64$ (8 reg AVX) | **751.2 ms** | **4.57 tokens/s** (218.8 ms/tok) | **~4.8 tokens/s** (~6,600 ms) | **3,450.0 KB** | **Streaming desde RAM** (~2.48 GB RSS) · Limitado por Bus de Memoria |
-| **ESM-2 650M (Q8_0, -t 2)** | 33 | 1280 | $20 \times 64$ (8 reg AVX) | **219.98 ms** | **7.70 tokens/s** (129.9 ms/tok) | **~8.2 tokens/s** (~3,900 ms) | **3,450.0 KB** | **Optimizado para Streaming DRAM** (~698.5 MB RSS) · Núcleos Saturados |
+| Escala del Modelo | Capas (L) | Dimensión Oculta (d) | Cabezas Atención (H × d_k) | Tamaño Binario Q4_0 | Latencia Carga Q4_0 | Bidireccional (41 tok, 4T) | Pico RAM RSS (Q4_0) | Jerarquía de Caché y Memoria |
+| :--- | :---: | :---: | :---: | ---: | ---: | ---: | ---: | :--- |
+| **ESM-2 8M** | 6 | 320 | 20 × 16 (2 YMM) | **4.97 MiB** (`5,208,516 B`) | **4.69 ms** | **456.5 tok/s** (89.8 ms) | **29.29 MiB** | **100% en Caché L3** (≤ 32 MB) · Limitado por Cómputo |
+| **ESM-2 35M** | 12 | 480 | 20 × 24 (3 YMM) | **21.07 MiB** (`22,093,636 B`) | **12.85 ms** | **128.7 tok/s** (318.6 ms) | **29.41 MiB** | **Residencia Parcial L3 / DDR** · Balanceado Caché/DRAM |
+| **ESM-2 150M** | 30 | 640 | 20 × 32 (4 YMM) | **90.58 MiB** (`94,978,756 B`) | **39.17 ms** | **30.0 tok/s** (1,367.8 ms) | **100.39 MiB** | **Streaming desde RAM** (> 500 MB FP32) · Limitado por Bus |
+| **ESM-2 650M** | 33 | 1280 | 20 × 64 (8 YMM) | **395.41 MiB** (`414,617,796 B`) | **137.32 ms** | **9.04 tok/s** (4,535.5 ms) | **413.07 MiB** | **Optimizado para Streaming DRAM** · Núcleos Saturados |
+| **ESM-2 3B** | 36 | 2560 | 40 × 64 (8 YMM) | **1,717.76 MiB** (`1,801,205,956 B`) | **545.36 ms** | **2.12 tok/s** (19,368.9 ms) | **1,752.57 MiB** | **Streaming Masivo DRAM** (Opera en < 2 GB RAM) |
 
 ### 3. Escalamiento Multihilo y Cuantización en ESM-2 650M (Núcleos Físicos vs SMT)
 
 Evaluado en procesador de doble núcleo Intel Sandy Bridge (Core i5-2520M @ 2.50 GHz, 2 núcleos físicos, 4 hilos lógicos SMT) con micro-kernels vectoriales AVX1:
 
-| Configuración de Ejecución | Precisión de Pesos | Huella en Memoria (RAM) | Latencia de Carga en Frío | Throughput | Latencia por Token | Aceleración Relativa |
+| Configuración de Ejecución | Precisión de Pesos | Huella en Memoria (RAM) | Latencia de Carga en Frío | Throughput | Latency por Token | Aceleración Relativa |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | **1 Hilo (Monocore)** | FP32 | 2,485 MB | 751.2 ms | 4.57 tok/s | 218.8 ms/tok | 1.00x (Base) |
 | **1 Hilo (Monocore)** | Q8_0 | 698.5 MB | 219.98 ms | 5.15 tok/s | 194.2 ms/tok | 1.13x |
-| **2 Núcleos Físicos (`-t 2`)** | **Q8_0** | **698.5 MB** | **219.98 ms** | **7.70 tok/s** | **129.9 ms/tok** | **1.68x (Óptimo)** |
+| **2 Núcleos Físicos (`-t 2`)** | Q8_0 | 698.5 MB | 219.98 ms | 7.70 tok/s | 129.9 ms/tok | 1.68x |
 | **4 Hilos SMT (`-t 4`)** | Q8_0 | 698.5 MB | 219.98 ms | 7.48 tok/s | 133.7 ms/tok | 1.64x (Contención AVX) |
+| **4 Hilos (`-t 4`)** | **Q4_0** | **413.1 MB** | **137.32 ms** | **9.04 tok/s** | **110.6 ms/tok** | **1.98x (Aceleración Máxima y Menor RAM)** |
 
 > [!NOTE]
 > **Saturación de Núcleos Físicos vs Hyper-Threading:** En arquitecturas donde los hilos lógicos SMT comparten el puerto de ejecución vectorial AVX de 256 bits por núcleo físico, asignar 2 hilos a los 2 núcleos reales (`-t 2`) otorga el rendimiento máximo (7.70 tok/s) y la mínima latencia de sincronización. `codon-infer` detecta automáticamente los núcleos físicos vía `detect_optimal_threads` si se omite `--threads`.
@@ -137,7 +138,7 @@ Entrada (Prompt):  MCMPCFTTDHQMARKCDD
 Generación:        MCMPCFTTDHQMARKCDDDPCCIIVQCCRQEIIQRCCLRIDRNCCIIIVYCCNCY
 ```
 
-Al someter las secuencias candidatas a la base de datos **NCBI BLASTP** contra secuencias no redundantes, se confirmó alineamiento significativo con estructuras cristalográficas auténticas de clorotoxina (PDB: [`7X41_A`](https://www.rcsb.org/structure/7X41), E-value: $0.001$), demostrando la preservación de motivos estructurales y una exploración coherente del espacio conformacional peptídico *de novo*.
+Al someter las secuencias candidatas a la base de datos **NCBI BLASTP** contra secuencias no redundantes, se confirmó alineamiento significativo con estructuras cristalográficas auténticas de clorotoxina (PDB: [`7X41_A`](https://www.rcsb.org/structure/7X41), E-value: 0.001), demostrando la preservación de motivos estructurales y una exploración coherente del espacio conformacional peptídico *de novo*.
 
 ---
 
@@ -212,43 +213,46 @@ pub fn detect_from_file_len(file_len: u64) -> io::Result<Self> {
     }
 }
 ```
-Cualquier archivo de pesos personalizado suministrado mediante `--model <RUTA>` es identificado y validado al arrancar en $< 0.1\text{ ms}$, redimensionando automáticamente los búferes internos, cachés KV y matrices de proyección sin sobrecoste de asignación en tiempo de ejecución.
+Cualquier archivo de pesos personalizado suministrado mediante `--model <RUTA>` es identificado y validado al arrancar en < 0.1 ms, redimensionando automáticamente los búferes internos, cachés KV y matrices de proyección sin sobrecoste de asignación en tiempo de ejecución.
 
 ### 2. Optimización SIMD y Despacho Dinámico de Atención Heterogénea
-En el mecanismo de atención multi-cabeza, cada cabeza posee una dimensión $d_k = d_{\text{model}} / H$. Mientras que 8M, 35M, 150M y 650M estandarizan $H=20$ cabezas de atención, 3B escala a $H=40$ cabezas:
-* **8M:** $d_k = 320 / 20 = 16$ flotantes
-* **35M:** $d_k = 480 / 20 = 24$ flotantes
-* **150M:** $d_k = 640 / 20 = 32$ flotantes
-* **650M:** $d_k = 1280 / 20 = 64$ flotantes
-* **3B:** $d_k = 2560 / 40 = 64$ flotantes
+En el mecanismo de atención multi-cabeza, cada cabeza posee una dimensión d_k = d_model / H. Mientras que 8M, 35M, 150M y 650M estandarizan H = 20 cabezas de atención, 3B escala a H = 40 cabezas:
+* **8M:** d_k = 320 / 20 = 16 flotantes
+* **35M:** d_k = 480 / 20 = 24 flotantes
+* **150M:** d_k = 640 / 20 = 32 flotantes
+* **650M:** d_k = 1280 / 20 = 64 flotantes
+* **3B:** d_k = 2560 / 40 = 64 flotantes
 
-Debido a que cada registro AVX de 256 bits (`__m256`) almacena con precisión 8 números flotantes de precisión simple (`f32`), y cada registro AVX-512 de 512 bits (`__m512`) almacena 16 flotantes, cada $d_k$ resulta ser un múltiplo entero exacto:
-$$\frac{16}{8} = 2 \text{ YMM}, \quad \frac{24}{8} = 3 \text{ YMM}, \quad \frac{32}{8} = 4 \text{ YMM}, \quad \frac{64}{8} = 8 \text{ YMM} \quad (\text{o } 4 \text{ ZMM en AVX-512})$$
+Debido a que cada registro AVX de 256 bits (`__m256`) almacena con precisión 8 números flotantes de precisión simple (`f32`), y cada registro AVX-512 de 512 bits (`__m512`) almacena 16 flotantes, cada `d_k` resulta ser un múltiplo entero exacto:
+
+```text
+16 / 8 = 2 YMM,   24 / 8 = 3 YMM,   32 / 8 = 4 YMM,   64 / 8 = 8 YMM  (o 4 ZMM en AVX-512)
+```
 
 `codon-infer` implementa micro-kernels vectoriales especializados y desenrollados (*loop-unrolled*) para productos escalares y acumulación de valores:
-* **Producto Escalar Escalado ($Q \cdot K^\top$):** `dot_product_head_avx` procesa 16, 24, 32 o 64 dimensiones en paralelo sin bucles escalares residuales ni comprobaciones de límites (`_mm256_mul_ps`, `_mm256_add_ps`, `hsum256_ps_avx`). En hardware con AVX-512, $d_k=64$ se despacha a `dot_product_head_avx512_d64` aprovechando 4 registros ZMM y reducción horizontal de ciclo único (`_mm512_reduce_add_ps`).
-* **Acumulación del Vector de Valores ($V \times \text{prob}$):** `accumulate_value_head_avx` difunde (*broadcast*) la probabilidad escalar a lo largo de un vector completo (`_mm256_set1_ps`) y ejecuta operaciones vectoriales combinadas de multiplicación y acumulación. Para $d_k=64$, AVX-512 despacha `accumulate_value_head_avx512_d64` (`_mm512_fmadd_ps`).
-* **Garantía de Paridad Escalar:** Las baterías de pruebas unitarias (`test_attention_simd_parity_dk_16_24_32`, `test_attention_simd_parity_dk_64`) verifican la equivalencia matemática rigurosa frente a bucles de referencia escalares bajo un umbral de tolerancia estricto ($\Delta < 10^{-5}$) en todas las 4 dimensiones de cabeza.
+* **Producto Escalar Escalado (Q · Kᵀ):** `dot_product_head_avx` procesa 16, 24, 32 o 64 dimensiones en paralelo sin bucles escalares residuales ni comprobaciones de límites (`_mm256_mul_ps`, `_mm256_add_ps`, `hsum256_ps_avx`). En hardware con AVX-512, d_k = 64 se despacha a `dot_product_head_avx512_d64` aprovechando 4 registros ZMM y reducción horizontal de ciclo único (`_mm512_reduce_add_ps`).
+* **Acumulación del Vector de Valores (V × prob):** `accumulate_value_head_avx` difunde (*broadcast*) la probabilidad escalar a lo largo de un vector completo (`_mm256_set1_ps`) y ejecuta operaciones vectoriales combinadas de multiplicación y acumulación. Para d_k = 64, AVX-512 despacha `accumulate_value_head_avx512_d64` (`_mm512_fmadd_ps`).
+* **Garantía de Paridad Escalar:** Las baterías de pruebas unitarias (`test_attention_simd_parity_dk_16_24_32`, `test_attention_simd_parity_dk_64`) verifican la equivalencia matemática rigurosa frente a bucles de referencia escalares bajo un umbral de tolerancia estricto (Δ < 10⁻⁵) en todas las 4 dimensiones de cabeza.
 
 ### 3. Matriz Técnica Comparativa de Arquitectura y Rendimiento
 
 | Parámetro / Métrica | ESM-2 8M (`esm2_t6_8M_UR50D`) | ESM-2 35M (`esm2_t12_35M_UR50D`) | ESM-2 150M (`esm2_t30_150M_UR50D`) | ESM-2 650M (`esm2_t33_650M_UR50D`) | ESM-2 3B (`esm2_t36_3B_UR50D`) |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Capas Transformer ($L$)** | 6 | 12 | 30 | 33 | 36 |
-| **Dimensión Oculta ($d_{\text{model}}$)** | 320 | 480 | 640 | 1,280 | 2,560 |
-| **Cabezas de Atención ($H$)** | 20 | 20 | 20 | 20 | 40 |
-| **Dimensión por Cabeza ($d_k$)** | 16 | 24 | 32 | 64 | 64 |
+| **Capas Transformer (L)** | 6 | 12 | 30 | 33 | 36 |
+| **Dimensión Oculta (d_model)** | 320 | 480 | 640 | 1,280 | 2,560 |
+| **Cabezas de Atención (H)** | 20 | 20 | 20 | 20 | 40 |
+| **Dimensión por Cabeza (d_k)** | 16 | 24 | 32 | 64 | 64 |
 | **Registros SIMD por Cabeza** | **2 YMM** (16 floats) | **3 YMM** (24 floats) | **4 YMM** (32 floats) | **8 YMM / 4 ZMM** (64 floats) | **8 YMM / 4 ZMM** (64 floats) |
-| **Dimensión FFN ($d_{\text{ffn}}$)** | 1,280 | 1,920 | 2,560 | 5,120 | 10,240 |
+| **Dimensión FFN (d_ffn)** | 1,280 | 1,920 | 2,560 | 5,120 | 10,240 |
 | **Vocabulario** | 33 tokens | 33 tokens | 33 tokens | 33 tokens | 33 tokens |
 | **Flotantes Totales (`grouped_canonical_v1`)** | 7,522,913 (~7.5M) | 33,516,993 (~33.5M) | 148,160,673 (~148M) | 651,084,833 (~651M) | 2,839,088,673 (~2.84B) |
 | **Tamaño Binario (FP32)** | `30,091,652 B` (28.70 MiB) | `134,067,972 B` (127.86 MiB) | `592,642,692 B` (565.19 MiB) | **`2,604,339,332 B` (2,483.69 MiB)** | **`11,356,354,692 B` (10.58 GiB)** |
 | **Tamaño Binario Cuantizado (`Q8_0`)** | `8,864,556 B` (8.45 MiB) | `38,636,896 B` (36.85 MiB) | `168,646,036 B` (160.83 MiB) | **`738,899,556 B` (704.67 MiB)** | **`3,216,540,676 B` (3.00 GiB)** |
 | **Tamaño Binario Cuantizado (`Q4_0`)** | **`5,208,516 B` (4.97 MiB)** | **`22,093,636 B` (21.07 MiB)** | **`94,978,756 B` (90.58 MiB)** | **`414,617,796 B` (395.41 MiB)** | **`1,801,205,956 B` (1.68 GiB)** |
 | **Latencia Carga Caliente (Q4_0)** | **4.69 ms** | **12.85 ms** | **39.17 ms** | **137.32 ms** | **545.36 ms** |
-| **Throughput Bidireccional ($L=41$, 4T)** | **476.9 tok/s (Q8) / 456.5 tok/s (Q4)** | **128.7 tok/s (Q4)** | **30.0 tok/s (Q4)** | **9.04 tok/s (Q4)** | **2.20 tok/s (Q8) / 2.12 tok/s (Q4)** |
-| **Memoria de Estado de Trabajo ($L=128$)** | **~911 KB** | **~1,321 KB** | **~1,732 KB** | **~3,450 KB** | **~7,200 KB** |
-| **Residencia en Jerarquía de Caché** | **100% en Caché L3** ($\le 32$ MB) | Residencia Parcial en L3 / DDR | Transmisión (*streaming*) desde RAM ($> 500$ MB) | Streaming DRAM (~2.48 GB FP32 / ~395 MB Q4) | Streaming DRAM (~1.68 GiB Q4) |
+| **Throughput Bidireccional (L = 41, 4T)** | **476.9 tok/s (Q8) / 456.5 tok/s (Q4)** | **128.7 tok/s (Q4)** | **30.0 tok/s (Q4)** | **9.04 tok/s (Q4)** | **2.20 tok/s (Q8) / 2.12 tok/s (Q4)** |
+| **Memoria de Estado de Trabajo (L = 128)** | **~911 KB** | **~1,321 KB** | **~1,732 KB** | **~3,450 KB** | **~7,200 KB** |
+| **Residencia en Jerarquía de Caché** | **100% en Caché L3** (≤ 32 MB) | Residencia Parcial en L3 / DDR | Transmisión (*streaming*) desde RAM (> 500 MB) | Streaming DRAM (~2.48 GB FP32 / ~395 MB Q4) | Streaming DRAM (~1.68 GiB Q4) |
 | **Demanda de Ancho de Banda de Memoria** | **Limitado por Cómputo (AVX/SIMD)** | **Balanceado Caché/DRAM** | **Limitado por Bus de Memoria** | **Limitado por Bus (Optimizado Q4/Q8)** | **Limitado por DRAM (Habilitado por Q4/Q8)** |
 | **Caso de Uso Primario** | DMS *in silico* ultrarrápido, inpainting en tiempo real | DMS de alta resolución, cribado de péptidos | Predicción de contactos 3D, diseño *de novo* | Mapas de contacto de alta fidelidad, DMS fino | Modelos de lenguaje de proteínas de frontera en CPU |
 
@@ -276,7 +280,7 @@ Evaluación empírica en `test_peptidase.fasta` (41 tokens) frente a los tensore
 
 > [!NOTE]
 > **Conclusiones Clave de Fidelidad y Memoria (`docs/benchmarks_v1.6.0.md`):**
-> 1. **Paridad Exacta con HuggingFace:** En todos los modelos FP32 (`8M` a `650M`), `codon-infer` reproduce los `hidden_states` capa a capa y los `logits` finales de HuggingFace `facebook/esm2_*` con similitud de coseno $\ge 0.999999$ y **100.0% de coincidencia Top-1**.
+> 1. **Paridad Exacta con HuggingFace:** En todos los modelos FP32 (`8M` a `650M`), `codon-infer` reproduce los `hidden_states` capa a capa y los `logits` finales de HuggingFace `facebook/esm2_*` con similitud de coseno ≥ 0.999999 y **100.0% de coincidencia Top-1**.
 > 2. **ESM-2 3B en RAM Convencional:** El cuantizador por streaming (`12.55 MiB` Peak RSS) comprime los 10.58 GiB de `esm2_3b_weights.bin` a un binario `Q4_0` de `1.68 GiB` (`1,801,205,956 B`) que carga en **545 ms** y se ejecuta en **1,752.57 MiB Peak RSS** con **0.999422 de coseno de logits** y **100.0% de coincidencia Top-1** frente a HuggingFace `esm2_t36_3B_UR50D`.
 > 3. **Alivio de Ancho de Banda DRAM:** En ESM-2 650M, `Q4_0` logra una **aceleración de 1.92×** en forward frente a FP32 (4.54 s vs 8.69 s) y reduce el Peak RSS en un **83.5%** (de 2,501 MiB a 413 MiB).
 
@@ -545,13 +549,13 @@ codon-infer benchmark --suite full --export-json benchmark_report.json
 
 Suites disponibles:
 * `full`: Evaluación comparativa multi-modelo (latencia de carga, throughput en tokens/s, memoria de trabajo, perfil de caché) más pruebas algorítmicas completas.
-* `simd`: Microbenchmarks multi-escala matriz-vector y paridad numérica AVX2+FMA vs AVX1 a través de dimensiones de proyección ($320 \to 1280$, $480 \to 1920$, $640 \to 2560$, $1280 \to 5120$, $2560 \to 10240$) y dimensiones de cabeza $d_k \in \{16, 24, 32, 64\}$.
+* `simd`: Microbenchmarks multi-escala matriz-vector y paridad numérica AVX2+FMA vs AVX1 a través de dimensiones de proyección (320 → 1280, 480 → 1920, 640 → 2560, 1280 → 5120, 2560 → 10240) y dimensiones de cabeza d_k ∈ {16, 24, 32, 64}.
 * `mlm`: Pseudo-perplejidad evolutiva y penalizaciones comparativas entre tipo salvaje y mutaciones disruptivas.
 * `dms`: Calibración de escaneo mutacional profundo en motivos catalíticos de peptidasas bacterianas.
 * `contacts`: Predicción de contactos espaciales y puntuación de proximidad Cys-Cys.
 * `inpainting`: Reconstrucción posicional múltiple en secuencias enmascaradas bidireccionales.
 * `stress`: Prueba de estabilidad continua bajo sobrecarga de caché con cuantización dinámica de rebanadas Q8.
-* `scaling`: Benchmark de escalamiento de longitud de contexto ($L = 32 \to 256$) adaptativo a la profundidad de capas del modelo.
+* `scaling`: Benchmark de escalamiento de longitud de contexto (L = 32 → 256) adaptativo a la profundidad de capas del modelo.
 
 ### 5. Servidor Model Context Protocol (MCP)
 `codon-infer-mcp` expone la totalidad de las capacidades bioinformáticas como herramientas nativas para agentes LLM (Claude Desktop, Cursor, Gemini, etc.) sobre stdio mediante JSON-RPC:
@@ -567,7 +571,7 @@ cargo run --release --bin codon-infer-mcp -- --model esm2_650m_q8_0.bin
 #### Herramientas Expuestas vía MCP:
 * `generate_protein`: Generación autorregresiva de secuencias a partir de `prompt`, `temperature` y `max_tokens`.
 * `codon_infer_inpaint`: Reconstruye residuos enmascarados (`*`) devolviendo los 5 candidatos principales con sus probabilidades y clasificación fisicoquímica.
-* `codon_infer_dms`: Ejecuta mutagénesis de saturación *in silico* desde una secuencia cruda o archivo FASTA, identificando posiciones catalíticas críticas ($\Delta \log P \le -3.8$) y tolerancias mutacionales.
+* `codon_infer_dms`: Ejecuta mutagénesis de saturación *in silico* desde una secuencia cruda o archivo FASTA, identificando posiciones catalíticas críticas (Δ log P ≤ -3.8) y tolerancias mutacionales.
 * `codon_infer_contacts`: Calcula pares de contacto epistáticos (APC) y detecta puentes disulfuro candidatos (`Cys-Cys`).
 
 ---
@@ -598,7 +602,7 @@ cargo run --release --bin codon-infer-mcp -- --model esm2_650m_q8_0.bin
 | `--window <USIZE>` | `dms` | Tamaño de ventana deslizante para proteínas largas | `128` |
 | `--stride <USIZE>` | `dms` | Paso de desplazamiento de la ventana deslizante | `64` |
 | `--min-separation <USIZE>` | `contacts` | Separación mínima de secuencia para contactos epistáticos | `6` |
-| `--top-l <F32>` | `contacts` | Umbral de factor de contactos Top L (ej. 1.0 = $L$ contactos) | `1.0` |
+| `--top-l <F32>` | `contacts` | Umbral de factor de contactos Top L (ej. 1.0 = L contactos) | `1.0` |
 | `--temperature <F32>`| `generate` | Temperatura de muestreo (0.0 = búsqueda voraz argmax) | `0.7` |
 | `--max-tokens <USIZE>`| `generate` | Número máximo de nuevos residuos a generar | `1024` |
 | `--seed <U64>` | `generate` | Semilla numérica personalizada para generador pseudoaleatorio | - |
@@ -626,12 +630,12 @@ codon-infer/
 │   ├── fasta.rs            # Lector de flujos y secuencias multi-FASTA de cero copias
 │   ├── export.rs           # Serializadores de datos CSV y JSON para análisis de publicación
 │   ├── pipeline.rs         # Controladores de ventana deslizante para DMS, contactos e inpainting
-│   ├── benchmark.rs        # Suite automatizada de estrés de hardware y validación biológica
+│   ├── benchmark.rs        # Automated bioinformatic & hardware stress suite
 │   ├── mcp.rs              # Servidor JSON-RPC MCP sobre stdio sin dependencias externas
 │   └── mcp_main.rs         # Punto de entrada ejecutable del servidor MCP autónomo
 ├── LICENSE                 # Licencia MIT
-├── README.md               # Documentación principal del proyecto (en inglés)
-└── README_ES.md            # Documentación completa del proyecto (en español)
+├── README.md               # Main project documentation (English)
+└── README_ES.md            # Documentación completa del proyecto (Spanish)
 ```
 
 ---
@@ -641,8 +645,8 @@ codon-infer/
 - [x] Migración completa a Rust puro desde el prototipo preliminar en C (**ADR-01**).
 - [x] Runtime con estricta ausencia de asignaciones en heap durante inferencia (`RunState`).
 - [x] Vectorización SIMD dual: micro-kernels `AVX2+FMA` y `AVX1 Sandy Bridge` con despacho dinámico.
-- [x] Escalamiento multi-escala de la arquitectura (8M, 35M, 150M, 650M, 3B) con atención heterogénea ($d_k \in \{16, 24, 32, 64\}$).
-- [x] Micro-kernels vectoriales SIMD AVX-512 para el cómputo de atención con $d_k=64$.
+- [x] Escalamiento multi-escala de la arquitectura (8M, 35M, 150M, 650M, 3B) con atención heterogénea (d_k ∈ {16, 24, 32, 64}).
+- [x] Micro-kernels vectoriales SIMD AVX-512 para el cómputo de atención con d_k = 64.
 - [x] Formulación RoPE *split-half* y aproximación numérica precisa de GELU mediante `erf`.
 - [x] Integración completa del cabezal clasificador `EsmLMHead` (denso canónico + GELU + LayerNorm + sesgo de decodificador).
 - [x] Cuantización por bloques `Q8_0` para optimización de residencia en caché L3 y ancho de banda DRAM.

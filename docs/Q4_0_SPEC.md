@@ -14,7 +14,7 @@ Esta especificación define el diseño formal, los contratos binarios, las estru
 1. **Zero External Dependencies**: Únicamente `std` y `std::arch` de Rust.
 2. **Zero Allocations en el Hot Path**: Los kernels SIMD y el forward pass de Q4_0 no deben realizar allocations dinámicas en el bucle de inferencia.
 3. **Compatibilidad Estricta**: FP32 y Q8_0 (incluyendo el archivo legacy sin cabecera `esm2_650m_q8_0.bin`) deben mantenerse 100% operativos sin regresiones numéricas ni de rendimiento.
-4. **Determinismo y Fidelidad**: Coincidencia matemática exacta entre el kernel de referencia escalar y los backends vectorizados SIMD (AVX1, AVX2+FMA), con tolerancia relativa $\le 10^{-5}$.
+4. **Determinismo y Fidelidad**: Coincidencia matemática exacta entre el kernel de referencia escalar y los backends vectorizados SIMD (AVX1, AVX2+FMA), con tolerancia relativa ≤ 10⁻⁵.
 
 ---
 
@@ -36,37 +36,49 @@ const _: () = assert!(core::mem::align_of::<BlockQ4_0>() == 4);
 ```
 
 - **Tamaño por bloque**: 20 bytes exactos.
-- **Tasa de compresión**: 32 floats (128 bytes) $\to$ 20 bytes = **6.4×** de compresión teórica sobre matrices cuantizadas (0.625 bytes por parámetro).
+- **Tasa de compresión**: 32 floats (128 bytes) → 20 bytes = **6.4×** de compresión teórica sobre matrices cuantizadas (0.625 bytes por parámetro).
 - **Alineación**: `align_of == 4`. Dado que la cabecera `CODQ` mide 64 bytes (múltiplo de 4 y de 64), los bloques en archivo residen naturalmente alineados para `from_raw_parts`.
 
 ### 2.2 Convención de Cuantización (llama.cpp standard)
-Para un vector de 32 floats $X = [x_0, x_1, \dots, x_{31}]$:
-1. Se localiza el elemento $x_{max}$ con mayor valor absoluto conservando su signo:
-   $$x_{max} = \operatorname{argmax}_{x \in X} |x| \quad (\text{conservando el signo de } x)$$
-2. Se calcula la escala $d$:
-   $$d = \frac{x_{max}}{-8.0}$$
-   $$\text{id} = \begin{cases} 0.0 & \text{si } d = 0.0 \\ \frac{1.0}{d} & \text{si } d \neq 0.0 \end{cases}$$
-3. Para cada elemento $x_i$ ($i \in [0, 31]$):
-   $$q_i = \operatorname{clamp}\left( \operatorname{round}(x_i \cdot \text{id}) + 8, \, 0, \, 15 \right) \in [0, 15]$$
+Para un vector de 32 floats `X = [x_0, x_1, ..., x_31]`:
+1. Se localiza el elemento `x_max` con mayor valor absoluto conservando su signo:
+   ```text
+   x_max = argmax_{x ∈ X} |x|   (conservando el signo de x)
+   ```
+2. Se calcula la escala `d`:
+   ```text
+   d = x_max / -8.0
+   id = (d == 0.0) ? 0.0 : (1.0 / d)
+   ```
+3. Para cada elemento `x_i` (`i ∈ [0, 31]`):
+   ```text
+   q_i = clamp(round(x_i · id) + 8, 0, 15) ∈ [0, 15]
+   ```
 
 ### 2.3 Empaquetado y Desempaquetado de Nibbles
-Los 32 valores cuantizados $q_0 \dots q_{31}$ se empaquetan en `qs: [u8; 16]`:
-- Para $j \in [0, 15]$:
-  - **Nibble bajo** (bits `0..=3`): $q_j$
-  - **Nibble alto** (bits `4..=7`): $q_{j + 16}$
+Los 32 valores cuantizados `q_0 ... q_31` se empaquetan en `qs: [u8; 16]`:
+- Para `j ∈ [0, 15]`:
+  - **Nibble bajo** (bits `0..=3`): `q_j`
+  - **Nibble alto** (bits `4..=7`): `q_{j + 16}`
   - Formato del byte:
-    $$\text{qs}[j] = (q_j \ \& \ \text{0x0F}) \ | \ ((q_{j+16} \ \& \ \text{0x0F}) \ll 4)$$
+    ```text
+    qs[j] = (q_j & 0x0F) | ((q_{j+16} & 0x0F) << 4)
+    ```
 
 ### 2.4 Decuantización
-Para recuperar los valores continuos aproximados $\hat{x}_i$:
-- Para $j \in [0, 15]$:
-  $$\hat{x}_j = ((\text{qs}[j] \ \& \ \text{0x0F}) - 8) \cdot d$$
-  $$\hat{x}_{j + 16} = (((\text{qs}[j] \gg 4) \ \& \ \text{0x0F}) - 8) \cdot d$$
+Para recuperar los valores continuos aproximados `x̂_i`:
+- Para `j ∈ [0, 15]`:
+  ```text
+  x̂_j      = ((qs[j] & 0x0F) - 8) · d
+  x̂_{j+16} = (((qs[j] >> 4) & 0x0F) - 8) · d
+  ```
 
 ### 2.5 Cota de Error de Cuantización
-Dado que el paso de cuantización es $|d|$ y el redondeo es al entero más próximo:
-$$|x_i - \hat{x}_i| \le \frac{|d|}{2.0} + 10^{-5}$$
-Para un bloque de ceros ($x_i = 0$), $d = 0$, $q_i = 8$, $\text{qs}[j] = \text{0x88}$, $\hat{x}_i = 0.0$.
+Dado que el paso de cuantización es `|d|` y el redondeo es al entero más próximo:
+```text
+|x_i - x̂_i| ≤ |d| / 2.0 + 10⁻⁵
+```
+Para un bloque de ceros (`x_i = 0`), `d = 0`, `q_i = 8`, `qs[j] = 0x88`, `x̂_i = 0.0`.
 
 ### 2.6 Matrices Cuantizadas vs Matrices en FP32
 Siguiendo la arquitectura probada y optimizada para fidelidad:
@@ -185,7 +197,7 @@ pub fn matmul_q4_parallel(
 ```
 
 ### 4.2 Algoritmo AVX2 + FMA
-Por cada bloque de 32 elementos ($w \in \text{BlockQ4\_0}$):
+Por cada bloque de 32 elementos (`w` ∈ `BlockQ4_0`):
 1. Cargar 16 bytes: `raw16 = _mm_loadu_si128(block.qs.as_ptr() as *const __m128i)`.
 2. Aislar nibbles:
    - `mask_low = _mm_set1_epi8(0x0F)`
@@ -193,10 +205,10 @@ Por cada bloque de 32 elementos ($w \in \text{BlockQ4\_0}$):
    - `lo_i8 = _mm_sub_epi8(_mm_and_si128(raw16, mask_low), c8)`
    - `hi_i8 = _mm_sub_epi8(_mm_and_si128(_mm_srli_epi16(raw16, 4), mask_low), c8)`
 3. Expandir a 4 vectores de 8 flotantes (`__m256`):
-   - Elementos 0..7: `lo_i8` $\to$ `_mm256_cvtepi8_epi32` $\to$ `_mm256_cvtepi32_ps`
-   - Elementos 8..15: `_mm_srli_si128(lo_i8, 8)` $\to$ `_mm256_cvtepi8_epi32` $\to$ `_mm256_cvtepi32_ps`
-   - Elementos 16..23: `hi_i8` $\to$ `_mm256_cvtepi8_epi32` $\to$ `_mm256_cvtepi32_ps`
-   - Elementos 24..31: `_mm_srli_si128(hi_i8, 8)` $\to$ `_mm256_cvtepi8_epi32` $\to$ `_mm256_cvtepi32_ps`
+   - Elementos 0..7: `lo_i8` → `_mm256_cvtepi8_epi32` → `_mm256_cvtepi32_ps`
+   - Elementos 8..15: `_mm_srli_si128(lo_i8, 8)` → `_mm256_cvtepi8_epi32` → `_mm256_cvtepi32_ps`
+   - Elementos 16..23: `hi_i8` → `_mm256_cvtepi8_epi32` → `_mm256_cvtepi32_ps`
+   - Elementos 24..31: `_mm_srli_si128(hi_i8, 8)` → `_mm256_cvtepi8_epi32` → `_mm256_cvtepi32_ps`
 4. Acumular mediante FMA:
    - `acc = _mm256_fmadd_ps(vq, vx, acc)`
 5. Reducción horizontal:
@@ -205,7 +217,7 @@ Por cada bloque de 32 elementos ($w \in \text{BlockQ4\_0}$):
 
 ### 4.3 Algoritmo AVX1 (Fallback x86_64)
 - AVX1 carece de instrucciones vectoriales de enteros de 256 bits (`_mm256_cvtepi8_epi32`).
-- Se desempaqueta con SSE (`__m128i` de 4 enteros $\to$ `_mm_cvtepi8_epi32` $\to$ `_mm_cvtepi32_ps`), se combina con `_mm256_set_m128(ps_hi, ps_lo)`, y se ejecuta `_mm256_mul_ps` + `_mm256_add_ps`.
+- Se desempaqueta con SSE (`__m128i` de 4 enteros → `_mm_cvtepi8_epi32` → `_mm_cvtepi32_ps`), se combina con `_mm256_set_m128(ps_hi, ps_lo)`, y se ejecuta `_mm256_mul_ps` + `_mm256_add_ps`.
 
 ### 4.4 Paralelismo por Filas
 - Si `num_threads > 1` y `out_dim >= 32`, se utiliza `get_global_pool().run_parallel` particionando uniformemente las filas de salida `out_dim` entre los hilos asignados, garantizando nula contención y cero sincronización mutex en el hot path.
@@ -219,7 +231,7 @@ Para garantizar la independencia de trabajo y evitar colisiones de git:
 | Componente | Líneas aproximadas en `src/lib.rs` / Archivos | Subagente Responsable | Entregables |
 |---|---|---|---|
 | **Estructura BlockQ4_0, CodqHeader, Serialización y Loader** | `src/lib.rs` líneas ~320-560 (bloque Q4 data/loader) | **Subagente A** (Format & Loader Engineer) | Implementación de `BlockQ4_0`, `CodqHeader`, `quantize_slice_to_q4`, `EsmWeightsQ4`, `EsmWeights::quantize_q4`, `save_to_file`, `from_file`, tests unitarios de formato |
-| **Kernels SIMD (Escalar, AVX1, AVX2+FMA, SIMD Dispatch, Paralelo)** | `src/lib.rs` líneas ~1150-1360 (bloque Q4 kernels) | **Subagente B** (SIMD Kernel Engineer) | `matmul_q4`, `matmul_q4_avx1`, `matmul_q4_avx2_fma`, `matmul_q4_simd`, `matmul_q4_parallel`, microtests de paridad con tolerancia $\le 10^{-5}$ |
+| **Kernels SIMD (Escalar, AVX1, AVX2+FMA, SIMD Dispatch, Paralelo)** | `src/lib.rs` líneas ~1150-1360 (bloque Q4 kernels) | **Subagente B** (SIMD Kernel Engineer) | `matmul_q4`, `matmul_q4_avx1`, `matmul_q4_avx2_fma`, `matmul_q4_simd`, `matmul_q4_parallel`, microtests de paridad con tolerancia ≤ 10⁻⁵ |
 | **Integración de Inferencia Q4 (Forward & LM Head)** | `src/lib.rs` líneas ~1750-2250, `src/pipeline.rs` | **Orquestador Principal** (Fase 2) | Conexión de `forward_q4`, `forward_bidirectional_q4`, `project_lm_head_q4`, `ModelWeightsRef::Q4` |
 | **CLI `quantize q4_0`, Generación de Pesos y Validación Multi-Escala** | `src/main.rs`, `src/benchmark.rs` | **Subagente C** (CLI & Validation Engineer) | Soporte CLI `quantize q4_0`, generación binarios 8M/35M/150M/650M, métricas de compresión, coseno y latencia |
 | **Auditoría de Seguridad, Unsafe y Zero-Allocation** | Todo el repositorio (solo lectura) | **Subagente D** (Reviewer / Auditor) | Informe de seguridad `unsafe`, límites de punteros, balance de memoria, clippy y regresiones |

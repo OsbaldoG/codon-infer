@@ -24,12 +24,12 @@ By eliminating Python, PyTorch, C/CUDA runtimes, and external third-party crates
 
 * **Native `Q4_0` 4-Bit Block Quantization (`BlockQ4_0`):**
   * Sub-byte quantized representation packing 32 4-bit nibbles into 16 bytes alongside an aligned 32-bit float scale factor `d` (`#[repr(C)]`, exactly **20 bytes** per 32-parameter block).
-  * Standard symmetric quantization convention (llama.cpp compatible): $d = \max / -8.0$, $id = 1/d$, $q = \text{clamp}(\text{round}(x \cdot id) + 8, 0, 15)$. Low nibble holds index $j \in [0, 15]$, high nibble holds index $j + 16$.
+  * Standard symmetric quantization convention (llama.cpp compatible): `d = max / -8.0`, `id = 1/d`, `q = clamp(round(x · id) + 8, 0, 15)`. Low nibble holds index `j ∈ [0, 15]`, high nibble holds index `j + 16`.
   * **6.40× Theoretical Matrix Compression** (0.625 B/param vs 4.0 B FP32) and up to **6.30× Total File Compression** (**ESM-2 3B** reduced from 11.36 GB to **1.80 GB**, and **ESM-2 650M** reduced from 2.60 GB to **414.62 MB**).
   * **~83.5% Peak Memory (RSS) Reduction:** ESM-2 650M RAM footprint plunges from 2,501.33 MiB in FP32 to **413.07 MiB in Q4_0**, while **ESM-2 3B** runs in just **1,752.57 MiB RSS in Q4_0** (`3,102.18 MiB` in Q8_0) on an 11 GiB RAM machine.
   * **1.92× Inference Speedup on ESM-2 650M:** Relieves DRAM bus saturation on 4-thread runs (**4,535.47 ms** in Q4_0 and **4,669.89 ms** in Q8_0 vs **8,692.15 ms** in FP32).
 * **Exact HuggingFace Mathematical Parity (`grouped_canonical_v1`):**
-  * Byte-exact canonical weight layout across all 5 scales (`8M`, `35M`, `150M`, `650M`, `3B`) with **100.0% Top-1 match** and cosine similarity $\ge 0.999999$ against official HuggingFace `facebook/esm2_*` reference tensors (`hidden_states` and `logits`).
+  * Byte-exact canonical weight layout across all 5 scales (`8M`, `35M`, `150M`, `650M`, `3B`) with **100.0% Top-1 match** and cosine similarity ≥ 0.999999 against official HuggingFace `facebook/esm2_*` reference tensors (`hidden_states` and `logits`).
   * Streaming block-by-block quantizers (`quantize_file_streaming_q8` / `quantize_file_streaming_q4`) using `BufReader` / `BufWriter` that convert the 10.58 GiB `esm2_3b_weights.bin` in **12.55 MiB Peak RSS**.
 * **Universal `CODQ` 64-Byte Header Architecture:**
   * Fixed 64-byte little-endian header (`b"CODQ"`, version 1, dtype, architecture, layer depth, hidden dimension, FFN dimension, vocabulary size).
@@ -58,22 +58,22 @@ By eliminating Python, PyTorch, C/CUDA runtimes, and external third-party crates
   * Hardware topology autodetection (`detect_optimal_threads` via `/proc/cpuinfo`) that prioritizes physical execution cores over SMT/Hyper-Threads to saturate 256-bit AVX execution ports without resource thrashing.
 * **Multi-Scale Architecture & Parametric Autodetection (`detect_from_file_len`):**
   * Instant, zero-config model instantiation across **ESM-2 8M**, **35M**, **150M**, **650M**, and **3B** variants directly from binary file byte length, completely eliminating the need for detached JSON configs or manifest files.
-* **Heterogeneous Dynamic SIMD Attention Kernels ($d_k \in \{16, 24, 32, 64\}$):**
-  * Hand-crafted 256-bit AVX and 512-bit AVX-512 vector kernels mapped to 2, 3, 4, or 8 `__m256` registers (and 4 `__m512` ZMM registers) per head, delivering maximum vector compute density with bit-exact scalar parity ($\Delta < 10^{-5}$) across both causal autoregressive and bidirectional forward passes.
+* **Heterogeneous Dynamic SIMD Attention Kernels (`d_k` ∈ {16, 24, 32, 64}):**
+  * Hand-crafted 256-bit AVX and 512-bit AVX-512 vector kernels mapped to 2, 3, 4, or 8 `__m256` registers (and 4 `__m512` ZMM registers) per head, delivering maximum vector compute density with bit-exact scalar parity (Δ < 10⁻⁵) across both causal autoregressive and bidirectional forward passes.
 * **Production CLI Subcommands (`generate`, `inpaint`, `dms`, `contacts`, `benchmark`, `quantize`):**
   * Expressive, unified terminal interface supporting subcommands, global flags (`--model`, `--threads`, `--quantize`, `--color`, `--no-color`), automatic TTY detection, and clear error diagnostics.
 * **Zero-Dependency TrueColor UX (`ui.rs`):**
   * **Physicochemical Palette:** Amino acid residues styled using TrueColor ANSI RGB according to biochemical properties (Aliphatic, Aromatic, Basic, Acidic, Polar, Cysteine, Conformationally flexible).
-  * **Continuous Thermal Gradient Heatmap:** Dynamic RGB interpolation (`lerp_rgb`) from Deep Crimson (`#7F1D1D`) for lethal substitutions ($\Delta \log P \le -4.0$) through Amber, Neutral Slate, to Electric Blue (`#1E3A8A`) for beneficial variants, preserving ASCII density glyphs (`█`, `▓`, `▒`, `░`, `·`) for non-color terminals.
+  * **Continuous Thermal Gradient Heatmap:** Dynamic RGB interpolation (`lerp_rgb`) from Deep Crimson (`#7F1D1D`) for lethal substitutions (Δ log P ≤ -4.0) through Amber, Neutral Slate, to Electric Blue (`#1E3A8A`) for beneficial variants, preserving ASCII density glyphs (`█`, `▓`, `▒`, `░`, `·`) for non-color terminals.
   * **Stderr Dynamic Progress Bar:** Clean ANSI `\r` updates reporting throughput (`muts/s`) and estimated completion time (`ETA`) without polluting redirected `stdout`.
 * **Multi-FASTA & Stream Pipeline (`fasta.rs`):**
   * High-throughput zero-copy streaming parser for multi-record FASTA files (`--fasta <FILE>`), standard input (`--fasta -`), or direct string sequences (`--sequence <STR>`).
 * **Publication-Grade Export Formats (`export.rs`):**
   * Structured rectangular CSV matrices and comprehensive JSON reports with residue mutational tolerances, Shannon entropy, and top contact pairs.
 * **Sliding Window Evaluator for Full-Length Proteins (`pipeline.rs`):**
-  * Processes arbitrary-length proteins using adaptive sliding windows ($W=128, S=64$) centered on evaluated residues to prevent RoPE boundary distortion and guarantee cache locality.
+  * Processes arbitrary-length proteins using adaptive sliding windows (W = 128, S = 64) centered on evaluated residues to prevent RoPE boundary distortion and guarantee cache locality.
 * **Multi-SIMD Hardware Acceleration & Pure Rust Core:**
-  * **AVX-512:** 512-bit vector pipeline for $d_k=64$ attention processing on Intel Xeon and AMD Zen 4+ architectures.
+  * **AVX-512:** 512-bit vector pipeline for `d_k = 64` attention processing on Intel Xeon and AMD Zen 4+ architectures.
   * **AVX2 + FMA:** 256-bit Fused Multiply-Add vector pipeline for modern AMD Ryzen and Intel Haswell+.
   * **AVX1:** 256-bit SIMD kernel for legacy Intel Sandy Bridge / Ivy Bridge processors.
   * **Dynamic Runtime CPU Dispatch:** Evaluates CPU capabilities at startup via `is_x86_feature_detected!`.
@@ -90,25 +90,25 @@ Benchmarked on Linux x86_64 (CPU single-thread execution, native vector instruct
 ### 1. Contrast vs. Python / PyTorch Baseline
 The architectural migration to pure Rust with deterministic zero-allocation guarantees dramatically outperforms the standard Python/PyTorch ecosystem across all operational metrics:
 
-| Metric | PyTorch / Python Baseline (ESM-2 8M) | `codon-infer` v1.5 (Pure Rust + SIMD) | Engineering Advantage |
+| Metric | PyTorch / Python Baseline (ESM-2 8M) | `codon-infer` v1.6 (Pure Rust + SIMD) | Engineering Advantage |
 | :--- | :--- | :--- | :--- |
 | **Dependencies** | Python, PyTorch, LibTorch, CUDA (~4–7 GB) | **Pure `std` (0 crates, 0 dynamic dependencies)** | **~99.9% smaller footprint** |
-| **Executable Size** | Multi-gigabyte runtime environment | **~1.5 MB release binary** | **Ultra-portable single binary** |
-| **Model Load Latency** | ~2,500 – 4,000 ms (PyTorch initialization) | **34.8 ms (8M) / 117.4 ms (35M) / 219.98 ms (650M Q8)** | **~12x – 100x faster startup** |
-| **Memory Footprint (RAM)** | ~1.5 – 2.5 GB RSS baseline | **~35 MB static RSS (8M) / ~698.5 MB (650M Q8)** | **~4x – 50x leaner memory consumption** |
-| **Inference Throughput** | ~15 – 35 tokens/sec (CPU single-thread) | **~333.3 tok/s (8M) / 7.70 tok/s (650M Q8_0 -t 2)** | **High compute density, zero-allocation** |
+| **Executable Size** | Multi-gigabyte runtime environment | **~1.1 MB release binary** | **Ultra-portable single binary** |
+| **Model Load Latency** | ~2,500 – 4,000 ms (PyTorch initialization) | **4.69 ms (8M Q4) / 12.85 ms (35M Q4) / 137.3 ms (650M Q4)** | **~20x – 850x faster startup** |
+| **Memory Footprint (RAM)** | ~1.5 – 2.5 GB RSS baseline | **29.3 MB RSS (8M Q4) / 413.1 MB (650M Q4) / 1.75 GB (3B Q4)** | **~4x – 85x leaner memory consumption** |
+| **Inference Throughput** | ~15 – 35 tokens/sec (CPU single-thread) | **456.5 tok/s (8M Q4) / 9.04 tok/s (650M Q4) / 2.12 tok/s (3B Q4)** | **High compute density, zero-allocation** |
 | **Memory Allocation** | Continuous GC pauses & tensor churn | **0 heap allocations in inference hot-path** | **Deterministic real-time guarantees** |
 
-### 2. Multi-Scale Real Performance Matrix (ESM-2 8M to 650M)
-Measured with `codon-infer benchmark --suite full` under CPU execution with native SIMD dispatch:
+### 2. Multi-Scale Real Performance Matrix (ESM-2 8M to 3B)
+Audited empirical metrics on Linux x86_64 (AVX2+FMA, 4 threads, 41 tokens, kernel `wait4 ru_maxrss` from `docs/benchmarks_v1.6.0.md`):
 
-| Model Scale | Layer Depth ($L$) | Hidden Dim ($d$) | Attention Heads ($H \times d_k$) | Weight Load Latency | Autoregressive Throughput | Bidirectional ($L=32$) | Working State Buffer ($L=128$) | Cache Hierarchy & Memory Regime |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **ESM-2 8M** | 6 | 320 | $20 \times 16$ (2 AVX regs) | **34.8 ms** | **~333.3 tokens/s** (3.0 ms/tok) | **~418.8 tokens/s** (76.4 ms) | **911.0 KB** | **100% L3 Resident** ($\le 32$ MB) · Compute-Bound |
-| **ESM-2 35M** | 12 | 480 | $20 \times 24$ (3 AVX regs) | **117.4 ms** | **~84.7 tokens/s** (11.8 ms/tok) | **~89.9 tokens/s** (356.1 ms) | **1,321.2 KB** | **Partial L3 / DDR Streaming** · Balanced Cache/DRAM |
-| **ESM-2 150M** | 30 | 640 | $20 \times 32$ (4 AVX regs) | **466.8 ms** | **~18.9 tokens/s** (53.0 ms/tok) | **~20.2 tokens/s** (1,583.7 ms) | **1,731.5 KB** | **RAM Streaming Bound** ($>500$ MB) · Memory-Bus Limited |
-| **ESM-2 650M (FP32)** | 33 | 1280 | $20 \times 64$ (8 AVX regs) | **751.2 ms** | **4.57 tokens/s** (218.8 ms/tok) | **~4.8 tokens/s** (~6,600 ms) | **3,450.0 KB** | **DRAM Streaming Bound** (~2.48 GB RSS) · Memory-Bus Limited |
-| **ESM-2 650M (Q8_0, -t 2)** | 33 | 1280 | $20 \times 64$ (8 AVX regs) | **219.98 ms** | **7.70 tokens/s** (129.9 ms/tok) | **~8.2 tokens/s** (~3,900 ms) | **3,450.0 KB** | **DRAM Streaming Optimized** (~698.5 MB RSS) · Multi-Core Saturated |
+| Model Scale | Layer Depth (L) | Hidden Dim (d) | Attention Heads (H × d_k) | Q4_0 Binary Size | Q4_0 Load Latency | Bidirectional (41 tok, 4T) | Peak RAM RSS (Q4_0) | Cache Hierarchy & Memory Regime |
+| :--- | :---: | :---: | :---: | ---: | ---: | ---: | ---: | :--- |
+| **ESM-2 8M** | 6 | 320 | 20 × 16 (2 YMM) | **4.97 MiB** (`5,208,516 B`) | **4.69 ms** | **456.5 tok/s** (89.8 ms) | **29.29 MiB** | **100% L3 Resident** (≤ 32 MB) · Compute-Bound |
+| **ESM-2 35M** | 12 | 480 | 20 × 24 (3 YMM) | **21.07 MiB** (`22,093,636 B`) | **12.85 ms** | **128.7 tok/s** (318.6 ms) | **29.41 MiB** | **Partial L3 / DDR Streaming** · Balanced Cache/DRAM |
+| **ESM-2 150M** | 30 | 640 | 20 × 32 (4 YMM) | **90.58 MiB** (`94,978,756 B`) | **39.17 ms** | **30.0 tok/s** (1,367.8 ms) | **100.39 MiB** | **RAM Streaming Bound** (> 500 MB FP32) · Bus-Limited |
+| **ESM-2 650M** | 33 | 1280 | 20 × 64 (8 YMM) | **395.41 MiB** (`414,617,796 B`) | **137.32 ms** | **9.04 tok/s** (4,535.5 ms) | **413.07 MiB** | **DRAM Streaming Optimized** · Multi-Core Saturated |
+| **ESM-2 3B** | 36 | 2560 | 40 × 64 (8 YMM) | **1,717.76 MiB** (`1,801,205,956 B`) | **545.36 ms** | **2.12 tok/s** (19,368.9 ms) | **1,752.57 MiB** | **DRAM Streaming Bound** (Fits in < 2 GB RAM) |
 
 ### 3. ESM-2 650M Multithreading & Quantization Scaling (Physical Cores vs SMT)
 
@@ -118,8 +118,9 @@ Evaluated on dual-core Intel Sandy Bridge (Core i5-2520M @ 2.50 GHz, 2 physical 
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | **1 Thread (Single-core)** | FP32 | 2,485 MB | 751.2 ms | 4.57 tok/s | 218.8 ms/tok | 1.00x (Baseline) |
 | **1 Thread (Single-core)** | Q8_0 | 698.5 MB | 219.98 ms | 5.15 tok/s | 194.2 ms/tok | 1.13x |
-| **2 Physical Cores (`-t 2`)** | **Q8_0** | **698.5 MB** | **219.98 ms** | **7.70 tok/s** | **129.9 ms/tok** | **1.68x (Optimal)** |
+| **2 Physical Cores (`-t 2`)** | Q8_0 | 698.5 MB | 219.98 ms | 7.70 tok/s | 129.9 ms/tok | 1.68x |
 | **4 SMT Threads (`-t 4`)** | Q8_0 | 698.5 MB | 219.98 ms | 7.48 tok/s | 133.7 ms/tok | 1.64x (Port Contention) |
+| **4 Threads (`-t 4`)** | **Q4_0** | **413.1 MB** | **137.32 ms** | **9.04 tok/s** | **110.6 ms/tok** | **1.98x (Max Speedup & Leanest RAM)** |
 
 > [!NOTE]
 > **Physical Core Saturation vs Hyper-Threading:** On architectures where logical SMT threads share a single 256-bit AVX execution port per physical core, allocating 2 threads to 2 physical cores (`-t 2`) yields the highest throughput (7.70 tok/s) and lowest synchronization latency. `codon-infer` automatically detects physical cores via `detect_optimal_threads` when `--threads` is omitted.
@@ -135,7 +136,7 @@ Prompt:     MCMPCFTTDHQMARKCDD
 Generation: MCMPCFTTDHQMARKCDDDPCCIIVQCCRQEIIQRCCLRIDRNCCIIIVYCCNCY
 ```
 
-Submitting generated candidates to the **NCBI BLASTP** database against non-redundant protein sequences confirmed alignment against genuine chlorotoxin crystal structures (PDB: [`7X41_A`](https://www.rcsb.org/structure/7X41), E-value: $0.001$), demonstrating structural motif conservation followed by coherent *de novo* peptide space exploration.
+Submitting generated candidates to the **NCBI BLASTP** database against non-redundant protein sequences confirmed alignment against genuine chlorotoxin crystal structures (PDB: [`7X41_A`](https://www.rcsb.org/structure/7X41), E-value: 0.001), demonstrating structural motif conservation followed by coherent *de novo* peptide space exploration.
 
 ---
 
@@ -210,43 +211,46 @@ pub fn detect_from_file_len(file_len: u64) -> io::Result<Self> {
     }
 }
 ```
-Any custom weights binary supplied via `--model <PATH>` is identified and validated at boot time in $< 0.1\text{ ms}$, automatically resizing all internal inference buffers, KV-caches, and embedding projections with zero runtime allocation overhead.
+Any custom weights binary supplied via `--model <PATH>` is identified and validated at boot time in < 0.1 ms, automatically resizing all internal inference buffers, KV-caches, and embedding projections with zero runtime allocation overhead.
 
 ### 2. SIMD Optimization and Heterogeneous Attention Dynamic Dispatch
-In multi-head attention, every head has dimension $d_k = d_{\text{model}} / H$. While 8M, 35M, 150M, and 650M standardize on $H=20$ attention heads, 3B scales to $H=40$ heads:
-* **8M:** $d_k = 320 / 20 = 16$ floats
-* **35M:** $d_k = 480 / 20 = 24$ floats
-* **150M:** $d_k = 640 / 20 = 32$ floats
-* **650M:** $d_k = 1280 / 20 = 64$ floats
-* **3B:** $d_k = 2560 / 40 = 64$ floats
+In multi-head attention, every head has dimension d_k = d_model / H. While 8M, 35M, 150M, and 650M standardize on H = 20 attention heads, 3B scales to H = 40 heads:
+* **8M:** d_k = 320 / 20 = 16 floats
+* **35M:** d_k = 480 / 20 = 24 floats
+* **150M:** d_k = 640 / 20 = 32 floats
+* **650M:** d_k = 1280 / 20 = 64 floats
+* **3B:** d_k = 2560 / 40 = 64 floats
 
-Because each 256-bit AVX register (`__m256`) holds exactly 8 single-precision (`f32`) floats, and each 512-bit AVX-512 register (`__m512`) holds 16 floats, every $d_k$ is an exact integer multiple:
-$$\frac{16}{8} = 2 \text{ YMM}, \quad \frac{24}{8} = 3 \text{ YMM}, \quad \frac{32}{8} = 4 \text{ YMM}, \quad \frac{64}{8} = 8 \text{ YMM} \quad (\text{or } 4 \text{ ZMM in AVX-512})$$
+Because each 256-bit AVX register (`__m256`) holds exactly 8 single-precision (`f32`) floats, and each 512-bit AVX-512 register (`__m512`) holds 16 floats, every `d_k` is an exact integer multiple:
+
+```text
+16 / 8 = 2 YMM,   24 / 8 = 3 YMM,   32 / 8 = 4 YMM,   64 / 8 = 8 YMM  (or 4 ZMM in AVX-512)
+```
 
 `codon-infer` implements dedicated, unrolled assembly-grade vector kernels for dot products and value accumulations:
-* **Scaled Dot-Product ($Q \cdot K^\top$):** `dot_product_head_avx` evaluates 16, 24, 32, or 64 dimensions in parallel without remaining scalar loops or bounds checks (`_mm256_mul_ps`, `_mm256_add_ps`, `hsum256_ps_avx`). On AVX-512 hardware, $d_k=64$ dispatches to `dot_product_head_avx512_d64` utilizing 4 ZMM registers and single-cycle horizontal reduction (`_mm512_reduce_add_ps`).
-* **Value Vector Accumulation ($V \times \text{prob}$):** `accumulate_value_head_avx` broadcasts the scalar probability across vectors (`_mm256_set1_ps`) and executes direct vector multiply-accumulate operations. For $d_k=64$, AVX-512 dispatches `accumulate_value_head_avx512_d64` (`_mm512_fmadd_ps`).
-* **Scalar Parity Guarantee:** Unit tests (`test_attention_simd_parity_dk_16_24_32`, `test_attention_simd_parity_dk_64`) enforce mathematical equivalence with scalar reference loops under a strict tolerance threshold ($\Delta < 10^{-5}$) across all 4 head dimensions.
+* **Scaled Dot-Product (Q · Kᵀ):** `dot_product_head_avx` evaluates 16, 24, 32, or 64 dimensions in parallel without remaining scalar loops or bounds checks (`_mm256_mul_ps`, `_mm256_add_ps`, `hsum256_ps_avx`). On AVX-512 hardware, d_k = 64 dispatches to `dot_product_head_avx512_d64` utilizing 4 ZMM registers and single-cycle horizontal reduction (`_mm512_reduce_add_ps`).
+* **Value Vector Accumulation (V × prob):** `accumulate_value_head_avx` broadcasts the scalar probability across vectors (`_mm256_set1_ps`) and executes direct vector multiply-accumulate operations. For d_k = 64, AVX-512 dispatches `accumulate_value_head_avx512_d64` (`_mm512_fmadd_ps`).
+* **Scalar Parity Guarantee:** Unit tests (`test_attention_simd_parity_dk_16_24_32`, `test_attention_simd_parity_dk_64`) enforce mathematical equivalence with scalar reference loops under a strict tolerance threshold (Δ < 10⁻⁵) across all 4 head dimensions.
 
 ### 3. Architectural and Performance Technical Comparison Matrix
 
 | Parameter / Metric | ESM-2 8M (`esm2_t6_8M_UR50D`) | ESM-2 35M (`esm2_t12_35M_UR50D`) | ESM-2 150M (`esm2_t30_150M_UR50D`) | ESM-2 650M (`esm2_t33_650M_UR50D`) | ESM-2 3B (`esm2_t36_3B_UR50D`) |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Transformer Layers ($L$)** | 6 | 12 | 30 | 33 | 36 |
-| **Hidden Dimension ($d_{\text{model}}$)** | 320 | 480 | 640 | 1,280 | 2,560 |
-| **Attention Heads ($H$)** | 20 | 20 | 20 | 20 | 40 |
-| **Head Dimension ($d_k$)** | 16 | 24 | 32 | 64 | 64 |
+| **Transformer Layers (L)** | 6 | 12 | 30 | 33 | 36 |
+| **Hidden Dimension (d_model)** | 320 | 480 | 640 | 1,280 | 2,560 |
+| **Attention Heads (H)** | 20 | 20 | 20 | 20 | 40 |
+| **Head Dimension (d_k)** | 16 | 24 | 32 | 64 | 64 |
 | **SIMD Registers per Head** | **2 YMM** (16 floats) | **3 YMM** (24 floats) | **4 YMM** (32 floats) | **8 YMM / 4 ZMM** (64 floats) | **8 YMM / 4 ZMM** (64 floats) |
-| **FFN Dimension ($d_{\text{ffn}}$)** | 1,280 | 1,920 | 2,560 | 5,120 | 10,240 |
+| **FFN Dimension (d_ffn)** | 1,280 | 1,920 | 2,560 | 5,120 | 10,240 |
 | **Vocabulary** | 33 tokens | 33 tokens | 33 tokens | 33 tokens | 33 tokens |
 | **Total Floats (`grouped_canonical_v1`)** | 7,522,913 (~7.5M) | 33,516,993 (~33.5M) | 148,160,673 (~148M) | 651,084,833 (~651M) | 2,839,088,673 (~2.84B) |
 | **Binary Size (FP32)** | `30,091,652 B` (28.70 MiB) | `134,067,972 B` (127.86 MiB) | `592,642,692 B` (565.19 MiB) | **`2,604,339,332 B` (2,483.69 MiB)** | **`11,356,354,692 B` (10.58 GiB)** |
 | **Quantized Binary Size (`Q8_0`)** | `8,864,556 B` (8.45 MiB) | `38,636,896 B` (36.85 MiB) | `168,646,036 B` (160.83 MiB) | **`738,899,556 B` (704.67 MiB)** | **`3,216,540,676 B` (3.00 GiB)** |
 | **Quantized Binary Size (`Q4_0`)** | **`5,208,516 B` (4.97 MiB)** | **`22,093,636 B` (21.07 MiB)** | **`94,978,756 B` (90.58 MiB)** | **`414,617,796 B` (395.41 MiB)** | **`1,801,205,956 B` (1.68 GiB)** |
 | **Warm Load Latency (Q4_0)** | **4.69 ms** | **12.85 ms** | **39.17 ms** | **137.32 ms** | **545.36 ms** |
-| **Bidirectional Throughput ($L=41$, 4T)** | **476.9 tok/s (Q8) / 456.5 tok/s (Q4)** | **128.7 tok/s (Q4)** | **30.0 tok/s (Q4)** | **9.04 tok/s (Q4)** | **2.20 tok/s (Q8) / 2.12 tok/s (Q4)** |
-| **Working State Memory ($L=128$)** | **~911 KB** | **~1,321 KB** | **~1,732 KB** | **~3,450 KB** | **~7,200 KB** |
-| **Cache Hierarchy Residency** | **100% in L3 Cache** ($\le 32$ MB) | Partial Residency in L3 / DDR | Streaming from RAM ($> 500$ MB) | DRAM Streaming (~2.48 GB FP32 / ~395 MB Q4) | Massive DRAM Streaming (~1.68 GiB Q4) |
+| **Bidirectional Throughput (L = 41, 4T)** | **476.9 tok/s (Q8) / 456.5 tok/s (Q4)** | **128.7 tok/s (Q4)** | **30.0 tok/s (Q4)** | **9.04 tok/s (Q4)** | **2.20 tok/s (Q8) / 2.12 tok/s (Q4)** |
+| **Working State Memory (L = 128)** | **~911 KB** | **~1,321 KB** | **~1,732 KB** | **~3,450 KB** | **~7,200 KB** |
+| **Cache Hierarchy Residency** | **100% in L3 Cache** (≤ 32 MB) | Partial Residency in L3 / DDR | Streaming from RAM (> 500 MB) | DRAM Streaming (~2.48 GB FP32 / ~395 MB Q4) | Massive DRAM Streaming (~1.68 GiB Q4) |
 | **Memory Bandwidth Demand** | **Compute-Bound (AVX/SIMD)** | **Balanced Cache/DRAM** | **Memory-Bus Limited** | **Memory-Bus Limited (Q4/Q8-Optimized)** | **Extreme Memory-Bus Bound (Q4/Q8 Enabled)** |
 | **Primary Use Case** | Fast in silico DMS, real-time inpainting | High-resolution DMS, peptide screening | 3D contact prediction, de novo design | Publication-grade contact maps, fine DMS | Frontier protein language modeling on CPU |
 
@@ -267,14 +271,14 @@ Empirical benchmark evaluated on `test_peptidase.fasta` (41 tokens) against offi
 | | **Q4_0** | **`94,978,756 B` (90.58 MiB)** | **6.24×** | **0.981715** | **0.999266** | **0.020517** | **100.0% (41/41)** | **1,367.83 ms** | **30.0 tok/s** | **100.39 MiB** |
 | **ESM-2 650M** | FP32 | `2,604,339,332 B` (2,483.69 MiB) | 1.00× | 0.999999 | 1.000000 | 0.000000 | **100.0% (41/41)** | 8,692.15 ms | 4.72 tok/s | 2,501.33 MiB |
 | | Q8_0 | `738,899,556 B` (704.67 MiB) | 3.52× | 0.999913 | 0.999996 | 0.000039 | **100.0% (41/41)** | 4,669.89 ms | 8.78 tok/s | 722.41 MiB |
-| | **Q4_0** | **`414,617,796 B` (395.41 MiB)** | **6.28×** | **0.980842** | **0.999292** | **0.019508** | **97.6% (40/41)** | **4,535.47 ms** | **9.04 tok/s** | **413.07 MiB** |
+| | **Q4_0** | **`414,617,796 B` (395.41 MiB)** | **6.28×** | **0.980842** | **0.999292** | **0.998939** | **97.6% (40/41)** | **4,535.47 ms** | **9.04 tok/s** | **413.07 MiB** |
 | **ESM-2 3B** | FP32 | `11,356,354,692 B` (10.58 GiB) | 1.00× | *Ref HF* | *Ref HF* | *Ref HF* | *Ref HF* | *N/A (>11 GiB RAM)* | *N/A* | *Streaming Only* |
 | | **Q8_0** | **`3,216,540,676 B` (3.00 GiB)** | **3.53×** | **0.999983** | **0.999998** | **0.000027** | **100.0% (41/41)** | **18,615.93 ms** | **2.20 tok/s** | **3,102.18 MiB** |
 | | **Q4_0** | **`1,801,205,956 B` (1.68 GiB)** | **6.30×** | **0.994156** | **0.999422** | **0.006447** | **100.0% (41/41)** | **19,368.89 ms** | **2.12 tok/s** | **1,752.57 MiB** |
 
 > [!NOTE]
 > **Fidelity and Memory Takeaways (`docs/benchmarks_v1.6.0.md`):**
-> 1. **Exact HuggingFace Parity:** Across all FP32 models (`8M` to `650M`), `codon-infer` matches HuggingFace `facebook/esm2_*` layer-by-layer hidden states and final logits with cosine $\ge 0.999999$ and **100.0% Top-1 match**.
+> 1. **Exact HuggingFace Parity:** Across all FP32 models (`8M` to `650M`), `codon-infer` matches HuggingFace `facebook/esm2_*` layer-by-layer hidden states and final logits with cosine ≥ 0.999999 and **100.0% Top-1 match**.
 > 2. **ESM-2 3B on Commodity RAM:** Streaming quantization (`12.55 MiB` Peak RSS) compresses the 10.58 GiB `esm2_3b_weights.bin` into a `1.68 GiB` `Q4_0` binary (`1,801,205,956 B`) that loads in **545 ms** and executes in **1,752.57 MiB Peak RSS** with **0.999422 logits cosine** and **100.0% Top-1 match** against HuggingFace `esm2_t36_3B_UR50D`.
 > 3. **DRAM Bandwidth Relief:** On ESM-2 650M, `Q4_0` achieves a **1.92× forward speedup** over FP32 (4.54 s vs 8.69 s) while cutting Peak RSS by **83.5%** (from 2,501 MiB down to 413 MiB).
 
@@ -543,13 +547,13 @@ codon-infer benchmark --suite full --export-json benchmark_report.json
 
 Available suites:
 * `full`: Multi-model comparative evaluation (weight loading latency, tokens/s throughput, working memory, cache profile) plus algorithmic tests.
-* `simd`: Multi-scale AVX2+FMA vs AVX1 numerical parity and matrix-vector microbenchmarks across projection dimensions ($320 \to 1280$, $480 \to 1920$, $640 \to 2560$, $1280 \to 5120$, $2560 \to 10240$) and head dimensions $d_k \in \{16, 24, 32, 64\}$.
+* `simd`: Multi-scale AVX2+FMA vs AVX1 numerical parity and matrix-vector microbenchmarks across projection dimensions (320 → 1280, 480 → 1920, 640 → 2560, 1280 → 5120, 2560 → 10240) and head dimensions d_k ∈ {16, 24, 32, 64}.
 * `mlm`: Evolutionary pseudo-perplexity and wild-type vs disruptive mutation penalties.
 * `dms`: Deep mutational scanning calibration on bacterial catalytic peptidase motifs.
 * `contacts`: Structural contact prediction and Cys-Cys spatial proximity scoring.
 * `inpainting`: Multi-position bidirectional masked sequence infilling.
 * `stress`: Dynamic context continuous inference cache-thrashing stability test with slice Q8 quantization.
-* `scaling`: Context length scaling ($L = 32 \to 256$) memory and latency benchmark adapting to model depth.
+* `scaling`: Context length scaling (L = 32 → 256) memory and latency benchmark adapting to model depth.
 
 ### 5. Model Context Protocol (MCP) Server
 `codon-infer-mcp` exposes the entire bioinformatic engine as native tools for LLM agents (Claude Desktop, Cursor, Gemini, etc.) over stdio JSON-RPC:
@@ -565,7 +569,7 @@ cargo run --release --bin codon-infer-mcp -- --model esm2_650m_q8_0.bin
 #### Tools Exposed over MCP:
 * `generate_protein`: Autoregressive sequence generation given `prompt`, `temperature`, `max_tokens`.
 * `codon_infer_inpaint`: Reconstructs masked residues (`*`) returning top-5 amino acid candidates with probabilities and physicochemical classifications.
-* `codon_infer_dms`: Runs in silico saturation mutagenesis from raw sequence or FASTA path, returning critical catalytic sites ($\Delta \log P \le -3.8$) and mutational tolerances.
+* `codon_infer_dms`: Runs in silico saturation mutagenesis from raw sequence or FASTA path, returning critical catalytic sites (Δ log P ≤ -3.8) and mutational tolerances.
 * `codon_infer_contacts`: Computes epistatic contact pairs (APC) and identifies putative disulfide bridges (`Cys-Cys`).
 
 ---
@@ -596,7 +600,7 @@ cargo run --release --bin codon-infer-mcp -- --model esm2_650m_q8_0.bin
 | `--window <USIZE>` | `dms` | Sliding window context size for long proteins | `128` |
 | `--stride <USIZE>` | `dms` | Sliding window stride step size | `64` |
 | `--min-separation <USIZE>` | `contacts` | Minimum sequence separation for epistatic contacts | `6` |
-| `--top-l <F32>` | `contacts` | Top L contact factor threshold (e.g., 1.0 = $L$ contacts) | `1.0` |
+| `--top-l <F32>` | `contacts` | Top L contact factor threshold (e.g., 1.0 = L contacts) | `1.0` |
 | `--temperature <F32>`| `generate` | Sampling temperature (0.0 = greedy argmax) | `0.7` |
 | `--max-tokens <USIZE>`| `generate` | Maximum new residues to generate | `1024` |
 | `--seed <U64>` | `generate` | Custom pseudo-random number generator seed | - |
@@ -639,8 +643,8 @@ codon-infer/
 - [x] Pure Rust migration from C prototype (**ADR-01**).
 - [x] Strict zero-allocation heap runtime (`RunState`).
 - [x] Dual SIMD vectorization: `AVX2+FMA` and `AVX1 Sandy Bridge` kernels with runtime dispatch.
-- [x] Multi-scale architecture scaling (8M, 35M, 150M, 650M, 3B) with heterogeneous attention ($d_k \in \{16, 24, 32, 64\}$).
-- [x] AVX-512 SIMD vector micro-kernels for $d_k=64$ attention processing.
+- [x] Multi-scale architecture scaling (8M, 35M, 150M, 650M, 3B) with heterogeneous attention (d_k ∈ {16, 24, 32, 64}).
+- [x] AVX-512 SIMD vector micro-kernels for d_k = 64 attention processing.
 - [x] RoPE `split-half` formulation and numerical `erf` GELU approximation.
 - [x] Full `EsmLMHead` classifier integration (canonical dense + GELU + LayerNorm + decoder bias).
 - [x] Block `Q8_0` Quantization for L3 cache & DRAM bandwidth optimization.

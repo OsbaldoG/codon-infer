@@ -36,11 +36,11 @@ Este documento contiene las mediciones reales, reproducibles y verificadas contr
 ## 2. Resolución Definitiva del Bug de Desplazamiento en Pesos Legacy y Paridad con HuggingFace
 
 ### 2.1. Causa Raíz del Desplazamiento Histórico (`inv_freq` y `contact_head`)
-En versiones previas, los archivos `.bin` exportados desde checkpoints que incluían buffers persistentes no-parámetro (`rotary_emb.inv_freq` de longitud $d_k / 2$ por cada capa y `contact_head.regression` de longitud $L \cdot H + 1$) contenían flotantes extra intercalados:
-- **8M:** $+129$ floats ($+516\text{ B}$: $6 \times 8 = 48$ de `inv_freq` + $81$ de `contact_head`)
-- **35M:** $+253$ floats ($+1,012\text{ B}$: $12 \times 12 = 144$ de `inv_freq` + $109$ de `contact_head`)
-- **150M:** $+617$ floats ($+2,468\text{ B}$: $30 \times 16 = 480$ de `inv_freq` + $137$ de `contact_head`)
-- **650M:** $+693$ floats ($+2,772\text{ B}$: $33 \times 32 = 1,056$ de `inv_freq` y diferencias de cabecera)
+En versiones previas, los archivos `.bin` exportados desde checkpoints que incluían buffers persistentes no-parámetro (`rotary_emb.inv_freq` de longitud `d_k / 2` por cada capa y `contact_head.regression` de longitud `L · H + 1`) contenían flotantes extra intercalados:
+- **8M:** +129 floats (+516 B: 6 × 8 = 48 de `inv_freq` + 81 de `contact_head`)
+- **35M:** +253 floats (+1,012 B: 12 × 12 = 144 de `inv_freq` + 109 de `contact_head`)
+- **150M:** +617 floats (+2,468 B: 30 × 16 = 480 de `inv_freq` + 137 de `contact_head`)
+- **650M:** +693 floats (+2,772 B: 33 × 32 = 1,056 de `inv_freq` y diferencias de cabecera)
 
 Debido a que el cargador leía las matrices de forma contigua sin descontar `inv_freq`, todas las matrices posteriores se desplazaban decenas o cientos de floats, corrompiendo la atención y produciendo predicciones constantes degeneradas (`SSSS...`, `IIII...`, `KKKK...`).
 
@@ -80,41 +80,55 @@ Para permitir la cuantización de **ESM-2 3B (`11,356,354,692 B` / `10.58 GiB` e
 2. Abre un `BufReader` de 1 MiB sobre el archivo FP32 y un `BufWriter` de 1 MiB sobre el destino, escribiendo primero la cabecera universal `CODQ` de 64 bytes.
 3. Procesa cada región del archivo en orden secuencial mediante un único buffer reutilizable de trabajo de `65,536` floats (`256 KiB`, múltiplo exacto de 32 elementos), convirtiendo al vuelo a bloques `BlockQ8_0` (36 B) o `BlockQ4_0` (20 B) y copiando en `f32` puro los tensores de LayerNorm, biases y `classifier_weights`.
 4. **Consumo de Memoria Medido (`wait4` `ru_maxrss`):**
-   - Cuantización completa de `esm2_3b_weights.bin` (`10.58 GiB`) $\to$ `esm2_3b_q8_0.bin` (`3.00 GiB`) y `esm2_3b_q4_0.bin` (`1.68 GiB`): **Peak RSS = `12,852 KB` (`12.55 MiB`)**.
+   - Cuantización completa de `esm2_3b_weights.bin` (`10.58 GiB`) → `esm2_3b_q8_0.bin` (`3.00 GiB`) y `esm2_3b_q4_0.bin` (`1.68 GiB`): **Peak RSS = `12,852 KB` (`12.55 MiB`)**.
 
 ---
 
 ## 4. Derivación Matemática Exacta de Tamaños en Disco para las 5 Escalas (`grouped_canonical_v1`)
 
-En el layout canónico `grouped_canonical_v1` (sin `inv_freq` ni `contact_head`), cada modelo ESM-2 con dimensión $d$, dimensión FFN $d_{ff} = 4d$, $L$ capas y vocabulario $V = 33$ contiene:
+En el layout canónico `grouped_canonical_v1` (sin `inv_freq` ni `contact_head`), cada modelo ESM-2 con dimensión `d`, dimensión FFN `d_ff = 4d`, `L` capas y vocabulario `V = 33` contiene:
 
 1. **Cabecera Universal `CODQ`:**
-   $$\text{Header} = \mathbf{64\text{ bytes}}$$
-2. **Matrices Lineales Cuantizadas por Capa ($W_q, W_k, W_v, W_o, W_{fc1}, W_{fc2}$):**
-   $$N_{\text{mat}} = L \times (4 d^2 + 2 d \cdot d_{ff}) = 12 L d^2\text{ floats}$$
-   - En **Q8_0**, además se cuantiza `token_embedding_table` ($33 d$ floats):
-     $$\text{Bytes}_{\text{Q8\_blocks}} = \frac{12 L d^2 + 33 d}{32} \times 36\text{ bytes}$$
-   - En **Q4_0**, `token_embedding_table` se conserva en FP32 ($33 d \times 4$ bytes) y las matrices usan bloques de 20 bytes:
-     $$\text{Bytes}_{\text{Q4\_blocks}} = \frac{12 L d^2}{32} \times 20\text{ bytes}$$
+   ```text
+   Header = 64 bytes
+   ```
+2. **Matrices Lineales Cuantizadas por Capa (`W_q, W_k, W_v, W_o, W_fc1, W_fc2`):**
+   ```text
+   N_mat = L × (4 d² + 2 d · d_ff) = 12 L d² floats
+   ```
+   - En **Q8_0**, además se cuantiza `token_embedding_table` (`33 d` floats):
+     ```text
+     Bytes_Q8_blocks = ((12 L d² + 33 d) / 32) × 36 bytes
+     ```
+   - En **Q4_0**, `token_embedding_table` se conserva en FP32 (`33 d × 4` bytes) y las matrices usan bloques de 20 bytes:
+     ```text
+     Bytes_Q4_blocks = (12 L d² / 32) × 20 bytes
+     ```
 3. **Tensores en Precisión Completa FP32 (LayerNorms, Biases y `EsmLMHead`):**
-   - Biases y LayerNorms de las $L$ capas + `ln_f`:
-     $$N_{\text{LN+bias}} = L \times (9 d + d_{ff}) + 2 d = (13 L + 2) d\text{ floats}$$
-   - Cabezal de lenguaje `classifier_weights` (`EsmLMHead`: `dense.weight` $[d \times d]$, `dense.bias` $[d]$, `layer_norm.weight` $[d]$, `layer_norm.bias` $[d]$, `decoder.weight` $[33 \times d]$, `decoder.bias` $[33]$):
-     $$N_{\text{classifier}} = d^2 + 36 d + 33\text{ floats}$$
+   - Biases y LayerNorms de las `L` capas + `ln_f`:
+     ```text
+     N_LN+bias = L × (9 d + d_ff) + 2 d = (13 L + 2) d floats
+     ```
+   - Cabezal de lenguaje `classifier_weights` (`EsmLMHead`: `dense.weight` `[d × d]`, `dense.bias` `[d]`, `layer_norm.weight` `[d]`, `layer_norm.bias` `[d]`, `decoder.weight` `[33 × d]`, `decoder.bias` `[33]`):
+     ```text
+     N_classifier = d² + 36 d + 33 floats
+     ```
 
-### Caso Particular: Derivación Exacta de ESM-2 3B ($L = 36, d = 2560, d_{ff} = 10240$)
+### Caso Particular: Derivación Exacta de ESM-2 3B (`L = 36, d = 2560, d_ff = 10240`)
 - **FP32 (`esm2_3b_weights.bin`):**
-  $$N_{\text{floats}} = 33(2560) + 12(36)(2560^2) + (13 \cdot 36 + 2)(2560) + (2560^2 + 36 \cdot 2560 + 33) = \mathbf{2,839,088,673\text{ floats}}$$
-  $$\text{Bytes}_{\text{FP32}} = 2,839,088,673 \times 4 = \mathbf{11,356,354,692\text{ bytes}} \quad (10.58\text{ GiB})$$
+  ```text
+  N_floats = 33(2560) + 12(36)(2560²) + (13 · 36 + 2)(2560) + (2560² + 36 · 2560 + 33) = 2,839,088,673 floats
+  Bytes_FP32 = 2,839,088,673 × 4 = 11,356,354,692 bytes (10.58 GiB)
+  ```
 - **Q8_0 (`esm2_3b_q8_0.bin`):**
-  - Elementos cuantizados en `BlockQ8_0`: $84,480 + 2,831,155,200 = 2,831,239,680$ floats $= 88,476,240$ bloques $\times 36\text{ B} = \mathbf{3,185,144,640\text{ B}}$
-  - Elementos FP32 (`LN+bias` + `classifier_weights`): $(1,203,200 + 6,645,793) \times 4 = \mathbf{31,395,972\text{ B}}$
-  - Total Q8_0: $64 + 3,185,144,640 + 31,395,972 = \mathbf{3,216,540,676\text{ bytes}} \quad (3.00\text{ GiB}, \text{ compresión } \mathbf{3.531\times})$
+  - Elementos cuantizados en `BlockQ8_0`: `84,480 + 2,831,155,200 = 2,831,239,680` floats `= 88,476,240` bloques `× 36 B = 3,185,144,640 B`
+  - Elementos FP32 (`LN+bias` + `classifier_weights`): `(1,203,200 + 6,645,793) × 4 = 31,395,972 B`
+  - Total Q8_0: `64 + 3,185,144,640 + 31,395,972 = 3,216,540,676 bytes` (3.00 GiB, compresión **3.531×**)
 - **Q4_0 (`esm2_3b_q4_0.bin`):**
-  - Elementos cuantizados en `BlockQ4_0`: $2,831,155,200$ floats $= 88,473,600$ bloques $\times 20\text{ B} = \mathbf{1,769,472,000\text{ B}}$
-  - Elementos FP32 (`token_embedding_table` + `LN+bias` + `classifier_weights`): $(84,480 + 1,203,200 + 6,645,793) \times 4 = \mathbf{31,733,892\text{ B}}$
-  - Total Q4_0: $64 + 1,769,472,000 + 31,733,892 = \mathbf{1,801,205,956\text{ bytes}} \quad (1.68\text{ GiB}, \text{ compresión } \mathbf{6.305\times})$
-  *(Nota: La diferencia de exactamente $5,764\text{ bytes}$ respecto a la estimación preliminar de $1,801,211,720\text{ B}$ corresponde a los $1,441\text{ floats} \times 4\text{ B}$ de `contact_head` que fueron erradicados en el formato `grouped_canonical_v1`).*
+  - Elementos cuantizados en `BlockQ4_0`: `2,831,155,200` floats `= 88,473,600` bloques `× 20 B = 1,769,472,000 B`
+  - Elementos FP32 (`token_embedding_table` + `LN+bias` + `classifier_weights`): `(84,480 + 1,203,200 + 6,645,793) × 4 = 31,733,892 B`
+  - Total Q4_0: `64 + 1,769,472,000 + 31,733,892 = 1,801,205,956 bytes` (1.68 GiB, compresión **6.305×**)
+  *(Nota: La diferencia de exactamente 5,764 bytes respecto a la estimación preliminar de 1,801,211,720 B corresponde a los 1,441 floats × 4 B de `contact_head` que fueron erradicados en el formato `grouped_canonical_v1`).*
 
 ---
 
@@ -142,4 +156,4 @@ El crate `codon-infer` compila con **cero warnings** bajo `cargo clippy --releas
 
 ## 6. Arquitectura de Inferencia y Hoja de Ruta v1.7.0 (GEMV vs Batched GEMM)
 
-Actualmente, `forward_bidirectional_*` evalúa cada token de la secuencia mediante multiplicaciones matriz-vector (**GEMV**), leyendo los pesos de la red por cada posición de la secuencia. En la versión **v1.7.0** se implementará un micro-kernel de multiplicación matricial por lotes (**Batched GEMM** $[N \times D] \times [D \times D]$) que cargará cada bloque `BlockQ4_0` / `BlockQ8_0` en registros SIMD una única vez para todos los tokens de la secuencia simultáneamente, reduciendo el tráfico del bus DRAM en un factor proporcional a la longitud de secuencia $N$.
+Actualmente, `forward_bidirectional_*` evalúa cada token de la secuencia mediante multiplicaciones matriz-vector (**GEMV**), leyendo los pesos de la red por cada posición de la secuencia. En la versión **v1.7.0** se implementará un micro-kernel de multiplicación matricial por lotes (**Batched GEMM** `[N × D] × [D × D]`) que cargará cada bloque `BlockQ4_0` / `BlockQ8_0` en registros SIMD una única vez para todos los tokens de la secuencia simultáneamente, reduciendo el tráfico del bus DRAM en un factor proporcional a la longitud de secuencia N.
