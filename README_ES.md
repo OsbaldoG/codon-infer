@@ -6,7 +6,7 @@
 
 [![Rust](https://img.shields.io/badge/rust-edición_2024-orange.svg)](https://www.rust-lang.org/)
 [![Version](https://img.shields.io/badge/versión-1.6.0-blue.svg)]()
-[![Tests](https://img.shields.io/badge/tests-50%20pasados%2C%200%20fallidos-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-54%20pasados%2C%200%20fallidos-brightgreen.svg)]()
 [![Dependencies](https://img.shields.io/badge/dependencias-0%20(std%20puro)-brightgreen.svg)]()
 [![License](https://img.shields.io/badge/licencia-MIT-blue.svg)](LICENSE)
 [![Model](https://img.shields.io/badge/modelo-ESM--2%20(8M%20a%203B)-blueviolet.svg)](https://github.com/facebookresearch/esm)
@@ -172,29 +172,37 @@ Los frameworks convencionales de aprendizaje profundo en Python exigen archivos 
 
 ```rust
 pub fn detect_from_file_len(file_len: u64) -> io::Result<Self> {
+    match file_len {
+        30_091_652 | 30_092_168 => return Ok(Self::esm2_8m()),
+        134_067_972 | 134_068_984 => return Ok(Self::esm2_35m()),
+        592_642_692 | 592_645_160 => return Ok(Self::esm2_150m()),
+        2_604_339_332 | 2_604_342_104 => return Ok(Self::esm2_650m()),
+        11_356_354_692 | 11_356_360_584 | 11_357_091_972 => return Ok(Self::esm2_3b()),
+        _ => {}
+    }
     if file_len >= 3_000_000_000 {
-        // ESM-2 3B: ~11.4 GB (FP32) o ~3.2 GB - 3.4 GB (Q8_0)
+        // ESM-2 3B: ~11.36 GB (FP32) o ~3.2 GB - 3.4 GB (Q8_0)
         Ok(Self::esm2_3b())
     } else if file_len >= 2_000_000_000 {
-        // ESM-2 650M: ~2.60 GB (FP32: 2,604,342,104 bytes)
+        // ESM-2 650M: ~2.60 GB (FP32)
         Ok(Self::esm2_650m())
     } else if file_len >= 600_000_000 {
-        // ESM-2 650M: ~738.9 MB (Q8_0: 738,902,264 bytes)
+        // ESM-2 650M: ~698.5 MB - 780 MB (Q8_0)
         Ok(Self::esm2_650m())
     } else if file_len >= 450_000_000 {
-        // ESM-2 150M: ~592.5 MB (FP32)
+        // ESM-2 150M: ~592.6 MB (FP32)
         Ok(Self::esm2_150m())
-    } else if file_len >= 155_000_000 {
+    } else if file_len >= 140_000_000 {
         // ESM-2 150M: ~166 MB - 178 MB (Q8_0)
         Ok(Self::esm2_150m())
-    } else if file_len >= 95_000_000 {
-        // ESM-2 35M: ~134 MB (FP32)
+    } else if file_len >= 80_000_000 {
+        // ESM-2 35M: ~134.1 MB (FP32)
         Ok(Self::esm2_35m())
-    } else if file_len >= 34_000_000 {
+    } else if file_len >= 30_500_000 {
         // ESM-2 35M: ~38 MB - 48 MB (Q8_0)
         Ok(Self::esm2_35m())
-    } else if file_len >= 22_000_000 {
-        // ESM-2 8M: ~30 MB (FP32)
+    } else if file_len >= 20_000_000 {
+        // ESM-2 8M: ~30.1 MB (FP32)
         Ok(Self::esm2_8m())
     } else if file_len >= 6_000_000 {
         // ESM-2 8M: ~8.5 MB - 12 MB (Q8_0)
@@ -353,28 +361,38 @@ cargo build --release
 ### 2. Pesos Preentrenados y GitHub Releases
 
 `codon-infer` estandariza los archivos binarios de pesos bajo una nomenclatura limpia y explícita:
-* **ESM-2 8M (`esm2_8m_weights.bin`):** Pre-empaquetado en la raíz del repositorio (~30.1 MB FP32) para inferencia instantánea sin configuraciones adicionales, desarrollo local y pruebas unitarias rápidas sin descargas externas.
-* **ESM-2 35M (`esm2_35m_weights.bin`):** Modelo de capacidad intermedia (~134.1 MB FP32), hospedado en [GitHub Releases v1.4.0](https://github.com/OsbaldoG/codon-infer/releases/tag/v1.4.0).
-* **ESM-2 150M (`esm2_150m_weights.bin`):** Modelo de alta fidelidad para predicción de contactos y bioinformática con calidad de publicación (~592.6 MB FP32), hospedado en [GitHub Releases v1.4.0](https://github.com/OsbaldoG/codon-infer/releases/tag/v1.4.0).
-* **ESM-2 650M Q8_0 (`esm2_650m_q8_0.bin`):** Binario cuantizado nativo de alta capacidad (738.9 MB Q8_0), hospedado en [GitHub Releases v1.5.0](https://github.com/OsbaldoG/codon-infer/releases/tag/v1.5.0) para arranque zero-copy en 220 ms.
-* **ESM-2 650M FP32 (`esm2_650m_weights.bin`) y ESM-2 3B (`esm2_3b_weights.bin`):** Debido al límite de 2.0 GiB por archivo en GitHub Releases, los modelos de precisión completa que superan 2 GiB (~2.60 GB para 650M FP32 y ~11.4 GB para 3B FP32) se exportan localmente directamente desde HuggingFace/fair-esm mediante `python3 scripts/export_weights.py`.
+* **ESM-2 8M (`esm2_8m_weights.bin`):** Pre-empaquetado en la raíz del repositorio (~28.7 MB FP32 canónico) para inferencia instantánea sin configuraciones adicionales, desarrollo local y pruebas unitarias rápidas sin descargas externas.
+* **ESM-2 35M (`esm2_35m_weights.bin`):** Modelo de precisión completa (~127.9 MB FP32), hospedado en [GitHub Releases v1.6.0](https://github.com/OsbaldoG/codon-infer/releases/tag/v1.6.0).
+* **ESM-2 150M (`esm2_150m_weights.bin`):** Modelo canónico de alta fidelidad para predicción de contactos y bioinformática (~565.2 MB FP32), hospedado en [GitHub Releases v1.6.0](https://github.com/OsbaldoG/codon-infer/releases/tag/v1.6.0).
+* **ESM-2 650M Q8_0 (`esm2_650m_q8_0.bin`):** Binario cuantizado nativo con cabecera CODQ (704.7 MB Q8_0), hospedado en [GitHub Releases v1.6.0](https://github.com/OsbaldoG/codon-infer/releases/tag/v1.6.0).
+* **ESM-2 650M Q4_0 (`esm2_650m_q4_0.bin`):** Binario cuantizado sub-byte a 4 bits (395.41 MiB / 414.62 MB Q4_0), hospedado en [GitHub Releases v1.6.0](https://github.com/OsbaldoG/codon-infer/releases/tag/v1.6.0).
+* **ESM-2 3B Q4_0 (`esm2_3b_q4_0.bin`):** Modelo masivo de 3B cuantizado a 4 bits (1.68 GiB / 1,801.21 MB Q4_0), hospedado en [GitHub Releases v1.6.0](https://github.com/OsbaldoG/codon-infer/releases/tag/v1.6.0) para ejecución con solo 1.75 GiB de RAM.
+* **ESM-2 650M FP32 (`esm2_650m_weights.bin`) y ESM-2 3B (`esm2_3b_weights.bin`):** Debido al límite de 2.0 GiB por archivo en GitHub Releases, los modelos FP32 (>2 GiB: ~2.60 GB para 650M y ~11.36 GB para 3B) pueden generarse con el notebook de Google Colab (`scripts/colab_export_esm2.ipynb`) o exportarse localmente.
 
 #### Descarga Directa de Pesos vía `curl`
-Descargue directamente los pesos binarios deseados en la raíz del repositorio sin necesidad de reconstruirlos en Google Colab:
+Descargue directamente los pesos binarios deseados en la raíz del repositorio:
 ```bash
-# Descargar pesos de ESM-2 35M (~134 MB, hospedado en v1.4.0)
-curl -L -o esm2_35m_weights.bin https://github.com/OsbaldoG/codon-infer/releases/download/v1.4.0/esm2_35m_weights.bin
+# Descargar pesos de ESM-2 35M (~128 MB FP32, hospedado en v1.6.0)
+curl -L -o esm2_35m_weights.bin https://github.com/OsbaldoG/codon-infer/releases/download/v1.6.0/esm2_35m_weights.bin
 
-# Descargar pesos de ESM-2 150M (~592 MB, hospedado en v1.4.0)
-curl -L -o esm2_150m_weights.bin https://github.com/OsbaldoG/codon-infer/releases/download/v1.4.0/esm2_150m_weights.bin
+# Descargar pesos de ESM-2 150M (~565 MB FP32, hospedado en v1.6.0)
+curl -L -o esm2_150m_weights.bin https://github.com/OsbaldoG/codon-infer/releases/download/v1.6.0/esm2_150m_weights.bin
 
-# Descargar pesos de ESM-2 650M Q8_0 (738.9 MB, hospedado en v1.5.0)
-curl -L -o esm2_650m_q8_0.bin https://github.com/OsbaldoG/codon-infer/releases/download/v1.5.0/esm2_650m_q8_0.bin
+# Descargar pesos de ESM-2 650M Q8_0 (705 MB Q8_0, hospedado en v1.6.0)
+curl -L -o esm2_650m_q8_0.bin https://github.com/OsbaldoG/codon-infer/releases/download/v1.6.0/esm2_650m_q8_0.bin
+
+# Descargar pesos de ESM-2 650M Q4_0 (395 MiB Q4_0, hospedado en v1.6.0)
+curl -L -o esm2_650m_q4_0.bin https://github.com/OsbaldoG/codon-infer/releases/download/v1.6.0/esm2_650m_q4_0.bin
+
+# Descargar pesos de ESM-2 3B Q4_0 (1.68 GiB Q4_0, hospedado en v1.6.0)
+curl -L -o esm2_3b_q4_0.bin https://github.com/OsbaldoG/codon-infer/releases/download/v1.6.0/esm2_3b_q4_0.bin
 
 # O utilizar el script automatizado:
 ./scripts/download_weights.sh 35m
 ./scripts/download_weights.sh 150m
-./scripts/download_weights.sh 650m
+./scripts/download_weights.sh 650m-q8
+./scripts/download_weights.sh 650m-q4
+./scripts/download_weights.sh 3b-q4
 ```
 
 > [!TIP]
@@ -391,7 +409,7 @@ cargo test --release
 ```
 Salida esperada:
 ```text
-running 51 tests
+running 55 tests
 test benchmark::tests::test_benchmark_report_to_json_validity ... ok
 test benchmark::tests::test_discover_available_models ... ok
 test export::tests::test_json_string_serializers ... ok
@@ -407,6 +425,7 @@ test mcp::tests::test_mcp_tools_list_schema ... ok
 test tests::test_esm_config_autodetection ... ok
 test benchmark::tests::test_multi_scale_simd_parity ... ok
 test tests::test_bidirectional_logits_entropy ... ok
+test tests::test_evaluation_metrics_unit ... ok
 test tests::test_forward_bidirectional_if_available ... ok
 test tests::test_forward_pass_with_weights_if_available ... ok
 test tests::test_forward_q4_cosine_similarity_8m ... ok
@@ -440,15 +459,18 @@ test tests_q4_simd::test_q4_edge_case_zero_blocks ... ok
 test tests_q4_simd::test_q4_parallel_vs_sequential_identity_threads ... ok
 test tests_q4_simd::test_q4_simd_parity_esm_dimensions ... ok
 test tests_q4_integration::test_forward_q4_integration_650m ... ok
+test tests_regression::test_strict_fp32_loader_rejects_corrupted_size ... ok
+test tests_regression::test_regression_esm2_fp32_all_scales_against_ref_npz ... ok
+test tests_regression::test_regression_quantized_q8_q4_against_ref_npz_including_3b ... ok
 test tests::test_forward_650m_if_available ... ok
 test tests::test_forward_650m_q8_and_multithread_if_available ... ok
 
-test result: ok. 50 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out
+test result: ok. 54 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out
 ```
 
 ### 4. Subcomandos y Pipelines Bioinformáticos
 
-Todos los subcomandos aceptan las banderas globales `--model <RUTA>`, `--threads <N>` y `--quantize q8_0`. `codon-infer` detecta automáticamente si el archivo binario corresponde a **ESM-2 8M**, **35M**, **150M**, **650M** o **3B** (en precisión completa FP32 o cuantizado `Q8_0`) y autoconfigura los kernels vectoriales correspondientes.
+Todos los subcomandos aceptan las banderas globales `--model <RUTA>`, `--threads <N>`, `--quantize <q4_0|q8_0|fp32>`, `--q4` y `--q8`. `codon-infer` detecta automáticamente si el archivo binario corresponde a **ESM-2 8M**, **35M**, **150M**, **650M** o **3B** (en precisión completa FP32 o cuantizado `Q8_0` / `Q4_0`) mediante la cabecera `CODQ` de 64 bytes o la heurística de tamaño, y autoconfigura los kernels vectoriales correspondientes.
 
 #### A. Generación Autorregresiva de Secuencias (`generate`)
 Ejecuta síntesis de secuencias peptídicas *de novo* o extensión de motivos funcionales:
@@ -494,7 +516,7 @@ codon-infer contacts --model esm2_650m_q8_0.bin --threads 2 --fasta proteins.fas
 #### E. Cuantización Nativa de Modelos a Q4_0 y Q8_0 (`quantize`)
 Convierte los pesos de puntos de control FP32 directamente en binarios zero-copy optimizados `Q4_0` o `Q8_0` en disco con cabeceras universales `CODQ`:
 ```bash
-# Cuantizar pesos FP32 de ESM-2 650M (~2.48 GB) a binario directo Q4_0 (~395.28 MB, 6.28x menor):
+# Cuantizar pesos FP32 de ESM-2 650M (~2.60 GB) a binario directo Q4_0 (395.41 MiB / 414.62 MB, 6.28x menor):
 codon-infer quantize --model esm2_650m_weights.bin --output esm2_650m_q4_0.bin --format q4_0
 
 # O utilizar autodetección automática del formato según el nombre del archivo de salida:
@@ -557,11 +579,11 @@ cargo run --release --bin codon-infer-mcp -- --model esm2_650m_q8_0.bin
 | :--- | :--- | :--- |
 | `-h`, `--help` | Muestra el panel de ayuda con la guía de subcomandos | - |
 | `-V`, `--version` | Muestra la versión y el motor vectorial SIMD activo | - |
-| `--model <RUTA>` | Ruta al binario personalizado de pesos ESM-2 en FP32 o Q8_0 (o `all` para benchmark comparativo) | `esm2_8m_weights.bin` |
+| `--model <RUTA>`, `-m` | Ruta al binario personalizado de pesos ESM-2 en FP32, Q8_0 o Q4_0 (o `all` para benchmark comparativo) | `esm2_8m_weights.bin` |
 | `-t`, `--threads <N>` | Hilos de trabajo para la ejecución paralela matriz-vector | Núcleos físicos detectados |
-| `--quantize <q8_0>`, `--q8`| Ejecuta o convierte utilizando cuantización por bloques `Q8_0` nativa | `auto` |
+| `--quantize <q4_0|q8_0|fp32>`, `--q4`, `--q8` | Modo de cuantización en ejecución (`auto`, `fp32`, `q8_0`, `q4_0`). `--q4` / `--q8` son atajos | `auto` |
 | `--export-json <RUTA>`| Exporta métricas de benchmark o análisis directamente a JSON | - |
-| `--color <auto\|always\|never>` | Controla el estilizado de la terminal mediante ANSI TrueColor | `auto` |
+| `--color <auto|always|never>` | Controla el estilizado de la terminal mediante ANSI TrueColor | `auto` |
 | `--no-color` | Desactiva terminantemente los códigos de escape ANSI (estándar NO_COLOR) | `false` |
 
 ### Opciones de Pipeline
@@ -569,7 +591,8 @@ cargo run --release --bin codon-infer-mcp -- --model esm2_650m_q8_0.bin
 | :--- | :--- | :--- | :--- |
 | `--sequence <CADENA>` | `generate`, `inpaint`, `dms`, `contacts` | Secuencia de aminoácidos suministrada de forma directa | `"M"` |
 | `--fasta <RUTA>` | `generate`, `inpaint`, `dms`, `contacts` | Ruta al archivo FASTA (o `-` para leer de stdin) | - |
-| `--output <RUTA>` | `quantize` | Ruta de salida para el archivo binario cuantizado (`*_q8_0.bin`) | - |
+| `--output <RUTA>`, `-o` | `quantize` | Ruta de salida para el archivo binario cuantizado (`*_q4_0.bin` o `*_q8_0.bin`) | - |
+| `--format <q4_0|q8_0>`, `-f` | `quantize` | Formato objetivo de cuantización (opcional si es inferible por el nombre del archivo) | `q8_0` |
 | `--export-csv <RUTA>`| `dms`, `contacts` | Ruta de destino para la matriz rectangular o tabla CSV | - |
 | `--export-json <RUTA>`| `dms`, `contacts`, `benchmark` | Ruta de destino para el informe estructurado en JSON | - |
 | `--window <USIZE>` | `dms` | Tamaño de ventana deslizante para proteínas largas | `128` |
@@ -590,13 +613,14 @@ codon-infer/
 ├── .cargo/
 │   └── config.toml         # Banderas de compilación nativa (-C target-cpu=native)
 ├── .gitignore              # Filtro de artefactos generados y copias de seguridad
-├── Cargo.toml              # Especificación cero dependencias (v1.5.0, edición 2024)
+├── Cargo.toml              # Especificación cero dependencias (v1.6.0, edición 2024)
 ├── esm2_8m_weights.bin     # Pesos FP32 de ESM-2 8M (7.52M parámetros, ~30 MB)
 ├── scripts/
 │   ├── download_weights.sh # Descargador veloz de pesos desde GitHub Releases
-│   └── export_weights.py   # Exportador de pesos desde HuggingFace y fair-esm
+│   ├── export_weights.py   # Exportador de pesos desde HuggingFace y fair-esm
+│   └── colab_export_esm2.ipynb # Exportador Google Colab de pesos canónicos y referencias HF
 ├── src/
-│   ├── lib.rs              # Núcleo del motor: ThreadPool persistente, GEMV Q8_0, atención SIMD, EsmLMHead
+│   ├── lib.rs              # Núcleo del motor: ThreadPool persistente, GEMV Q8_0/Q4_0, atención SIMD, EsmLMHead
 │   ├── main.rs             # Despachador de CLI y parser de argumentos de subcomandos
 │   ├── ui.rs               # Paletas TrueColor ANSI, mapas de gradiente térmico y barra de progreso
 │   ├── fasta.rs            # Lector de flujos y secuencias multi-FASTA de cero copias
@@ -626,8 +650,9 @@ codon-infer/
 - [x] Soporte nativo y validado para ESM-2 650M y serialización binaria zero-copy `Q8_0`.
 - [x] Demonio estándar del protocolo Model Context Protocol (MCP) vía JSON-RPC (`codon-infer-mcp`).
 - [x] Modularización desacoplada: `lib.rs` (biblioteca núcleo), `main.rs` (CLI), `mcp.rs` (servidor MCP).
+- [x] Cuantización sub-byte INT4 (`Q4_0`) y cabecera universal `CODQ` de 64 bytes en las 5 escalas (8M a 3B).
+- [ ] Batched GEMM `[N × D] × [D × D]` en forward secuencial para eliminar la transmisión de pesos de DRAM por token.
 - [ ] Implementación de micro-kernels SIMD ARM NEON para Apple Silicon (M1/M2/M3/M4) y Raspberry Pi.
-- [ ] Cuantización sub-byte INT4 (`Q4_0`) para dispositivos biomédicos integrados de consumo ultra-bajo.
 
 ---
 

@@ -2,7 +2,7 @@
 
 **Estado:** CONGELADA / INMUTABLE  
 **Autor:** Orquestador y Arquitecto Principal (Rust de sistemas, pLM, SIMD x86)  
-**Versión:** 1.6.0-dev  
+**Versión:** 1.6.0  
 **Fecha:** 2026-10-15  
 
 ---
