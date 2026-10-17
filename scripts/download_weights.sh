@@ -4,24 +4,28 @@ set -e
 # codon-infer: Pretrained Weights Downloader from GitHub Releases
 # Repository: https://github.com/OsbaldoG/codon-infer
 
-TAG_V160="v1.6.0"
-BASE_URL="https://github.com/OsbaldoG/codon-infer/releases/download/${TAG_V160}"
+# Note: codon-infer v1.8.0 is 100% binary-compatible with canonical v1.6.0 weight assets
+# (.bin / CODQ). STRUCT-1 contact regression weights are embedded directly in 12.2 KiB of
+# static Rust memory and STRUCT-2 folding is zero-trunk, so no weight re-download is needed.
+WEIGHTS_TAG="${WEIGHTS_TAG:-v1.6.0}"
+BASE_URL="https://github.com/OsbaldoG/codon-infer/releases/download/${WEIGHTS_TAG}"
 
 show_help() {
     local code=${1:-0}
     echo "Usage: $0 [8m|35m|150m|650m|650m-q8|650m-q4|3b-q4|650m-fp32|3b-fp32|all]"
     echo ""
-    echo "Download pretrained canonical ESM-2 weights from GitHub Releases v1.6.0 into the current directory:"
-    echo "  8m        -> esm2_8m_weights.bin     (28.7 MB FP32, canonical v1.6.0 release)"
-    echo "  35m       -> esm2_35m_weights.bin    (127.9 MB FP32, canonical v1.6.0 release)"
-    echo "  150m      -> esm2_150m_weights.bin   (565.2 MB FP32, canonical v1.6.0 release)"
-    echo "  650m      -> esm2_650m_q8_0.bin      (704.7 MB Q8_0 CODQ, v1.6.0 release)"
-    echo "  650m-q8   -> esm2_650m_q8_0.bin      (704.7 MB Q8_0 CODQ, v1.6.0 release)"
-    echo "  650m-q4   -> esm2_650m_q4_0.bin      (395.4 MB Q4_0 CODQ, v1.6.0 release)"
-    echo "  3b-q4     -> esm2_3b_q4_0.bin        (1.68 GiB Q4_0 CODQ, v1.6.0 release)"
+    echo "Download pretrained canonical ESM-2 weights (100% compatible with codon-infer v1.8.0)"
+    echo "from GitHub Releases (${WEIGHTS_TAG}) into the current directory:"
+    echo "  8m        -> esm2_8m_weights.bin     (28.7 MB FP32, canonical ${WEIGHTS_TAG} asset)"
+    echo "  35m       -> esm2_35m_weights.bin    (127.9 MB FP32, canonical ${WEIGHTS_TAG} asset)"
+    echo "  150m      -> esm2_150m_weights.bin   (565.2 MB FP32, canonical ${WEIGHTS_TAG} asset)"
+    echo "  650m      -> esm2_650m_q8_0.bin      (704.7 MB Q8_0 CODQ, ${WEIGHTS_TAG} asset)"
+    echo "  650m-q8   -> esm2_650m_q8_0.bin      (704.7 MB Q8_0 CODQ, ${WEIGHTS_TAG} asset)"
+    echo "  650m-q4   -> esm2_650m_q4_0.bin      (395.4 MB Q4_0 CODQ, ${WEIGHTS_TAG} asset)"
+    echo "  3b-q4     -> esm2_3b_q4_0.bin        (1.68 GiB Q4_0 CODQ, ${WEIGHTS_TAG} asset)"
     echo "  650m-fp32 -> Notice: generate via export_weights.py (>2.0 GiB GitHub limit)"
     echo "  3b-fp32   -> Notice: generate via export_weights.py (>2.0 GiB GitHub limit)"
-    echo "  all       -> Download all hosted v1.6.0 models (8M, 35M, 150M FP32; 650M Q8; 650M Q4; 3B Q4)"
+    echo "  all       -> Download all hosted models (8M, 35M, 150M FP32; 650M Q8; 650M Q4; 3B Q4)"
     exit "${code}"
 }
 

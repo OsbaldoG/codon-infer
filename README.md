@@ -5,14 +5,14 @@
 [🇪🇸 Read in Spanish (README_ES.md)](README_ES.md)
 
 [![Rust](https://img.shields.io/badge/rust-2024_edition-orange.svg)](https://www.rust-lang.org/)
-[![Version](https://img.shields.io/badge/version-1.8.0-blue.svg)]()
-[![Tests](https://img.shields.io/badge/tests-57%20passed%2C%200%20failed-brightgreen.svg)]()
-[![Dependencies](https://img.shields.io/badge/dependencies-0%20(pure%20std)-brightgreen.svg)]()
+[![Version](https://img.shields.io/badge/version-1.8.0-blue.svg)](https://github.com/OsbaldoG/codon-infer/releases/tag/v1.8.0)
+[![Tests](https://img.shields.io/badge/tests-56%20passed%2C%200%20failed%2C%201%20ignored-brightgreen.svg)](#3-run-test-suite)
+[![Dependencies](https://img.shields.io/badge/dependencies-0%20(pure%20std)-brightgreen.svg)](Cargo.toml)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Model](https://img.shields.io/badge/model-ESM--2%20(8M%20to%203B)-blueviolet.svg)](https://github.com/facebookresearch/esm)
-[![SIMD](https://img.shields.io/badge/SIMD-AVX512%20%7C%20AVX2%2BFMA%20%7C%20AVX1-red.svg)]()
-[![Precision](https://img.shields.io/badge/precision-FP32%20%7C%20Q8__0%20%7C%20Q4__0-green.svg)]()
-[![Throughput](https://img.shields.io/badge/CPU%20throughput->200%20tokens%2Fsec-success.svg)]()
+[![SIMD](https://img.shields.io/badge/SIMD-AVX512%20%7C%20AVX2%2BFMA%20%7C%20AVX1-red.svg)](#2-simd-optimization-and-heterogeneous-attention-dynamic-dispatch)
+[![Precision](https://img.shields.io/badge/precision-FP32%20%7C%20Q8__0%20%7C%20Q4__0-green.svg)](#e-native-q4_0--q8_0-model-quantization-quantize)
+[![Throughput](https://img.shields.io/badge/CPU%20throughput->200%20tokens%2Fsec-success.svg)](#-performance--benchmarks)
 
 `codon-infer` is an ultra-lightweight, dependency-free inference engine and bioinformatic analysis suite for the Evolutionary Scale Modeling (**ESM-2**) protein language model family (`8M`, `35M`, `150M`, `650M`, and `3B`), engineered from first principles in **100% safe, idiomatic Rust (`std` only)**.
 
@@ -295,7 +295,7 @@ Because each 256-bit AVX register (`__m256`) holds exactly 8 single-precision (`
 
 ### 4. Multi-Scale Empirical Validation & Benchmarks vs. HuggingFace (`8M` to `3B`)
 
-Empirical benchmark evaluated on `test_peptidase.fasta` (41 tokens) against official HuggingFace `facebook/esm2_*` reference tensors (`scripts/ref_{8m,35m,150m,650m,3b}.npz`) under native SIMD execution (4 threads, `wait4` kernel `ru_maxrss`):
+Empirical benchmark evaluated on `test_peptidase.fasta` (41 tokens) against official HuggingFace `facebook/esm2_*` reference tensors (`scripts/ref_{8m,35m,150m,650m,3b}.npz`, generated locally via `scripts/generate_ref_8m.py` or `scripts/colab_export_esm2.ipynb`) under native SIMD execution (4 threads, `wait4` kernel `ru_maxrss`):
 
 | Model Scale | Format | Exact File Size (`stat -c %s`) | Total Comp. | `hidden_states[-1]` Cos vs HF | Logits Cos vs HF | KL Div vs HF | Top-1 Match vs HF | Forward Median (4 th) | Throughput | Peak RAM (RSS) |
 | :--- | :---: | ---: | :---: | :---: | :---: | :---: | :---: | ---: | ---: | ---: |
@@ -316,10 +316,10 @@ Empirical benchmark evaluated on `test_peptidase.fasta` (41 tokens) against offi
 | | **Q4_0** | **`1,801,205,956 B` (1.68 GiB)** | **6.30×** | **0.994156** | **0.999422** | **0.006447** | **100.0% (41/41)** | **19,368.89 ms** | **2.12 tok/s** | **1,752.57 MiB** |
 
 > [!NOTE]
-> **Fidelity and Memory Takeaways (`docs/benchmarks_v1.6.0.md`):**
-> 1. **Exact HuggingFace Parity:** Across all FP32 models (`8M` to `650M`), `codon-infer` matches HuggingFace `facebook/esm2_*` layer-by-layer hidden states and final logits with cosine ≥ 0.999999 and **100.0% Top-1 match**.
+> **Fidelity, Tiled GEMM & Reference Generation Notes (`docs/benchmarks_v1.6.0.md` & `docs/SPEC_CI1_BIO1_STRUCT1_V1_7_0.md`):**
+> 1. **Exact HuggingFace Parity:** Across all FP32 models (`8M` to `650M`), `codon-infer` matches HuggingFace `facebook/esm2_*` layer-by-layer hidden states and final logits with cosine ≥ 0.999999 and **100.0% Top-1 match**. Reference `.npz` files (`scripts/ref_*.npz`) can be generated locally with `python3 scripts/generate_ref_8m.py` or `scripts/colab_export_esm2.ipynb` (regression tests automatically skip missing optional `.npz` files in clean clones).
 > 2. **ESM-2 3B on Commodity RAM:** Streaming quantization (`12.55 MiB` Peak RSS) compresses the 10.58 GiB `esm2_3b_weights.bin` into a `1.68 GiB` `Q4_0` binary (`1,801,205,956 B`) that loads in **545 ms** and executes in **1,752.57 MiB Peak RSS** with **0.999422 logits cosine** and **100.0% Top-1 match** against HuggingFace `esm2_t36_3B_UR50D`.
-> 3. **DRAM Bandwidth Relief:** On ESM-2 650M, `Q4_0` achieves a **1.92× forward speedup** over FP32 (4.54 s vs 8.69 s) while cutting Peak RSS by **83.5%** (from 2,501 MiB down to 413 MiB).
+> 3. **Single-Token GEMV Baseline vs. Multi-Token Tiled GEMM (`CI-1`):** The latencies in the table above represent the pre-tiling single-token GEMV baseline (`docs/benchmarks_v1.6.0.md`). With the v1.7.0/v1.8.0 **Multi-Token Tiled GEMM (`CI-1`)** engine enabled (`M_r = 4`), multi-token bidirectional passes achieve an additional **3.76× speedup in FP32** and **2.41×–3.44× in Q8_0/Q4_0** while preserving bit-level parity ($\cos = 1.00000000$).
 
 ---
 
@@ -400,6 +400,9 @@ cargo build --release
 ```
 
 ### 2. Pretrained Weights & GitHub Releases
+
+> [!NOTE]
+> **100% Binary Compatibility with Canonical `v1.6.0` Weight Assets:** `codon-infer v1.8.0` uses the exact same canonical model weight binaries (`.bin`, `_q8_0.bin`, `_q4_0.bin`) published in [Release `v1.6.0`](https://github.com/OsbaldoG/codon-infer/releases/tag/v1.6.0). Because the official Meta AI contact regression weights (`STRUCT-1`) are embedded directly in 12.2 KiB of static Rust memory (`src/contact_heads.rs`) and the 3D folding solver (`STRUCT-2`) is zero-trunk, no weight format changes or multi-gigabyte re-downloads are required.
 
 `codon-infer` standardizes model binary files on clean, explicit nomenclature:
 * **ESM-2 8M (`esm2_8m_weights.bin`):** Pre-packaged in the repository root (~28.7 MB FP32 canonical) for instant out-of-the-box inference, local development, and rapid unit testing without external downloads.
@@ -643,25 +646,23 @@ cargo run --release --bin codon-infer-mcp -- --model esm2_650m_q8_0.bin
 | :--- | :--- | :--- |
 | `-h`, `--help` | Display help banner with subcommand guide | - |
 | `-V`, `--version` | Display version and active SIMD vector engine | - |
-| `--model <PATH>`, `-m` | Custom ESM-2 raw FP32/Q8_0/Q4_0 weights binary (or `all` for comparative benchmark) | `esm2_8m_weights.bin` |
+| `-m`, `--model <PATH>` | Custom ESM-2 raw FP32/Q8_0/Q4_0 weights binary (or `all` for comparative benchmark) | `esm2_8m_weights.bin` |
 | `-t`, `--threads <N>` | Worker threads for parallel matrix-vector execution | Detected physical cores |
 | `--quantize <q4_0|q8_0|fp32>`, `--q4`, `--q8` | Execution quantization mode (`auto`, `fp32`, `q8_0`, `q4_0`). `--q4` / `--q8` are shortcuts | `auto` |
-| `--export-pdb <PATH>` | Export reconstructed 3D $C_\alpha$ coordinates to standard Protein Data Bank (`.pdb`) format | - |
-| `--export-json <PATH>`| Export benchmark or analysis metrics directly to JSON | - |
 | `--color <auto|always|never>` | Control ANSI TrueColor terminal styling | `auto` |
 | `--no-color` | Strictly disable ANSI terminal escapes (NO_COLOR standard) | `false` |
 
 ### Pipeline Options
 | Option | Applicable Subcommands | Description | Default |
 | :--- | :--- | :--- | :--- |
-| `--sequence <STR>` | `generate`, `inpaint`, `dms`, `contacts`, `fold` | Direct input amino acid sequence | `"M"` |
-| `--fasta <PATH>` | `generate`, `inpaint`, `dms`, `contacts`, `fold` | Path to FASTA file (or `-` for stdin) | - |
+| `-s`, `--sequence <STR>` | `generate`, `inpaint`, `dms`, `contacts`, `fold` | Direct input amino acid sequence | `"M"` (`generate` only; required if `--fasta` is omitted in other subcommands) |
+| `-f`, `--fasta <PATH>` | `generate`, `inpaint`, `dms`, `contacts`, `fold` | Path to FASTA file (or `-` for stdin) | - |
 | `--export-pdb <PATH>` | `contacts`, `fold` | Destination file path for standard `.pdb` atomic coordinates | - |
 | `--export-tsv <PATH>` | `fold` | Destination file path for tab-separated 3D coordinates table | - |
 | `--output <PATH>`, `-o` | `quantize` | Output path for quantized binary (`*_q4_0.bin` or `*_q8_0.bin`) | - |
 | `--format <q4_0|q8_0>`, `-f` | `quantize` | Target quantization format (optional if inferrable from output filename) | `q8_0` |
 | `--export-csv <PATH>`| `dms`, `contacts` | Destination path for rectangular matrix / table | - |
-| `--export-json <PATH>`| `dms`, `contacts`, `fold`, `benchmark` | Destination path for structured JSON analysis / report | - |
+| `--export-json <PATH>`| `dms`, `contacts`, `inpaint`, `fold`, `benchmark` | Destination path for structured JSON analysis / report | - |
 | `--fast`, `--wt-marginal` | `dms` | Fast 1-Pass Wildtype Marginal scoring mode (accelerates up to 42×) | `false` |
 | `--window <USIZE>` | `dms` | Sliding window context size for long proteins | `128` |
 | `--stride <USIZE>` | `dms` | Sliding window stride step size | `64` |
@@ -686,6 +687,7 @@ codon-infer/
 ├── scripts/
 │   ├── download_weights.sh # Fast GitHub Releases weights downloader
 │   ├── export_weights.py   # HuggingFace & fair-esm weight exporter
+│   ├── generate_ref_8m.py  # Local HuggingFace reference .npz generator
 │   └── colab_export_esm2.ipynb # Google Colab canonical weights exporter & HF reference generator
 ├── src/
 │   ├── lib.rs              # Core engine: persistent ThreadPool, Tiled GEMM, Q8/Q4 kernels, SIMD attention

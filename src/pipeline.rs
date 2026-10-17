@@ -292,7 +292,7 @@ pub fn run_pipeline_dms_with_mode(
         0.0
     };
 
-    let catalytic_sites_detected = rows.iter().filter(|r| r.mean_delta_logp <= -3.5).count();
+    let catalytic_sites_detected = rows.iter().filter(|r| r.mean_delta_logp <= -3.8).count();
 
     DmsPipelineResult {
         protein_id: record.id.clone(),

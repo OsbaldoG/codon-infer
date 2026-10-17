@@ -47,15 +47,20 @@ fn print_help(theme: &TerminalTheme) {
     println!("\nGLOBAL OPTIONS:");
     println!("    -h, --help               Print help information");
     println!("    -V, --version            Print engine version and active vector acceleration");
+    println!("    -m, --model <PATH>       Path to weights binary (or 'all' for multi-scale benchmark)");
     println!("    -t, --threads <N>        Number of CPU threads (default: available physical cores)");
     println!("    --quantize <q4_0|q8_0|fp32> Quantization mode for execution (default: auto/fp32)");
     println!("    --q4                     Shortcut flag for '--quantize q4_0'");
     println!("    --q8                     Shortcut flag for '--quantize q8_0'");
-    println!("    --model <PATH>           Path to weights binary (or 'all' for multi-scale benchmark)");
-    println!("    --export-pdb <PATH>      Export reconstructed 3D C_alpha coordinates to standard PDB format");
-    println!("    --export-json <PATH>     Export benchmark or analysis metrics to JSON");
     println!("    --color <auto|always|never> Control ANSI TrueColor terminal styling");
     println!("    --no-color               Disable all colored terminal escapes (NO_COLOR standard)");
+    println!("\nPIPELINE & EXPORT OPTIONS:");
+    println!("    -s, --sequence <SEQ>     Input amino acid sequence (default 'M' in generate; required otherwise)");
+    println!("    -f, --fasta <PATH>       Input FASTA file path (or '-' for stdin)");
+    println!("    --export-pdb <PATH>      Export reconstructed 3D C_alpha coordinates to PDB (contacts, fold)");
+    println!("    --export-tsv <PATH>      Export 3D coordinates table to TSV (fold)");
+    println!("    --export-csv <PATH>      Export rectangular analysis matrix to CSV (dms, contacts)");
+    println!("    --export-json <PATH>     Export structured metrics report to JSON (dms, contacts, fold, benchmark)");
     println!("\nSUBCOMMAND EXAMPLES:");
     println!("    codon-infer generate --sequence \"M\" --temperature 0.7 --max-tokens 50 --threads 4");
     println!("    codon-infer generate --sequence \"M\" --model esm2_650m_q4_0.bin --threads 4");
@@ -254,6 +259,11 @@ fn main() -> io::Result<()> {
         .into_iter()
         .next()
         .unwrap_or_else(|| "esm2_8m_weights.bin".to_string());
+    for (i, a) in args.iter().enumerate() {
+        if (a == "--model" || a == "-m") && i + 1 < args.len() {
+            model_path = args[i + 1].clone();
+        }
+    }
 
     // Subcommand dispatch
     let subcommand = if args.len() > 1 && !args[1].starts_with('-') {
@@ -278,7 +288,7 @@ fn main() -> io::Result<()> {
                 if (args[i] == "--suite" || args[i] == "-s") && i + 1 < args.len() {
                     suite = args[i + 1].clone();
                     i += 2;
-                } else if args[i] == "--model" && i + 1 < args.len() {
+                } else if (args[i] == "--model" || args[i] == "-m") && i + 1 < args.len() {
                     model_arg = Some(args[i + 1].clone());
                     i += 2;
                 } else if (args[i] == "--threads" || args[i] == "-t") && i + 1 < args.len() {
@@ -400,7 +410,7 @@ fn main() -> io::Result<()> {
                 } else if args[i] == "--export-json" && i + 1 < args.len() {
                     export_json = Some(args[i + 1].clone());
                     i += 2;
-                } else if args[i] == "--model" && i + 1 < args.len() {
+                } else if (args[i] == "--model" || args[i] == "-m") && i + 1 < args.len() {
                     model_path = args[i + 1].clone();
                     i += 2;
                 } else if args[i] == "--no-color" || args[i] == "--color" {
@@ -470,7 +480,7 @@ fn main() -> io::Result<()> {
                 } else if args[i] == "--q4" {
                     quant_mode = Some(QuantizationMode::Q4_0);
                     i += 1;
-                } else if args[i] == "--model" && i + 1 < args.len() {
+                } else if (args[i] == "--model" || args[i] == "-m") && i + 1 < args.len() {
                     model_path = args[i + 1].clone();
                     i += 2;
                 } else if args[i] == "--no-color" || args[i] == "--color" {
@@ -541,7 +551,7 @@ fn main() -> io::Result<()> {
                 } else if args[i] == "--export-pdb" && i + 1 < args.len() {
                     export_pdb = Some(args[i + 1].clone());
                     i += 2;
-                } else if args[i] == "--model" && i + 1 < args.len() {
+                } else if (args[i] == "--model" || args[i] == "-m") && i + 1 < args.len() {
                     model_path = args[i + 1].clone();
                     i += 2;
                 } else if args[i] == "--no-color" || args[i] == "--color" {
@@ -592,7 +602,7 @@ fn main() -> io::Result<()> {
 
             let mut i = sub_args_start;
             while i < args.len() {
-                if args[i] == "--model" && i + 1 < args.len() {
+                if (args[i] == "--model" || args[i] == "-m") && i + 1 < args.len() {
                     model_path = args[i + 1].clone();
                     i += 2;
                 } else if (args[i] == "--sequence" || args[i] == "-s") && i + 1 < args.len() {
@@ -651,7 +661,7 @@ fn main() -> io::Result<()> {
                 LoadedWeights::Q4(_) => "Q4_0 (4-bit Nibble Blocks)",
             };
 
-            println!("--- Codon-Infer Engine V1.6 (Zero-Deps Multi-Scale CLI) ---");
+            println!("--- Codon-Infer Engine v{} (Zero-Deps Multi-Scale CLI) ---", env!("CARGO_PKG_VERSION"));
             println!("Active SIMD Backend:  {}", active_simd_backend());
             println!("Concurrency Threads:  {}", num_threads);
             println!("Execution Precision:  {}", prec_name);
@@ -896,7 +906,7 @@ fn main() -> io::Result<()> {
                 } else if args[i] == "--export-json" && i + 1 < args.len() {
                     export_json = Some(args[i + 1].clone());
                     i += 2;
-                } else if args[i] == "--model" && i + 1 < args.len() {
+                } else if (args[i] == "--model" || args[i] == "-m") && i + 1 < args.len() {
                     model_path = args[i + 1].clone();
                     i += 2;
                 } else if args[i] == "--no-color" || args[i] == "--color" {

@@ -5,14 +5,14 @@
 [🇬🇧 Read in English (README.md)](README.md)
 
 [![Rust](https://img.shields.io/badge/rust-edición_2024-orange.svg)](https://www.rust-lang.org/)
-[![Version](https://img.shields.io/badge/versión-1.8.0-blue.svg)]()
-[![Tests](https://img.shields.io/badge/tests-57%20pasados%2C%200%20fallidos-brightgreen.svg)]()
-[![Dependencies](https://img.shields.io/badge/dependencias-0%20(std%20puro)-brightgreen.svg)]()
+[![Version](https://img.shields.io/badge/versión-1.8.0-blue.svg)](https://github.com/OsbaldoG/codon-infer/releases/tag/v1.8.0)
+[![Tests](https://img.shields.io/badge/tests-56%20pasados%2C%200%20fallidos%2C%201%20ignorado-brightgreen.svg)](#3-ejecución-de-la-suite-de-pruebas)
+[![Dependencies](https://img.shields.io/badge/dependencias-0%20(std%20puro)-brightgreen.svg)](Cargo.toml)
 [![License](https://img.shields.io/badge/licencia-MIT-blue.svg)](LICENSE)
 [![Model](https://img.shields.io/badge/modelo-ESM--2%20(8M%20a%203B)-blueviolet.svg)](https://github.com/facebookresearch/esm)
-[![SIMD](https://img.shields.io/badge/SIMD-AVX512%20%7C%20AVX2%2BFMA%20%7C%20AVX1-red.svg)]()
-[![Precision](https://img.shields.io/badge/precisión-FP32%20%7C%20Q8__0%20%7C%20Q4__0-green.svg)]()
-[![Throughput](https://img.shields.io/badge/Rendimiento%20CPU->200%20tokens%2Fseg-success.svg)]()
+[![SIMD](https://img.shields.io/badge/SIMD-AVX512%20%7C%20AVX2%2BFMA%20%7C%20AVX1-red.svg)](#2-optimización-simd-y-despacho-dinámico-de-atención-heterogénea)
+[![Precision](https://img.shields.io/badge/precisión-FP32%20%7C%20Q8__0%20%7C%20Q4__0-green.svg)](#e-cuantización-nativa-de-modelos-a-q4_0-y-q8_0-quantize)
+[![Throughput](https://img.shields.io/badge/Rendimiento%20CPU->200%20tokens%2Fseg-success.svg)](#-rendimiento-y-benchmarks-comparativos)
 
 > 📖 **Nota de Idioma:** Este documento constituye la documentación oficial técnica completa en **español**. Para consultar la versión original en inglés técnico, acceda a [README.md](README.md).
 
@@ -297,7 +297,7 @@ Debido a que cada registro AVX de 256 bits (`__m256`) almacena con precisión 8 
 
 ### 4. Validación Empírica Multi-Escala y Rendimiento frente a HuggingFace (`8M` a `3B`)
 
-Evaluación empírica en `test_peptidase.fasta` (41 tokens) frente a los tensores oficiales de referencia de HuggingFace `facebook/esm2_*` (`scripts/ref_{8m,35m,150m,650m,3b}.npz`) bajo ejecución vectorial SIMD nativa (4 hilos, `wait4` kernel `ru_maxrss`):
+Evaluación empírica en `test_peptidase.fasta` (41 tokens) frente a los tensores oficiales de referencia de HuggingFace `facebook/esm2_*` (`scripts/ref_{8m,35m,150m,650m,3b}.npz`, generados localmente mediante `scripts/generate_ref_8m.py` o `scripts/colab_export_esm2.ipynb`) bajo ejecución vectorial SIMD nativa (4 hilos, `wait4` kernel `ru_maxrss`):
 
 | Escala del Modelo | Formato | Tamaño Exacto (`stat -c %s`) | Compresión Total | Coseno `hidden_states[-1]` vs HF | Coseno Logits vs HF | Divergencia KL vs HF | Top-1 Match vs HF | Forward Mediana (4 hilos) | Throughput | Memoria Pico (RSS) |
 | :--- | :---: | ---: | :---: | :---: | :---: | :---: | :---: | ---: | ---: | ---: |
@@ -318,10 +318,10 @@ Evaluación empírica en `test_peptidase.fasta` (41 tokens) frente a los tensore
 | | **Q4_0** | **`1,801,205,956 B` (1.68 GiB)** | **6.30×** | **0.994156** | **0.999422** | **0.006447** | **100.0% (41/41)** | **19,368.89 ms** | **2.12 tok/s** | **1,752.57 MiB** |
 
 > [!NOTE]
-> **Conclusiones Clave de Fidelidad y Memoria (`docs/benchmarks_v1.6.0.md`):**
-> 1. **Paridad Exacta con HuggingFace:** En todos los modelos FP32 (`8M` a `650M`), `codon-infer` reproduce los `hidden_states` capa a capa y los `logits` finales de HuggingFace `facebook/esm2_*` con similitud de coseno ≥ 0.999999 y **100.0% de coincidencia Top-1**.
+> **Notas de Fidelidad, Tiled GEMM y Generación de Referencias (`docs/benchmarks_v1.6.0.md` y `docs/SPEC_CI1_BIO1_STRUCT1_V1_7_0.md`):**
+> 1. **Paridad Exacta con HuggingFace:** En todos los modelos FP32 (`8M` a `650M`), `codon-infer` reproduce los `hidden_states` capa a capa y los `logits` finales de HuggingFace `facebook/esm2_*` con similitud de coseno ≥ 0.999999 y **100.0% de coincidencia Top-1**. Los archivos de referencia `.npz` (`scripts/ref_*.npz`) pueden generarse localmente con `python3 scripts/generate_ref_8m.py` o `scripts/colab_export_esm2.ipynb` (las pruebas de regresión omiten automáticamente los archivos `.npz` opcionales si no están presentes en un clon limpio).
 > 2. **ESM-2 3B en RAM Convencional:** El cuantizador por streaming (`12.55 MiB` Peak RSS) comprime los 10.58 GiB de `esm2_3b_weights.bin` a un binario `Q4_0` de `1.68 GiB` (`1,801,205,956 B`) que carga en **545 ms** y se ejecuta en **1,752.57 MiB Peak RSS** con **0.999422 de coseno de logits** y **100.0% de coincidencia Top-1** frente a HuggingFace `esm2_t36_3B_UR50D`.
-> 3. **Alivio de Ancho de Banda DRAM:** En ESM-2 650M, `Q4_0` logra una **aceleración de 1.92×** en forward frente a FP32 (4.54 s vs 8.69 s) y reduce el Peak RSS en un **83.5%** (de 2,501 MiB a 413 MiB).
+> 3. **Línea Base GEMV Monotoken vs. Motor Tiled GEMM Multi-Token (`CI-1`):** Las latencias de la tabla anterior corresponden a la línea base GEMV monotoken previa al tiling (`docs/benchmarks_v1.6.0.md`). Con el motor **Multi-Token Tiled GEMM (`CI-1`)** de v1.7.0/v1.8.0 (`M_r = 4`), las pasadas bidireccionales alcanzan una aceleración adicional de **3.76× en FP32** y **2.41×–3.44× en Q8_0/Q4_0** manteniendo paridad matemática exacta ($\cos = 1.00000000$).
 
 ---
 
@@ -402,6 +402,9 @@ cargo build --release
 ```
 
 ### 2. Pesos Preentrenados y GitHub Releases
+
+> [!NOTE]
+> **Compatibilidad Binaria al 100% con los Pesos Canónicos de `v1.6.0`:** `codon-infer v1.8.0` utiliza exactamente los mismos archivos binarios canónicos de pesos (`.bin`, `_q8_0.bin`, `_q4_0.bin`) publicados en [Release `v1.6.0`](https://github.com/OsbaldoG/codon-infer/releases/tag/v1.6.0). Dado que los pesos de regresión logística de contactos oficiales de Meta AI (`STRUCT-1`) están incrustados directamente en 12.2 KiB de memoria estática de Rust (`src/contact_heads.rs`) y el solver de plegamiento 3D (`STRUCT-2`) es *zero-trunk*, no se requieren cambios en el formato de archivos ni redescargas multigigabyte.
 
 `codon-infer` estandariza los archivos binarios de pesos bajo una nomenclatura limpia y explícita:
 * **ESM-2 8M (`esm2_8m_weights.bin`):** Pre-empaquetado en la raíz del repositorio (~28.7 MB FP32 canónico) para inferencia instantánea sin configuraciones adicionales, desarrollo local y pruebas unitarias rápidas sin descargas externas.
@@ -645,25 +648,23 @@ cargo run --release --bin codon-infer-mcp -- --model esm2_650m_q8_0.bin
 | :--- | :--- | :--- |
 | `-h`, `--help` | Muestra el panel de ayuda con la guía de subcomandos | - |
 | `-V`, `--version` | Muestra la versión y el motor vectorial SIMD activo | - |
-| `--model <RUTA>`, `-m` | Ruta al binario personalizado de pesos ESM-2 en FP32, Q8_0 o Q4_0 (o `all` para benchmark comparativo) | `esm2_8m_weights.bin` |
+| `-m`, `--model <RUTA>` | Ruta al binario personalizado de pesos ESM-2 en FP32, Q8_0 o Q4_0 (o `all` para benchmark comparativo) | `esm2_8m_weights.bin` |
 | `-t`, `--threads <N>` | Hilos de trabajo para la ejecución paralela matriz-vector | Núcleos físicos detectados |
 | `--quantize <q4_0|q8_0|fp32>`, `--q4`, `--q8` | Modo de cuantización en ejecución (`auto`, `fp32`, `q8_0`, `q4_0`). `--q4` / `--q8` son atajos | `auto` |
-| `--export-pdb <RUTA>` | Exporta las coordenadas $C_\alpha$ 3D reconstruidas al formato estándar Protein Data Bank (`.pdb`) | - |
-| `--export-json <RUTA>`| Exporta métricas de benchmark o análisis directamente a JSON | - |
 | `--color <auto|always|never>` | Controla el estilizado de la terminal mediante ANSI TrueColor | `auto` |
 | `--no-color` | Desactiva terminantemente los códigos de escape ANSI (estándar NO_COLOR) | `false` |
 
 ### Opciones de Pipeline
 | Opción | Subcomandos Aplicables | Descripción | Valor por Defecto |
 | :--- | :--- | :--- | :--- |
-| `--sequence <CADENA>` | `generate`, `inpaint`, `dms`, `contacts`, `fold` | Secuencia de aminoácidos suministrada de forma directa | `"M"` |
-| `--fasta <RUTA>` | `generate`, `inpaint`, `dms`, `contacts`, `fold` | Ruta al archivo FASTA (o `-` para leer de stdin) | - |
+| `-s`, `--sequence <CADENA>` | `generate`, `inpaint`, `dms`, `contacts`, `fold` | Secuencia de aminoácidos suministrada de forma directa | `"M"` (solo en `generate`; obligatorio si se omite `--fasta` en los demás subcomandos) |
+| `-f`, `--fasta <RUTA>` | `generate`, `inpaint`, `dms`, `contacts`, `fold` | Ruta al archivo FASTA (o `-` para leer de stdin) | - |
 | `--export-pdb <RUTA>` | `contacts`, `fold` | Ruta de archivo de destino para coordenadas atómicas en formato `.pdb` | - |
 | `--export-tsv <RUTA>` | `fold` | Ruta de archivo de destino para la tabla de coordenadas 3D separadas por tabuladores | - |
 | `--output <RUTA>`, `-o` | `quantize` | Ruta de salida para el archivo binario cuantizado (`*_q4_0.bin` o `*_q8_0.bin`) | - |
 | `--format <q4_0|q8_0>`, `-f` | `quantize` | Formato objetivo de cuantización (opcional si es inferible por el nombre del archivo) | `q8_0` |
 | `--export-csv <RUTA>`| `dms`, `contacts` | Ruta de destino para la matriz rectangular o tabla CSV | - |
-| `--export-json <RUTA>`| `dms`, `contacts`, `fold`, `benchmark` | Ruta de destino para el informe estructurado en JSON | - |
+| `--export-json <RUTA>`| `dms`, `contacts`, `inpaint`, `fold`, `benchmark` | Ruta de destino para el informe estructurado en JSON | - |
 | `--fast`, `--wt-marginal` | `dms` | Modo de escaneo rápido en 1 pasada Wildtype Marginal (acelera hasta 42×) | `false` |
 | `--window <USIZE>` | `dms` | Tamaño de ventana deslizante para proteínas largas | `128` |
 | `--stride <USIZE>` | `dms` | Paso de desplazamiento de la ventana deslizante | `64` |
@@ -688,6 +689,7 @@ codon-infer/
 ├── scripts/
 │   ├── download_weights.sh # Descargador veloz de pesos desde GitHub Releases
 │   ├── export_weights.py   # Exportador de pesos desde HuggingFace y fair-esm
+│   ├── generate_ref_8m.py  # Generador local de referencias .npz de HuggingFace
 │   └── colab_export_esm2.ipynb # Exportador Google Colab de pesos canónicos y referencias HF
 ├── src/
 │   ├── lib.rs              # Núcleo del motor: ThreadPool persistente, Tiled GEMM, Q8/Q4, atención SIMD

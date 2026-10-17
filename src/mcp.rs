@@ -17,13 +17,35 @@ pub fn escape_json_str(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            '\x08' => out.push_str("\\b"),
+            '\x0C' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
             _ => out.push(c),
         }
     }
     out
 }
 
-/// Extracts a string value from a JSON snippet given a key.
+/// Finds the byte index of the first unescaped double quote `"` in a string slice.
+fn find_unescaped_quote(s: &str) -> Option<usize> {
+    let mut escaped = false;
+    for (idx, ch) in s.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+        } else if ch == '"' {
+            return Some(idx);
+        }
+    }
+    None
+}
+
+/// Extracts a string value from a JSON snippet given a key, respecting escaped quotes (`\"`).
 pub fn extract_json_str<'a>(json: &'a str, key: &str) -> Option<&'a str> {
     let mut pattern = String::with_capacity(key.len() + 2);
     pattern.push('"');
@@ -39,7 +61,7 @@ pub fn extract_json_str<'a>(json: &'a str, key: &str) -> Option<&'a str> {
         return None;
     }
     let content = &after_colon[1..];
-    let end_quote = content.find('"')?;
+    let end_quote = find_unescaped_quote(content)?;
     Some(&content[..end_quote])
 }
 
@@ -56,7 +78,7 @@ pub fn extract_json_raw_value<'a>(json: &'a str, key: &str) -> Option<&'a str> {
     let after_colon = after_key[colon_pos + 1..].trim_start();
 
     if after_colon.starts_with('"') {
-        let end_quote = after_colon[1..].find('"')?;
+        let end_quote = find_unescaped_quote(&after_colon[1..])?;
         return Some(&after_colon[..=end_quote + 1]);
     }
 
@@ -468,6 +490,11 @@ mod tests {
 
         let wrapped = wrap_jsonrpc_result("1", r#"{"ok":true}"#);
         assert!(wrapped.contains(r#"result":{"ok":true}"#));
+
+        let escaped_req = r#"{"id":"req\"42","fasta_path":"path\\to\\file\"quoted\".fasta"}"#;
+        assert_eq!(extract_json_str(escaped_req, "id"), Some(r#"req\"42"#));
+        assert_eq!(extract_json_str(escaped_req, "fasta_path"), Some(r#"path\\to\\file\"quoted\".fasta"#));
+        assert_eq!(escape_json_str("a\"b\\c\nd\x01"), "a\\\"b\\\\c\\nd\\u0001");
     }
 
     #[test]

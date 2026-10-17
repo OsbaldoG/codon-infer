@@ -74,20 +74,20 @@ pub fn dms_to_json_string(
 ) -> String {
     let mut out = String::with_capacity(rows.len() * 250 + 256);
     out.push_str("{\n");
-    out.push_str(&format!("  \"protein_id\": \"{}\",\n", protein_id));
+    out.push_str(&format!("  \"protein_id\": \"{}\",\n", crate::mcp::escape_json_str(protein_id)));
     out.push_str(&format!("  \"sequence_length\": {},\n", sequence.len()));
-    out.push_str(&format!("  \"sequence\": \"{}\",\n", sequence));
+    out.push_str(&format!("  \"sequence\": \"{}\",\n", crate::mcp::escape_json_str(sequence)));
     out.push_str(&format!("  \"elapsed_ms\": {:.2},\n", elapsed_ms));
     out.push_str(&format!("  \"muts_per_sec\": {:.1},\n", muts_per_sec));
 
-    let critical_sites: Vec<&DmsPositionRow> = rows.iter().filter(|r| r.mean_delta_logp <= -3.5).collect();
+    let critical_sites: Vec<&DmsPositionRow> = rows.iter().filter(|r| r.mean_delta_logp <= -3.8).collect();
     out.push_str(&format!("  \"critical_sites_count\": {},\n", critical_sites.len()));
     out.push_str("  \"critical_sites\": [\n");
     for (i, r) in critical_sites.iter().enumerate() {
         let comma = if i + 1 < critical_sites.len() { "," } else { "" };
         out.push_str(&format!(
             "    {{\"pos\": {}, \"wt\": \"{}\", \"mean_delta_logp\": {:.3}, \"category\": \"{}\"}}{}\n",
-            r.pos, r.wt, r.mean_delta_logp, r.category, comma
+            r.pos, r.wt, r.mean_delta_logp, crate::mcp::escape_json_str(r.category), comma
         ));
     }
     out.push_str("  ],\n");
@@ -97,7 +97,7 @@ pub fn dms_to_json_string(
         let comma = if i + 1 < rows.len() { "," } else { "" };
         out.push_str(&format!(
             "    {{\"pos\": {}, \"wt\": \"{}\", \"mean_delta_logp\": {:.3}, \"entropy\": {:.3}, \"category\": \"{}\", \"substitutions\": {{",
-            r.pos, r.wt, r.mean_delta_logp, r.entropy, r.category
+            r.pos, r.wt, r.mean_delta_logp, r.entropy, crate::mcp::escape_json_str(r.category)
         ));
         for (j, &(aa, _)) in CANONICAL_AAS.iter().enumerate() {
             let sub_comma = if j + 1 < 20 { ", " } else { "" };
@@ -163,7 +163,7 @@ pub fn contacts_to_json_string(
 ) -> String {
     let mut out = String::with_capacity(pairs.len() * 120 + 256);
     out.push_str("{\n");
-    out.push_str(&format!("  \"protein_id\": \"{}\",\n", protein_id));
+    out.push_str(&format!("  \"protein_id\": \"{}\",\n", crate::mcp::escape_json_str(protein_id)));
     out.push_str(&format!("  \"sequence_length\": {},\n", sequence_len));
     out.push_str(&format!("  \"cys_count\": {},\n", cys_indices.len()));
     let cys_str: Vec<String> = cys_indices.iter().map(|&idx| (idx + 1).to_string()).collect();
@@ -209,10 +209,10 @@ pub fn inpaint_to_json_string(
 ) -> String {
     let mut out = String::with_capacity(sites.len() * 300 + 256);
     out.push_str("{\n");
-    out.push_str(&format!("  \"protein_id\": \"{}\",\n", protein_id));
+    out.push_str(&format!("  \"protein_id\": \"{}\",\n", crate::mcp::escape_json_str(protein_id)));
     out.push_str(&format!("  \"sequence_length\": {},\n", original_sequence.len()));
-    out.push_str(&format!("  \"original_sequence\": \"{}\",\n", original_sequence));
-    out.push_str(&format!("  \"reconstructed_sequence\": \"{}\",\n", reconstructed_sequence));
+    out.push_str(&format!("  \"original_sequence\": \"{}\",\n", crate::mcp::escape_json_str(original_sequence)));
+    out.push_str(&format!("  \"reconstructed_sequence\": \"{}\",\n", crate::mcp::escape_json_str(reconstructed_sequence)));
     out.push_str(&format!("  \"masked_sites_count\": {},\n", sites.len()));
     out.push_str("  \"predictions\": [\n");
     for (i, site) in sites.iter().enumerate() {
@@ -225,7 +225,7 @@ pub fn inpaint_to_json_string(
             let cand_comma = if j + 1 < site.candidates.len() { ", " } else { "" };
             out.push_str(&format!(
                 "{{\"amino_acid\": \"{}\", \"probability_pct\": {:.2}, \"category\": \"{}\"}}{}",
-                cand.amino_acid, cand.probability_pct, cand.category, cand_comma
+                cand.amino_acid, cand.probability_pct, crate::mcp::escape_json_str(cand.category), cand_comma
             ));
         }
         out.push_str(&format!("]}}{}\n", comma));
@@ -334,9 +334,9 @@ pub fn fold_to_json_string(
 ) -> String {
     let mut out = String::with_capacity(result.coords.len() * 120 + pdb_content.len() + 512);
     out.push_str("{\n");
-    out.push_str(&format!("  \"protein_id\": \"{}\",\n", result.protein_id));
+    out.push_str(&format!("  \"protein_id\": \"{}\",\n", crate::mcp::escape_json_str(&result.protein_id)));
     out.push_str(&format!("  \"sequence_length\": {},\n", result.sequence.len()));
-    out.push_str(&format!("  \"sequence\": \"{}\",\n", result.sequence));
+    out.push_str(&format!("  \"sequence\": \"{}\",\n", crate::mcp::escape_json_str(&result.sequence)));
     out.push_str(&format!("  \"num_restraints\": {},\n", result.num_restraints));
     out.push_str(&format!("  \"p_max\": {:.4},\n", result.p_max));
     out.push_str(&format!("  \"forward_ms\": {:.2},\n", result.forward_ms));
@@ -403,8 +403,8 @@ mod tests {
     fn test_json_string_serializers() {
         let deltas = [0.0; 20];
         let row = DmsPositionRow::new(1, 'M', deltas, 2.5);
-        let dms_json = dms_to_json_string("test_prot", "M", &[row], 12.34, 162.0);
-        assert!(dms_json.contains("\"protein_id\": \"test_prot\""));
+        let dms_json = dms_to_json_string("test\"prot\\1\n2", "M", &[row], 12.34, 162.0);
+        assert!(dms_json.contains("\"protein_id\": \"test\\\"prot\\\\1\\n2\""));
         assert!(dms_json.contains("\"sequence_length\": 1"));
         assert!(dms_json.contains("\"positions\": ["));
 
@@ -417,8 +417,8 @@ mod tests {
             is_cys_cys: false,
             is_known_disulfide: false,
         };
-        let contacts_json = contacts_to_json_string("test_prot", 6, &[5], 1.25, &[pair]);
-        assert!(contacts_json.contains("\"protein_id\": \"test_prot\""));
+        let contacts_json = contacts_to_json_string("test\"prot", 6, &[5], 1.25, &[pair]);
+        assert!(contacts_json.contains("\"protein_id\": \"test\\\"prot\""));
         assert!(contacts_json.contains("\"top_contacts\": ["));
         assert!(contacts_json.contains("\"apc_score\": 0.12340"));
 
@@ -433,7 +433,8 @@ mod tests {
                 category: "Cysteine",
             }],
         };
-        let inpaint_json = inpaint_to_json_string("test_prot", "*", "C", &[inpaint_site]);
+        let inpaint_json = inpaint_to_json_string("test\"prot", "*", "C", &[inpaint_site]);
+        assert!(inpaint_json.contains("\"protein_id\": \"test\\\"prot\""));
         assert!(inpaint_json.contains("\"reconstructed_sequence\": \"C\""));
         assert!(inpaint_json.contains("\"predictions\": ["));
         assert!(inpaint_json.contains("85.50"));
