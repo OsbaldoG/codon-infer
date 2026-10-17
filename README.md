@@ -328,55 +328,57 @@ Empirical benchmark evaluated on `test_peptidase.fasta` (41 tokens) against offi
 The runtime pipeline faithfully executes the ESM-2 architecture (RoBERTa-based):
 
 ```text
-                    ┌────────────────────────┐
-                    │  Input Prompt (String) │
-                    └───────────┬────────────┘
-                                │ Tokenizer::encode()
-                                ▼
-                    ┌────────────────────────┐
-                    │ Token IDs ([0, ..., 2])│
-                    └───────────┬────────────┘
-                                │
- ┌──────────────────────────────▼───────────────────────────────┐
- │ Token Embedding Table (33 tokens × dim)                      │
- └──────────────────────────────┬───────────────────────────────┘
-                                │  x [dim]
- ┌──────────────────────────────▼───────────────────────────────┐ ◄──┐
- │ Transformer Layer (×L Layers: 6, 12, 30, 33, or 36)          │    │
- │  ├── LayerNorm 1 (dim, eps 1e-5)                             │    │
- │  ├── Multi-Head Attention (20/40 Heads × dk: 16, 24, 32, 64) │    │
- │  │    ├── Projections: Q, K, V (SIMD Matmul AVX2+FMA / AVX1)  │    │
- │  │    ├── RoPE Split-Half: x[:half], x[half:dk] rotated      │    │
- │  │    ├── Static Ring KV-Cache Update (pos × dim)            │    │
- │  │    ├── Scaled Dot-Product Attention (AVX dk-unrolled)     │    │
- │  │    └── Output Projection (Wo: dim × dim + Bias)           │    │
- │  ├── Residual Connection 1: x = x + att_out                  │    │
- │  ├── LayerNorm 2 (dim, eps 1e-5)                             │    │
- │  ├── Feed-Forward Network (FFN)                              │    │
- │  │    ├── FC1 Dense: dim -> hidden_dim + Bias                │    │
- │  │    ├── GELU Activation (Numerical erf approximation)      │    │
- │  │    └── FC2 Dense: hidden_dim -> dim + Bias                │    │
- │  └── Residual Connection 2: x = x + ffn_out                  │    │
- └──────────────────────────────┬───────────────────────────────┘ ───┘
-                                │  x [dim] (after L layers)
- ┌──────────────────────────────▼───────────────────────────────┐
- │ Final LayerNorm (ln_f, dim, eps 1e-5)                        │
- └──────────────────────────────┬───────────────────────────────┘
-                                │
- ┌──────────────────────────────▼───────────────────────────────┐
- │ EsmLMHead (Classification Head)                              │
- │  ├── Dense Layer: dim × dim + Bias                           │
- │  ├── GELU Activation (erf-based)                             │
- │  ├── Head LayerNorm (dim, eps 1e-5)                          │
- │  └── Tied Embedding Projection (dim × 33) + Decoder Bias     │
- └──────────────────────────────┬───────────────────────────────┘
-                                │  logits [33]
- ┌──────────────────────────────▼───────────────────────────────┐
- │ Biological Logit Masking (-inf on tokens <4 or >23)          │
- │ Stochastic Temperature Sampling (SimpleRng / XORShift64)     │
- └──────────────────────────────┬───────────────────────────────┘
-                                ▼
-                    Next Canonical Amino Acid Token
+                      ┌─────────────────────────┐
+                      │ Input Sequence (FASTA)  │
+                      └────────────┬────────────┘
+                                   │ Tokenizer::encode()
+                                   ▼
+                      ┌─────────────────────────┐
+                      │ Token IDs ([0, ..., 2]) │
+                      └────────────┬────────────┘
+                                   │
+ ┌─────────────────────────────────▼─────────────────────────────────┐
+ │ Token Embedding Table (33 tokens × dim) [zero-alloc lookup]       │
+ └─────────────────────────────────┬─────────────────────────────────┘
+                                   │ x [dim]
+ ┌─────────────────────────────────▼─────────────────────────────────┐ ◄──┐
+ │ Transformer Layer (×L: 6, 12, 30, 33, 36; d: 320 to 2560)         │    │
+ │ ├── LayerNorm 1 (prenorm, eps 1e-5)                               │    │
+ │ ├── Multi-Head Attention (20/40 Heads × dk: 16, 24, 32, 64)       │    │
+ │ │   ├── Projections: Q, K, V (Tiled GEMM AVX2+FMA / AVX1, Mr=4)   │    │
+ │ │   ├── RoPE Split-Half: x[:half], x[half:dk] rotated             │    │
+ │ │   ├── KV-Cache Update (autoregressive) / Full Sequence Window   │    │
+ │ │   ├── Scaled Dot-Product Attention (AVX dk-unrolled SIMD)       │    │
+ │ │   └── Output Projection (Wo: Tiled GEMM dim × dim + Bias)       │    │
+ │ ├── Residual Connection 1: x = x + att_out                        │    │
+ │ ├── LayerNorm 2 (dim, eps 1e-5)                                   │    │
+ │ ├── Feed-Forward Network (FFN: dim -> 4*dim -> dim)               │    │
+ │ │   ├── FC1 Dense: Tiled GEMM (AVX2+FMA / AVX1, Mr=4)             │    │
+ │ │   ├── GELU Activation (Numerical erf approximation)             │    │
+ │ │   └── FC2 Dense: Tiled GEMM (AVX2+FMA / AVX1, Mr=4)             │    │
+ │ └── Residual Connection 2: x = x + ffn_out                        │    │
+ └─────────────────────────────────┬─────────────────────────────────┘ ───┘
+                                   │
+                 ┌─────────────────┴─────────────────┐
+                 │ Final LayerNorm (ln_f)            │ Attention Maps [L, H, N, N]
+                 ▼                                   ▼
+ ┌───────────────────────────────┐   ┌───────────────────────────────┐
+ │ EsmLMHead (Token & DMS)       │   │ Multi-Layer Contact Head      │
+ │ ├── Dense Layer + GELU        │   │ ├── Streaming O(N²) APC       │
+ │ ├── Head LayerNorm            │   │ └── Meta Logistic Regr.       │
+ │ └── Tied Decoder Bias         │   │     (12.2 KiB weights)        │
+ └───────────────┬───────────────┘   └───────────────┬───────────────┘
+                 │ logits [N, 33]                    │ contact_probs [N, N]
+         ┌───────┴───────┐                           │
+         ▼               ▼                           ▼
+   ┌───────────┐   ┌───────────┐     ┌───────────────────────────────┐
+   │ generate  │   │    dms    │     │ Zero-Trunk 3D Fold Suite      │
+   │  inpaint  │   │ ΔlogP LLR │     │ ├── Stage A: Metric MDS       │
+   │ (Tokens)  │   │ (Mut/sec) │     │ └── Stage B: Biophys. GD      │
+   └───────────┘   └───────────┘     └───────────────┬───────────────┘
+                                                     ▼
+                                             PDB Atomic Output
+                                             (*.pdb Structure)
 ```
 
 ---

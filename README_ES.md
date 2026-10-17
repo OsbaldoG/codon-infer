@@ -330,55 +330,57 @@ Evaluación empírica en `test_peptidase.fasta` (41 tokens) frente a los tensore
 El pipeline de ejecución reproduce con absoluta fidelidad la arquitectura ESM-2 (derivada de RoBERTa):
 
 ```text
-                    ┌────────────────────────┐
-                    │ Secuencia Entrada (Str)│
-                    └───────────┬────────────┘
-                                │ Tokenizer::encode()
-                                ▼
-                    ┌────────────────────────┐
-                    │ Token IDs ([0, ..., 2])│
-                    └───────────┬────────────┘
-                                │
- ┌──────────────────────────────▼───────────────────────────────┐
- │ Tabla de Embeddings de Tokens (33 tokens × dim)              │
- └──────────────────────────────┬───────────────────────────────┘
-                                │  x [dim]
- ┌──────────────────────────────▼───────────────────────────────┐ ◄──┐
- │ Capa Transformer (×L Capas: 6, 12, 30, 33, o 36)            │    │
- │  ├── LayerNorm 1 (dim, eps 1e-5)                             │    │
- │  ├── Atención Multi-Cabeza (20/40 Cabezas × dk: 16, 24, 32, 64)│    │
- │  │    ├── Proyecciones: Q, K, V (SIMD Matmul AVX2+FMA / AVX1)│    │
- │  │    ├── RoPE Split-Half: rotación x[:half], x[half:dk]     │    │
- │  │    ├── Actualización Caché KV Ring Estática (pos × dim)   │    │
- │  │    ├── Atención Dot-Product Escalada (AVX dk-unrolled)    │    │
- │  │    └── Proyección de Salida (Wo: dim × dim + Bias)        │    │
- │  ├── Conexión Residual 1: x = x + att_out                    │    │
- │  ├── LayerNorm 2 (dim, eps 1e-5)                             │    │
- │  ├── Red Feed-Forward (FFN)                                  │    │
- │  │    ├── FC1 Densa: dim -> hidden_dim + Bias                │    │
- │  │    ├── Activación GELU (Aproximación numérica erf)        │    │
- │  │    └── FC2 Densa: hidden_dim -> dim + Bias                │    │
- │  └── Conexión Residual 2: x = x + ffn_out                    │    │
- └──────────────────────────────┬───────────────────────────────┘ ───┘
-                                │  x [dim] (tras L capas)
- ┌──────────────────────────────▼───────────────────────────────┐
- │ LayerNorm Final (ln_f, dim, eps 1e-5)                        │
- └──────────────────────────────┬───────────────────────────────┘
-                                │
- ┌──────────────────────────────▼───────────────────────────────┐
- │ EsmLMHead (Cabezal de Clasificación de Lenguaje)             │
- │  ├── Capa Densa: dim × dim + Bias                            │
- │  ├── Activación GELU (basada en erf)                         │
- │  ├── Head LayerNorm (dim, eps 1e-5)                          │
- │  └── Proyección de Embeddings Ligados (dim × 33) + Dec Bias  │
- └──────────────────────────────┬───────────────────────────────┘
-                                │  logits [33]
- ┌──────────────────────────────▼───────────────────────────────┐
- │ Enmascaramiento Biológico (-inf en tokens <4 o >23)          │
- │ Muestreo Estocástico con Temperatura (SimpleRng / XORShift64)│
- └──────────────────────────────┬───────────────────────────────┘
-                                ▼
-                 Siguiente Aminoácido Canónico
+                      ┌─────────────────────────┐
+                      │ Secuencia Entrada (STR) │
+                      └────────────┬────────────┘
+                                   │ Tokenizer::encode()
+                                   ▼
+                      ┌─────────────────────────┐
+                      │ Token IDs ([0, ..., 2]) │
+                      └────────────┬────────────┘
+                                   │
+ ┌─────────────────────────────────▼─────────────────────────────────┐
+ │ Tabla de Embeddings de Tokens (33 tokens × dim) [zero-alloc]      │
+ └─────────────────────────────────┬─────────────────────────────────┘
+                                   │ x [dim]
+ ┌─────────────────────────────────▼─────────────────────────────────┐ ◄──┐
+ │ Capa Transformer (×L: 6, 12, 30, 33, 36; d: 320 a 2560)           │    │
+ │ ├── LayerNorm 1 (prenorma, eps 1e-5)                              │    │
+ │ ├── Atención Multi-Cabeza (20/40 Cabezas × dk: 16, 24, 32, 64)    │    │
+ │ │   ├── Proyecciones: Q, K, V (Tiled GEMM AVX2+FMA / AVX1, Mr=4)  │    │
+ │ │   ├── RoPE Split-Half: rotación x[:half], x[half:dk]            │    │
+ │ │   ├── Actualización Caché KV Ring / Ventana Completa            │    │
+ │ │   ├── Atención Dot-Product Escalada (AVX dk-unrolled SIMD)      │    │
+ │ │   └── Proyección Salida (Wo: Tiled GEMM dim × dim + Bias)       │    │
+ │ ├── Conexión Residual 1: x = x + att_out                          │    │
+ │ ├── LayerNorm 2 (dim, eps 1e-5)                                   │    │
+ │ ├── Red Feed-Forward (FFN: dim -> 4*dim -> dim)                   │    │
+ │ │   ├── FC1 Densa: Tiled GEMM (AVX2+FMA / AVX1, Mr=4)             │    │
+ │ │   ├── Activación GELU (Aproximación numérica erf)               │    │
+ │ │   └── FC2 Densa: Tiled GEMM (AVX2+FMA / AVX1, Mr=4)             │    │
+ │ └── Conexión Residual 2: x = x + ffn_out                          │    │
+ └─────────────────────────────────┬─────────────────────────────────┘ ───┘
+                                   │
+                 ┌─────────────────┴─────────────────┐
+                 │ LayerNorm Final (ln_f)            │ Mapas de Atención [L, H, N, N]
+                 ▼                                   ▼
+ ┌───────────────────────────────┐   ┌───────────────────────────────┐
+ │ EsmLMHead (Tokens y DMS)      │   │ Cabezal Contacto Oficial      │
+ │ ├── Capa Densa + GELU         │   │ ├── Streaming O(N²) APC       │
+ │ ├── Head LayerNorm            │   │ └── Regresión Logística       │
+ │ └── Decodificador Ligado      │   │     (12.2 KiB estáticos)      │
+ └───────────────┬───────────────┘   └───────────────┬───────────────┘
+                 │ logits [N, 33]                    │ contact_probs [N, N]
+         ┌───────┴───────┐                           │
+         ▼               ▼                           ▼
+   ┌───────────┐   ┌───────────┐     ┌───────────────────────────────┐
+   │ generate  │   │    dms    │     │ Plegamiento 3D Zero-Trunk     │
+   │  inpaint  │   │ ΔlogP LLR │     │ ├── Fase A: MDS Métrico       │
+   │ (Tokens)  │   │ (Mut/seg) │     │ └── Fase B: Gradiente Fís     │
+   └───────────┘   └───────────┘     └───────────────┬───────────────┘
+                                                     ▼
+                                            Estructura Atómica
+                                             (*.pdb Estándar)
 ```
 
 ---
