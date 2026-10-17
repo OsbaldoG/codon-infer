@@ -1,12 +1,12 @@
 # codon-infer 🧬⚡
 
-> **Motor de Inferencia y Pipeline Bioinformático para Modelos de Lenguaje de Proteínas ESM-2 Multi-Escala, de Alto Rendimiento y Cero Asignaciones en Rust Puro (v1.6.0).**
+> **Motor de Inferencia y Pipeline Bioinformático para Modelos de Lenguaje de Proteínas ESM-2 Multi-Escala, de Alto Rendimiento y Cero Asignaciones en Rust Puro (v1.8.0).**
 
 [🇬🇧 Read in English (README.md)](README.md)
 
 [![Rust](https://img.shields.io/badge/rust-edición_2024-orange.svg)](https://www.rust-lang.org/)
-[![Version](https://img.shields.io/badge/versión-1.6.0-blue.svg)]()
-[![Tests](https://img.shields.io/badge/tests-54%20pasados%2C%200%20fallidos-brightgreen.svg)]()
+[![Version](https://img.shields.io/badge/versión-1.8.0-blue.svg)]()
+[![Tests](https://img.shields.io/badge/tests-55%20pasados%2C%200%20fallidos-brightgreen.svg)]()
 [![Dependencies](https://img.shields.io/badge/dependencias-0%20(std%20puro)-brightgreen.svg)]()
 [![License](https://img.shields.io/badge/licencia-MIT-blue.svg)](LICENSE)
 [![Model](https://img.shields.io/badge/modelo-ESM--2%20(8M%20a%203B)-blueviolet.svg)](https://github.com/facebookresearch/esm)
@@ -18,7 +18,40 @@
 
 `codon-infer` es un motor de inferencia y suite de análisis bioinformático ultraligero y libre de dependencias externas para la familia de modelos de lenguaje de proteínas Evolutionary Scale Modeling (**ESM-2**) en todas sus variantes de escala (`8M`, `35M`, `150M`, `650M` y `3B`), diseñado desde primeros principios matemáticos y de hardware en **Rust 100% seguro e idiomático (`std` exclusivamente)**.
 
-Al prescindir por completo de los ecosistemas de Python, PyTorch, C/CUDA y crates externos de terceros, `codon-infer` ejecuta generación autorregresiva de secuencias, *inpainting* bidireccional de sitios activos, escaneo mutacional profundo *in silico* (DMS) y predicción de contactos estructurales mediante vectorización SIMD dinámica a más de **200 tokens/segundo en CPUs x86_64 estándar**, manteniendo una huella de memoria estática inferior a 40 MB para modelos de 8M.
+Al prescindir por completo de los ecosistemas de Python, PyTorch, C/CUDA y crates externos de terceros, `codon-infer` ejecuta generación autorregresiva de secuencias, *inpainting* bidireccional de sitios activos, escaneo mutacional profundo *in silico* (DMS), predicción de contactos y reconstrucción 3D *ab initio* mediante vectorización SIMD dinámica a más de **200 tokens/segundo en CPUs x86_64 estándar**, manteniendo una huella de memoria estática inferior a 40 MB para modelos de 8M.
+
+---
+
+## ⚡ Aspectos Destacados (Versión 1.8: Reconstrucción 3D Zero-Trunk, Motor Tiled GEMM y Suite Canónica de Contactos)
+
+* **Reconstrucción Geométrica 3D Zero-Trunk (`STRUCT-2`):**
+  * Resuelve plegamientos proteicos 3D *ab initio* y genera coordenadas atómicas $C_\alpha$ directamente a partir de las representaciones de atención de ESM-2 en **15–35 ms** sobre procesadores x86_64 estándar, prescindiendo por completo de los pesados troncos de plegamiento de 3 GB de ESMFold o AlphaFold.
+  * **Optimización Híbrida de Escalamiento Multidimensional (MDS) + Gradiente Biofísico:**
+    1. *Fase A (MDS Métrico Espectral):* Clausura geodésica de Floyd-Warshall sobre el grafo de distancias cota superior, seguida por la descomposición espectral de la matriz de Gram doblemente centrada ($B = -\frac{1}{2} J D^{(2)} J$) y el método de las potencias con deflación para los 3 autovectores principales, reescalados al enlace peptídico canónico de $3.80\text{ \AA}$.
+    2. *Fase B (Descenso de Gradiente Multi-Inicio con Momento):* 450 pasos de optimización acelerada por momento sobre 4 cuencas conformacionales (MDS espectral + 3 cintas helicoidales torsionales) minimizando un potencial físico canónico:
+       * **Enlace Peptídico Exacto:** $d(C_{\alpha, i}, C_{\alpha, i+1}) = 3.80\text{ \AA}$ ($w = 18 \to 43$).
+       * **Ángulos de Flexión Local:** $d(C_{\alpha, i}, C_{\alpha, i+2}) \in [5.30\text{ \AA}, 6.90\text{ \AA}]$ con guiado dinámico según señal helicoidal local.
+       * **Restricciones de Contacto Terciario:** Potencial suave de Huber sobre los mejores $1.5 \cdot N$ pares con ponderación cuadrática por confianza ($w \propto P_{\text{rel}}^2$).
+       * **Exclusión Estérica de Van der Waals:** Repulsión dura para $|i - j| \ge 3$ a distancias $d < 4.10\text{ \AA}$ y repulsión epistática de no-contacto.
+       * **Compactación Globular:** Regularizador de radio de giro teórico de Flory $R_g = 2.25 \cdot N^{0.38}\text{ \AA}$.
+  * **Paridad de Coordenadas de Nivel Publicación:** Reconstruye estructuras cristalográficas con RMSD $< 3.0\text{ \AA}$ y TM-score $> 0.50$ (p. ej. `2L2D` Trp-cage: **RMSD 2.26 Å**, TM 0.525; `1O6X`: **RMSD 2.95 Å**, TM 0.602; oráculo de cristal: **RMSD 2.43 Å**, TM 0.652, 0 choques estéricos).
+  * Generación directa de archivos estándar `.pdb` (`codon-infer fold --sequence ... --export-pdb structure.pdb` y `codon-infer contacts ... --export-pdb contacts.pdb`).
+
+* **Motor Tiled GEMM Multi-Token Bloqueado en Caché (CI-1):**
+  * Multiplicación matricial por bloques de tokens (`matmul_tiled_fp32_parallel`, `matmul_tiled_q8_parallel`, `matmul_tiled_q4_parallel`).
+  * Micro-kernels AVX2+FMA y AVX1 con $M_r = 4$ tokens simultáneos (`dot_row_batch_m4_avx2_fma`, `dot_row_batch_m4_avx1`) y desempaquetado por filas en caché L1d (`unpack_q8_row_avx1`, `unpack_q4_row_avx1`).
+  * Elimina la saturación del bus DRAM (pasando de régimen limitado por memoria a limitado por cómputo), ofreciendo hasta **3.76× de aceleración en FP32** y **2.41×–3.44× en regímenes cuantizados** con paridad matemática bit a bit exacta ($\cos = 1.00000000$, RMSE $\sim 10^{-6}$, Top-1 Match 100.0%).
+
+* **Escaneo Mutacional Profundo Canónico (BIO-1):**
+  * Cálculo estricto del ratio de log-verosimilitud sin heurísticas arbitrarias ni reglas catalíticas codificadas: $\Delta \log P = \log P(x_i = m \mid x_{\setminus i}) - \log P(x_i = wt \mid x_{\setminus i})$.
+  * Modo rápido en 1 pasada `WildtypeMarginal` (`--fast`, `--wt-marginal`, `--mode wt`) que acelera la mutagénesis de saturación hasta **42×** (superando **16,170 mutaciones/seg**) identificando de forma fiable motivos catalíticos estrictamente conservados (p. ej., GDSGGP).
+
+* **Cabezal de Contacto Multicapa Oficial con Streaming O(N²) (STRUCT-1):**
+  * Integra los pesos oficiales de regresión logística multicapa de Meta AI en las 5 escalas (8M, 35M, 150M, 650M, 3B) en apenas 12.2 KiB de memoria estática, preservando 100% de compatibilidad binaria (`.bin`, `_q8_0.bin`, `_q4_0.bin`).
+  * Acumulación en streaming $O(N^2)$ (`accumulate_head_apc`), reduciendo el consumo de memoria en **1,440×** (sin necesidad de materializar pesados tensores $L \times H \times N \times N$) y alcanzando hasta **96.63% de Precision@L/5** en modelos cuantizados de 650M con solo 413 MiB de RAM.
+
+* **Herramienta 3D para Model Context Protocol (MCP) (`codon_infer_fold`):**
+  * Expone el plegamiento 3D y la generación atómica PDB mediante el demonio stdio JSON-RPC, entregando coordenadas y estructuras `.pdb` válidas directamente a entornos de agentes.
 
 ---
 
@@ -573,6 +606,7 @@ cargo run --release --bin codon-infer-mcp -- --model esm2_650m_q8_0.bin
 * `codon_infer_inpaint`: Reconstruye residuos enmascarados (`*`) devolviendo los 5 candidatos principales con sus probabilidades y clasificación fisicoquímica.
 * `codon_infer_dms`: Ejecuta mutagénesis de saturación *in silico* desde una secuencia cruda o archivo FASTA, identificando posiciones catalíticas críticas (Δ log P ≤ -3.8) y tolerancias mutacionales.
 * `codon_infer_contacts`: Calcula pares de contacto epistáticos (APC) y detecta puentes disulfuro candidatos (`Cys-Cys`).
+* `codon_infer_fold`: Reconstruye el plegamiento proteico 3D de nivel publicación (coordenadas $C_\alpha$ en formato `.pdb`) mediante MDS Zero-Trunk y optimización por gradiente biofísico.
 
 ---
 
@@ -586,6 +620,7 @@ cargo run --release --bin codon-infer-mcp -- --model esm2_650m_q8_0.bin
 | `--model <RUTA>`, `-m` | Ruta al binario personalizado de pesos ESM-2 en FP32, Q8_0 o Q4_0 (o `all` para benchmark comparativo) | `esm2_8m_weights.bin` |
 | `-t`, `--threads <N>` | Hilos de trabajo para la ejecución paralela matriz-vector | Núcleos físicos detectados |
 | `--quantize <q4_0|q8_0|fp32>`, `--q4`, `--q8` | Modo de cuantización en ejecución (`auto`, `fp32`, `q8_0`, `q4_0`). `--q4` / `--q8` son atajos | `auto` |
+| `--export-pdb <RUTA>` | Exporta las coordenadas $C_\alpha$ 3D reconstruidas al formato estándar Protein Data Bank (`.pdb`) | - |
 | `--export-json <RUTA>`| Exporta métricas de benchmark o análisis directamente a JSON | - |
 | `--color <auto|always|never>` | Controla el estilizado de la terminal mediante ANSI TrueColor | `auto` |
 | `--no-color` | Desactiva terminantemente los códigos de escape ANSI (estándar NO_COLOR) | `false` |
@@ -593,12 +628,15 @@ cargo run --release --bin codon-infer-mcp -- --model esm2_650m_q8_0.bin
 ### Opciones de Pipeline
 | Opción | Subcomandos Aplicables | Descripción | Valor por Defecto |
 | :--- | :--- | :--- | :--- |
-| `--sequence <CADENA>` | `generate`, `inpaint`, `dms`, `contacts` | Secuencia de aminoácidos suministrada de forma directa | `"M"` |
-| `--fasta <RUTA>` | `generate`, `inpaint`, `dms`, `contacts` | Ruta al archivo FASTA (o `-` para leer de stdin) | - |
+| `--sequence <CADENA>` | `generate`, `inpaint`, `dms`, `contacts`, `fold` | Secuencia de aminoácidos suministrada de forma directa | `"M"` |
+| `--fasta <RUTA>` | `generate`, `inpaint`, `dms`, `contacts`, `fold` | Ruta al archivo FASTA (o `-` para leer de stdin) | - |
+| `--export-pdb <RUTA>` | `contacts`, `fold` | Ruta de archivo de destino para coordenadas atómicas en formato `.pdb` | - |
+| `--export-tsv <RUTA>` | `fold` | Ruta de archivo de destino para la tabla de coordenadas 3D separadas por tabuladores | - |
 | `--output <RUTA>`, `-o` | `quantize` | Ruta de salida para el archivo binario cuantizado (`*_q4_0.bin` o `*_q8_0.bin`) | - |
 | `--format <q4_0|q8_0>`, `-f` | `quantize` | Formato objetivo de cuantización (opcional si es inferible por el nombre del archivo) | `q8_0` |
 | `--export-csv <RUTA>`| `dms`, `contacts` | Ruta de destino para la matriz rectangular o tabla CSV | - |
-| `--export-json <RUTA>`| `dms`, `contacts`, `benchmark` | Ruta de destino para el informe estructurado en JSON | - |
+| `--export-json <RUTA>`| `dms`, `contacts`, `fold`, `benchmark` | Ruta de destino para el informe estructurado en JSON | - |
+| `--fast`, `--wt-marginal` | `dms` | Modo de escaneo rápido en 1 pasada Wildtype Marginal (acelera hasta 42×) | `false` |
 | `--window <USIZE>` | `dms` | Tamaño de ventana deslizante para proteínas largas | `128` |
 | `--stride <USIZE>` | `dms` | Paso de desplazamiento de la ventana deslizante | `64` |
 | `--min-separation <USIZE>` | `contacts` | Separación mínima de secuencia para contactos epistáticos | `6` |
@@ -617,19 +655,20 @@ codon-infer/
 ├── .cargo/
 │   └── config.toml         # Banderas de compilación nativa (-C target-cpu=native)
 ├── .gitignore              # Filtro de artefactos generados y copias de seguridad
-├── Cargo.toml              # Especificación cero dependencias (v1.6.0, edición 2024)
+├── Cargo.toml              # Especificación cero dependencias (v1.8.0, edición 2024)
 ├── esm2_8m_weights.bin     # Pesos FP32 de ESM-2 8M (7.52M parámetros, ~30 MB)
 ├── scripts/
 │   ├── download_weights.sh # Descargador veloz de pesos desde GitHub Releases
 │   ├── export_weights.py   # Exportador de pesos desde HuggingFace y fair-esm
 │   └── colab_export_esm2.ipynb # Exportador Google Colab de pesos canónicos y referencias HF
 ├── src/
-│   ├── lib.rs              # Núcleo del motor: ThreadPool persistente, GEMV Q8_0/Q4_0, atención SIMD, EsmLMHead
+│   ├── lib.rs              # Núcleo del motor: ThreadPool persistente, Tiled GEMM, Q8/Q4, atención SIMD
 │   ├── main.rs             # Despachador de CLI y parser de argumentos de subcomandos
 │   ├── ui.rs               # Paletas TrueColor ANSI, mapas de gradiente térmico y barra de progreso
 │   ├── fasta.rs            # Lector de flujos y secuencias multi-FASTA de cero copias
-│   ├── export.rs           # Serializadores de datos CSV y JSON para análisis de publicación
-│   ├── pipeline.rs         # Controladores de ventana deslizante para DMS, contactos e inpainting
+│   ├── export.rs           # Serializadores de datos CSV, TSV, JSON y PDB para análisis de publicación
+│   ├── pipeline.rs         # Controladores de DMS, contactos, inpainting y plegamiento 3D STRUCT-2
+│   ├── contact_heads.rs    # Pesos y sesgos de regresión logística del cabezal oficial de Meta AI
 │   ├── benchmark.rs        # Automated bioinformatic & hardware stress suite
 │   ├── mcp.rs              # Servidor JSON-RPC MCP sobre stdio sin dependencias externas
 │   └── mcp_main.rs         # Punto de entrada ejecutable del servidor MCP autónomo
@@ -655,7 +694,10 @@ codon-infer/
 - [x] Demonio estándar del protocolo Model Context Protocol (MCP) vía JSON-RPC (`codon-infer-mcp`).
 - [x] Modularización desacoplada: `lib.rs` (biblioteca núcleo), `main.rs` (CLI), `mcp.rs` (servidor MCP).
 - [x] Cuantización sub-byte INT4 (`Q4_0`) y cabecera universal `CODQ` de 64 bytes en las 5 escalas (8M a 3B).
-- [ ] Batched GEMM `[N × D] × [D × D]` en forward secuencial para eliminar la transmisión de pesos de DRAM por token.
+- [x] Batched GEMM `[N × D] × [D × D]` en forward secuencial para eliminar la transmisión de pesos de DRAM por token (Tiled GEMM 3.76× speedup).
+- [x] Escaneo Mutacional Profundo Canónico (BIO-1) sin heurísticas artificiales + modo rápido Wildtype Marginal (16,170 mut/s).
+- [x] Cabezal de Contacto Multicapa Oficial (L × H APC + Regresión Logística) con streaming $O(N^2)$ en RAM.
+- [x] Reconstrucción Geométrica 3D Zero-Trunk (STRUCT-2) con MDS Métrico + Descenso de Gradiente Biofísico (exportación PDB).
 - [ ] Implementación de micro-kernels SIMD ARM NEON para Apple Silicon (M1/M2/M3/M4) y Raspberry Pi.
 
 ---

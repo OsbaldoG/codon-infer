@@ -1,7 +1,8 @@
 use std::io::{self, BufRead, Write};
 use crate::{
     active_simd_backend, compute_pipeline_contacts, compute_pipeline_inpaint,
-    contacts_to_json_string, dms_to_json_string, generate_sequence, inpaint_to_json_string,
+    compute_pipeline_fold_parallel, contacts_to_json_string, dms_to_json_string,
+    generate_sequence, inpaint_to_json_string, coords_to_pdb_string, fold_to_json_string,
     parse_fasta_file, parse_raw_sequence, run_pipeline_dms_with_mode, DmsScoringMode, EsmConfig,
     EsmWeights, FastaRecord, ModelWeightsRef, RunState, TerminalTheme,
 };
@@ -172,9 +173,9 @@ pub fn wrap_tool_content(id_raw: &str, text: &str) -> String {
     wrap_jsonrpc_result(id_raw, &payload)
 }
 
-/// Returns the MCP tools/list definition schema exposing version 1.7.0 multi-scale capabilities (8M to 3B).
+/// Returns the MCP tools/list definition schema exposing version 1.8.0 multi-scale capabilities (8M to 3B).
 pub fn get_tools_list_json() -> &'static str {
-    r#"{"tools":[{"name":"generate_protein","description":"Autoregressive de novo protein sequence generation and motif extension via ESM-2 (supports 8M, 35M, 150M, 650M, 3B)","inputSchema":{"type":"object","properties":{"prompt":{"type":"string","description":"Seed amino acid sequence (e.g. 'M', 'MCMPCF')"},"sequence":{"type":"string","description":"Alias for prompt"},"temperature":{"type":"number","description":"Sampling temperature (0.0 = greedy argmax, >0.0 = stochastic, default: 0.7)"},"max_tokens":{"type":"integer","description":"Maximum new amino acid residues to generate"},"seed":{"type":"integer","description":"Optional PRNG seed"}}}},{"name":"codon_infer_inpaint","description":"Bidirectional masked sequence infilling & active-site motif reconstruction using ESM-2 (8M to 3B; use '*' or '<mask_1>' for masked positions)","inputSchema":{"type":"object","properties":{"sequence":{"type":"string","description":"Protein sequence containing masked positions '*' (e.g. 'MCMPC*TTDHQMARKCDD')"},"fasta_path":{"type":"string","description":"Optional path to local FASTA file containing masked sequence"}}}},{"name":"codon_infer_dms","description":"In silico Deep Mutational Scanning (DMS) via canonical Masked Marginal or 1-Pass Wildtype Marginal evaluation (ΔLogP) across multi-scale ESM-2 models (8M to 3B)","inputSchema":{"type":"object","properties":{"sequence":{"type":"string","description":"Protein amino acid sequence to scan"},"fasta_path":{"type":"string","description":"Path to local FASTA file (alternative to sequence)"},"mode":{"type":"string","description":"Scoring mode: 'masked' (canonical L-pass) or 'wt' (fast 1-pass wildtype marginal)"},"window":{"type":"integer","description":"Sliding window context size (default: 128)"},"stride":{"type":"integer","description":"Sliding window stride step size (default: 64)"}}}},{"name":"codon_infer_contacts","description":"Zero-shot 3D structural contact map prediction and disulfide bridge detection via official ESM-2 Multi-Layer Contact Head (APC + Logistic Regression, 8M to 3B)","inputSchema":{"type":"object","properties":{"sequence":{"type":"string","description":"Protein amino acid sequence"},"fasta_path":{"type":"string","description":"Path to local FASTA file (alternative to sequence)"},"min_separation":{"type":"integer","description":"Minimum linear sequence distance |i - j| (default: 6)"},"top_contacts":{"type":"integer","description":"Number of top epistatic contact pairs to return (default: 30)"}}}}]}"#
+    r#"{"tools":[{"name":"generate_protein","description":"Autoregressive de novo protein sequence generation and motif extension via ESM-2 (supports 8M, 35M, 150M, 650M, 3B)","inputSchema":{"type":"object","properties":{"prompt":{"type":"string","description":"Seed amino acid sequence (e.g. 'M', 'MCMPCF')"},"sequence":{"type":"string","description":"Alias for prompt"},"temperature":{"type":"number","description":"Sampling temperature (0.0 = greedy argmax, >0.0 = stochastic, default: 0.7)"},"max_tokens":{"type":"integer","description":"Maximum new amino acid residues to generate"},"seed":{"type":"integer","description":"Optional PRNG seed"}}}},{"name":"codon_infer_inpaint","description":"Bidirectional masked sequence infilling & active-site motif reconstruction using ESM-2 (8M to 3B; use '*' or '<mask_1>' for masked positions)","inputSchema":{"type":"object","properties":{"sequence":{"type":"string","description":"Protein sequence containing masked positions '*' (e.g. 'MCMPC*TTDHQMARKCDD')"},"fasta_path":{"type":"string","description":"Optional path to local FASTA file containing masked sequence"}}}},{"name":"codon_infer_dms","description":"In silico Deep Mutational Scanning (DMS) via canonical Masked Marginal or 1-Pass Wildtype Marginal evaluation (ΔLogP) across multi-scale ESM-2 models (8M to 3B)","inputSchema":{"type":"object","properties":{"sequence":{"type":"string","description":"Protein amino acid sequence to scan"},"fasta_path":{"type":"string","description":"Path to local FASTA file (alternative to sequence)"},"mode":{"type":"string","description":"Scoring mode: 'masked' (canonical L-pass) or 'wt' (fast 1-pass wildtype marginal)"},"window":{"type":"integer","description":"Sliding window context size (default: 128)"},"stride":{"type":"integer","description":"Sliding window stride step size (default: 64)"}}}},{"name":"codon_infer_contacts","description":"Zero-shot 3D structural contact map prediction and disulfide bridge detection via official ESM-2 Multi-Layer Contact Head (APC + Logistic Regression, 8M to 3B)","inputSchema":{"type":"object","properties":{"sequence":{"type":"string","description":"Protein amino acid sequence"},"fasta_path":{"type":"string","description":"Path to local FASTA file (alternative to sequence)"},"min_separation":{"type":"integer","description":"Minimum linear sequence distance |i - j| (default: 6)"},"top_contacts":{"type":"integer","description":"Number of top epistatic contact pairs to return (default: 30)"}}}},{"name":"codon_infer_fold","description":"Zero-Trunk 3D protein structure folding and C-alpha atomic coordinate reconstruction via MDS and biophysical gradient optimization (STRUCT-2, returns PDB format)","inputSchema":{"type":"object","properties":{"sequence":{"type":"string","description":"Protein amino acid sequence to fold into 3D structure"},"fasta_path":{"type":"string","description":"Path to local FASTA file (alternative to sequence)"},"export_pdb":{"type":"string","description":"Optional file path to save reconstructed .pdb structure"}}}}]}"#
 }
 
 /// Dispatches a single JSON-RPC message against the ESM-2 runtime and returns the formatted response.
@@ -349,6 +350,42 @@ pub fn handle_jsonrpc_message(
                     wrap_tool_content(id_raw, &inner_json)
                 }
 
+                "codon_infer_fold" | "fold_protein" | "fold" => {
+                    let record = match resolve_mcp_record(msg, "target_fold") {
+                        Ok(r) => r,
+                        Err(e) => {
+                            return Some(wrap_jsonrpc_error(
+                                id_raw,
+                                -32602,
+                                &format!("Invalid parameters for codon_infer_fold: {}", e),
+                            ));
+                        }
+                    };
+
+                    let export_pdb_path = extract_json_str(msg, "export_pdb");
+                    let fold_res = compute_pipeline_fold_parallel(
+                        &record,
+                        config,
+                        ModelWeightsRef::Fp32(weights),
+                        1,
+                    );
+
+                    let pdb_string = coords_to_pdb_string(&fold_res.sequence, &fold_res.protein_id, &fold_res.coords);
+
+                    if let Some(path) = export_pdb_path {
+                        if let Err(e) = std::fs::write(path, &pdb_string) {
+                            return Some(wrap_jsonrpc_error(
+                                id_raw,
+                                -32603,
+                                &format!("Failed to write PDB to '{}': {}", path, e),
+                            ));
+                        }
+                    }
+
+                    let inner_json = fold_to_json_string(&fold_res, &pdb_string);
+                    wrap_tool_content(id_raw, &inner_json)
+                }
+
                 other => wrap_jsonrpc_error(id_raw, -32601, &format!("Tool '{}' not found", other)),
             }
         }
@@ -440,6 +477,7 @@ mod tests {
         assert!(tools_json.contains("codon_infer_inpaint"));
         assert!(tools_json.contains("codon_infer_dms"));
         assert!(tools_json.contains("codon_infer_contacts"));
+        assert!(tools_json.contains("codon_infer_fold"));
 
         let config = EsmConfig::esm2_8m();
         let mut run_state = RunState::new(&config);
@@ -449,6 +487,7 @@ mod tests {
         assert!(resp.contains("codon_infer_inpaint"));
         assert!(resp.contains("codon_infer_dms"));
         assert!(resp.contains("codon_infer_contacts"));
+        assert!(resp.contains("codon_infer_fold"));
     }
 
     #[test]
@@ -490,7 +529,15 @@ mod tests {
         assert!(contacts_resp.contains("top_contacts"));
         assert!(contacts_resp.contains("cys_positions"));
 
-        // 3. Test unknown tool error response
+        // 3. Test codon_infer_fold tool call
+        let fold_req = r#"{"jsonrpc":"2.0","id":103,"method":"tools/call","params":{"name":"codon_infer_fold","arguments":{"sequence":"MCMPCFTTDHQMARKCDDCCGGKGRGKCYGPQCLCR"}}}"#;
+        let fold_resp = handle_jsonrpc_message(fold_req, &config, Some(&weights), &mut run_state).unwrap();
+        assert!(fold_resp.contains("\"id\":103"));
+        assert!(fold_resp.contains("coordinates"));
+        assert!(fold_resp.contains("ATOM"));
+        assert!(fold_resp.contains("num_restraints"));
+
+        // 4. Test unknown tool error response
         let unknown_req = r#"{"jsonrpc":"2.0","id":999,"method":"tools/call","params":{"name":"invalid_tool","arguments":{}}}"#;
         let unknown_resp = handle_jsonrpc_message(unknown_req, &config, Some(&weights), &mut run_state).unwrap();
         assert!(unknown_resp.contains("-32601"));

@@ -2,17 +2,19 @@ use std::io::{self, Write};
 use std::time::Instant;
 use codon_infer::{
     active_simd_backend, export_contacts_csv, export_contacts_json,
-    export_dms_csv, export_dms_json, generate_sequence_parallel,
-    generate_sequence_q8, generate_sequence_q4, parse_fasta_file, parse_raw_sequence, render_dms_heatmap,
+    export_dms_csv, export_dms_json, export_ca_pdb, export_fold_tsv, export_fold_json,
+    generate_sequence_parallel, generate_sequence_q8, generate_sequence_q4,
+    parse_fasta_file, parse_raw_sequence, render_dms_heatmap,
     run_pipeline_contacts_parallel, run_pipeline_dms_with_mode,
-    run_pipeline_inpaint_parallel, detect_optimal_threads, EsmConfig, EsmWeights, EsmWeightsQ8,
+    run_pipeline_inpaint_parallel, run_pipeline_fold_parallel, reconstruct_3d_ca,
+    detect_optimal_threads, EsmConfig, EsmWeights, EsmWeightsQ8,
     EsmWeightsQ4, FastaRecord, ModelWeightsRef, RunState, TerminalTheme,
     CodqHeader, CODQ_MAGIC, DTYPE_Q4_0, DTYPE_Q8_0, DTYPE_FP32, QuantizationMode, DmsScoringMode,
 };
 
 fn print_version() {
     println!("codon-infer v{}", env!("CARGO_PKG_VERSION"));
-    println!("Engine: Pure Rust Zero-Dependencies (std) + Cache-Blocked Tiled GEMM");
+    println!("Engine: Pure Rust Zero-Dependencies (std) + Tiled GEMM & Zero-Trunk 3D Reconstruction");
     println!("Vector Dispatch: {}", active_simd_backend());
     println!("Concurrency: Persistent Worker Pool with Atomic Barrier (zero OS thread spawning)");
     println!("Quantization: Multi-Format Block Engine (Q4_0 nibbles & Q8_0 blocks with CODQ header)");
@@ -23,12 +25,12 @@ fn print_help(theme: &TerminalTheme) {
     let logo = if theme.enabled {
         "\x1b[38;2;139;92;246m╔═══════════════════════════════════════════════════════════════════════════════╗\n\
          ║   \x1b[38;2;59;130;246mCODON-INFER\x1b[38;2;139;92;246m: High-Performance Zero-Allocation ESM-2 Engine in Pure Rust     ║\n\
-         ║   \x1b[38;2;16;185;129mVersion 1.7.0\x1b[38;2;139;92;246m     | Tiled GEMM, Canonical DMS & Multi-Layer Contact Suite  ║\n\
+         ║   \x1b[38;2;16;185;129mVersion 1.8.0\x1b[38;2;139;92;246m     | Tiled GEMM, Canonical DMS, Contacts & 3D Fold Suite    ║\n\
          ╚═══════════════════════════════════════════════════════════════════════════════╝\x1b[0m"
     } else {
         "╔═══════════════════════════════════════════════════════════════════════════════╗\n\
          ║   CODON-INFER: High-Performance Zero-Allocation ESM-2 Engine in Pure Rust     ║\n\
-         ║   Version 1.7.0     | Tiled GEMM, Canonical DMS & Multi-Layer Contact Suite  ║\n\
+         ║   Version 1.8.0     | Tiled GEMM, Canonical DMS, Contacts & 3D Fold Suite    ║\n\
          ╚═══════════════════════════════════════════════════════════════════════════════╝"
     };
     println!("{}", logo);
@@ -39,6 +41,7 @@ fn print_help(theme: &TerminalTheme) {
     println!("    inpaint      Masked sequence infilling & functional active-site reconstruction");
     println!("    dms          In silico Deep Mutational Scanning (Masked Marginal & 1-Pass Fast mode)");
     println!("    contacts     Zero-shot 3D contact map prediction (Official Multi-Layer APC + LR Head)");
+    println!("    fold         Zero-trunk 3D protein structure folding & PDB atomic coordinate reconstruction");
     println!("    quantize     Export quantized weights binary in Q4_0 or Q8_0 block format");
     println!("    benchmark    Hardware validation suite (SIMD parity, cache thrashing, scaling)");
     println!("\nGLOBAL OPTIONS:");
@@ -49,6 +52,7 @@ fn print_help(theme: &TerminalTheme) {
     println!("    --q4                     Shortcut flag for '--quantize q4_0'");
     println!("    --q8                     Shortcut flag for '--quantize q8_0'");
     println!("    --model <PATH>           Path to weights binary (or 'all' for multi-scale benchmark)");
+    println!("    --export-pdb <PATH>      Export reconstructed 3D C_alpha coordinates to standard PDB format");
     println!("    --export-json <PATH>     Export benchmark or analysis metrics to JSON");
     println!("    --color <auto|always|never> Control ANSI TrueColor terminal styling");
     println!("    --no-color               Disable all colored terminal escapes (NO_COLOR standard)");
@@ -58,7 +62,8 @@ fn print_help(theme: &TerminalTheme) {
     println!("    codon-infer inpaint --sequence \"MCMPC*TTDHQMARKCDD\" --threads 4");
     println!("    codon-infer dms --fasta protein.fasta --window 128 --export-csv dms.csv --threads 4");
     println!("    codon-infer dms --fasta protein.fasta --fast --export-csv dms_fast.csv --threads 4");
-    println!("    codon-infer contacts --sequence \"MCMPCFTTDHQMARKCDDCCGGKGRGKCYGPQCLCR\" --threads 4");
+    println!("    codon-infer contacts --sequence \"MCMPCFTTDHQMARKCDDCCGGKGRGKCYGPQCLCR\" --export-pdb contacts.pdb --threads 4");
+    println!("    codon-infer fold --sequence \"MCMPCFTTDHQMARKCDDCCGGKGRGKCYGPQCLCR\" --export-pdb structure.pdb --threads 4");
     println!("    codon-infer quantize --model esm2_650m_weights.bin --output esm2_650m_q4_0.bin");
     println!("    codon-infer quantize q4_0 --model esm2_8m_weights.bin --output esm2_8m_q4_0.bin");
     println!("    codon-infer quantize --model esm2_8m_weights.bin --output esm2_8m_q8_0.bin");
@@ -490,6 +495,7 @@ fn main() -> io::Result<()> {
             let mut top_l_factor: f32 = 1.0;
             let mut export_csv: Option<String> = None;
             let mut export_json: Option<String> = None;
+            let mut export_pdb: Option<String> = None;
             let mut num_threads = global_threads.unwrap_or(default_threads);
             let mut quant_mode = global_quantize;
 
@@ -532,6 +538,9 @@ fn main() -> io::Result<()> {
                 } else if args[i] == "--export-json" && i + 1 < args.len() {
                     export_json = Some(args[i + 1].clone());
                     i += 2;
+                } else if args[i] == "--export-pdb" && i + 1 < args.len() {
+                    export_pdb = Some(args[i + 1].clone());
+                    i += 2;
                 } else if args[i] == "--model" && i + 1 < args.len() {
                     model_path = args[i + 1].clone();
                     i += 2;
@@ -546,7 +555,7 @@ fn main() -> io::Result<()> {
             let record = load_input_record(fasta_path.as_deref(), sequence_arg.as_deref(), "target_structure")?;
             let (config, loaded_weights) = load_model_weights(&model_path, quant_mode)?;
 
-            let (top_contacts, enrichment, cys_indices) = run_pipeline_contacts_parallel(
+            let contacts_res = run_pipeline_contacts_parallel(
                 &record,
                 min_separation,
                 top_l_factor,
@@ -557,12 +566,17 @@ fn main() -> io::Result<()> {
             );
 
             if let Some(ref csv_path) = export_csv {
-                export_contacts_csv(csv_path, &record.id, &top_contacts)?;
+                export_contacts_csv(csv_path, &record.id, &contacts_res.top_contacts)?;
                 println!("  [EXPORT] Predicted contact table saved to '{}'.", csv_path);
             }
             if let Some(ref json_path) = export_json {
-                export_contacts_json(json_path, &record.id, &record.sequence, &cys_indices, enrichment, &top_contacts)?;
+                export_contacts_json(json_path, &record.id, &record.sequence, &contacts_res.cys_indices, contacts_res.cys_enrichment_ratio, &contacts_res.top_contacts)?;
                 println!("  [EXPORT] Contact analysis JSON saved to '{}'.", json_path);
+            }
+            if let Some(ref pdb_path) = export_pdb {
+                let (coords, num_restraints, _) = reconstruct_3d_ca(&contacts_res.contact_probs, record.sequence.len());
+                export_ca_pdb(pdb_path, &record.sequence, &record.id, &coords)?;
+                println!("  [EXPORT] Reconstructed 3D C_alpha coordinates saved to '{}' ({} tertiary restraints).", pdb_path, num_restraints);
             }
             Ok(())
         }
@@ -833,6 +847,85 @@ fn main() -> io::Result<()> {
                 println!("==========================================================================");
                 println!("  ESTADO: BINARIO Q8_0 GENERADO Y VALIDADO EN DISCO                      ");
                 println!("==========================================================================\n");
+            }
+            Ok(())
+        }
+
+        "fold" => {
+            let mut fasta_path: Option<String> = None;
+            let mut sequence_arg: Option<String> = None;
+            let mut export_pdb: Option<String> = None;
+            let mut export_tsv: Option<String> = None;
+            let mut export_json: Option<String> = None;
+            let mut num_threads = global_threads.unwrap_or(default_threads);
+            let mut quant_mode = global_quantize;
+
+            let mut i = sub_args_start;
+            while i < args.len() {
+                if (args[i] == "--fasta" || args[i] == "-f") && i + 1 < args.len() {
+                    fasta_path = Some(args[i + 1].clone());
+                    i += 2;
+                } else if (args[i] == "--sequence" || args[i] == "-s") && i + 1 < args.len() {
+                    sequence_arg = Some(args[i + 1].clone());
+                    i += 2;
+                } else if (args[i] == "--threads" || args[i] == "-t") && i + 1 < args.len() {
+                    if let Ok(t) = args[i + 1].parse::<usize>() { num_threads = t.max(1); }
+                    i += 2;
+                } else if args[i] == "--quantize" && i + 1 < args.len() {
+                    let q_str = args[i + 1].to_lowercase();
+                    if q_str == "q4_0" || q_str == "q4" {
+                        quant_mode = Some(QuantizationMode::Q4_0);
+                    } else if q_str == "q8_0" || q_str == "q8" {
+                        quant_mode = Some(QuantizationMode::Q8_0);
+                    } else if q_str == "fp32" {
+                        quant_mode = Some(QuantizationMode::Fp32);
+                    }
+                    i += 2;
+                } else if args[i] == "--q8" {
+                    quant_mode = Some(QuantizationMode::Q8_0);
+                    i += 1;
+                } else if args[i] == "--q4" {
+                    quant_mode = Some(QuantizationMode::Q4_0);
+                    i += 1;
+                } else if args[i] == "--export-pdb" && i + 1 < args.len() {
+                    export_pdb = Some(args[i + 1].clone());
+                    i += 2;
+                } else if args[i] == "--export-tsv" && i + 1 < args.len() {
+                    export_tsv = Some(args[i + 1].clone());
+                    i += 2;
+                } else if args[i] == "--export-json" && i + 1 < args.len() {
+                    export_json = Some(args[i + 1].clone());
+                    i += 2;
+                } else if args[i] == "--model" && i + 1 < args.len() {
+                    model_path = args[i + 1].clone();
+                    i += 2;
+                } else if args[i] == "--no-color" || args[i] == "--color" {
+                    i += if args[i] == "--color" { 2 } else { 1 };
+                } else {
+                    eprintln!("Warning: unrecognized fold option '{}'", args[i]);
+                    i += 1;
+                }
+            }
+
+            let record = load_input_record(fasta_path.as_deref(), sequence_arg.as_deref(), "target_fold")?;
+            let (config, loaded_weights) = load_model_weights(&model_path, quant_mode)?;
+
+            let result = run_pipeline_fold_parallel(
+                &record,
+                &config,
+                loaded_weights.as_ref(),
+                num_threads,
+                export_pdb.as_deref(),
+                &theme,
+            );
+
+            if let Some(ref tsv_path) = export_tsv {
+                export_fold_tsv(tsv_path, &result.protein_id, &result.sequence, &result.coords)?;
+                println!("  [EXPORT] 3D coordinates TSV saved to '{}'.", tsv_path);
+            }
+            if let Some(ref json_path) = export_json {
+                export_fold_json(json_path, &result)?;
+                println!("  [EXPORT] 3D folding analysis JSON saved to '{}'.", json_path);
             }
             Ok(())
         }

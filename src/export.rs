@@ -235,6 +235,150 @@ pub fn inpaint_to_json_string(
     out
 }
 
+/// Converts standard single-letter amino acid code to three-letter IUPAC representation.
+pub fn aa1_to_aa3(aa: char) -> &'static str {
+    match aa.to_ascii_uppercase() {
+        'A' => "ALA",
+        'C' => "CYS",
+        'D' => "ASP",
+        'E' => "GLU",
+        'F' => "PHE",
+        'G' => "GLY",
+        'H' => "HIS",
+        'I' => "ILE",
+        'K' => "LYS",
+        'L' => "LEU",
+        'M' => "MET",
+        'N' => "ASN",
+        'P' => "PRO",
+        'Q' => "GLN",
+        'R' => "ARG",
+        'S' => "SER",
+        'T' => "THR",
+        'V' => "VAL",
+        'W' => "TRP",
+        'Y' => "TYR",
+        _ => "UNK",
+    }
+}
+
+/// Generates a standard Protein Data Bank (.pdb) string containing C_alpha backbone atoms.
+pub fn coords_to_pdb_string(
+    sequence: &str,
+    protein_id: &str,
+    coords: &[[f64; 3]],
+) -> String {
+    let mut out = String::with_capacity(coords.len() * 82 + 256);
+    out.push_str(&format!("HEADER    CODON-INFER STRUCT-2 3D RECONSTRUCTION {}\n", protein_id));
+    out.push_str("TITLE     C-ALPHA BACKBONE SOLVED VIA ZERO-TRUNK MDS + GRADIENT DESCENT\n");
+    for (i, (ch, pt)) in sequence.chars().zip(coords.iter()).enumerate() {
+        let res_num = (i + 1) as i32;
+        let res_name = aa1_to_aa3(ch);
+        out.push_str(&format!(
+            "ATOM  {:5}  CA  {:3} A{:4}    {:8.3}{:8.3}{:8.3}  1.00 50.00           C\n",
+            res_num,
+            res_name,
+            res_num,
+            pt[0],
+            pt[1],
+            pt[2]
+        ));
+    }
+    out.push_str("END\n");
+    out
+}
+
+/// Exports reconstructed 3D C_alpha coordinates to standard Protein Data Bank (.pdb) format.
+pub fn export_ca_pdb(
+    path: &str,
+    sequence: &str,
+    protein_id: &str,
+    coords: &[[f64; 3]],
+) -> io::Result<String> {
+    let pdb_content = coords_to_pdb_string(sequence, protein_id, coords);
+    let mut file = File::create(path)?;
+    file.write_all(pdb_content.as_bytes())?;
+    file.flush()?;
+    Ok(pdb_content)
+}
+
+/// Exports 3D coordinates to a tab-separated values (.tsv) file.
+pub fn export_fold_tsv(
+    path: &str,
+    _protein_id: &str,
+    sequence: &str,
+    coords: &[[f64; 3]],
+) -> io::Result<()> {
+    let mut file = File::create(path)?;
+    writeln!(file, "residue_index\tamino_acid\tresname_3\tx\ty\tz")?;
+    for (i, (ch, pt)) in sequence.chars().zip(coords.iter()).enumerate() {
+        writeln!(
+            file,
+            "{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}",
+            i + 1,
+            ch,
+            aa1_to_aa3(ch),
+            pt[0],
+            pt[1],
+            pt[2]
+        )?;
+    }
+    file.flush()?;
+    Ok(())
+}
+
+/// Serializes 3D folding result into structured JSON string.
+pub fn fold_to_json_string(
+    result: &crate::pipeline::FoldPipelineResult,
+    pdb_content: &str,
+) -> String {
+    let mut out = String::with_capacity(result.coords.len() * 120 + pdb_content.len() + 512);
+    out.push_str("{\n");
+    out.push_str(&format!("  \"protein_id\": \"{}\",\n", result.protein_id));
+    out.push_str(&format!("  \"sequence_length\": {},\n", result.sequence.len()));
+    out.push_str(&format!("  \"sequence\": \"{}\",\n", result.sequence));
+    out.push_str(&format!("  \"num_restraints\": {},\n", result.num_restraints));
+    out.push_str(&format!("  \"p_max\": {:.4},\n", result.p_max));
+    out.push_str(&format!("  \"forward_ms\": {:.2},\n", result.forward_ms));
+    out.push_str(&format!("  \"solve_ms\": {:.2},\n", result.solve_ms));
+    out.push_str(&format!("  \"total_ms\": {:.2},\n", result.forward_ms + result.solve_ms));
+
+    // Coordinates array
+    out.push_str("  \"coordinates\": [\n");
+    for (i, (ch, pt)) in result.sequence.chars().zip(result.coords.iter()).enumerate() {
+        let comma = if i + 1 < result.coords.len() { "," } else { "" };
+        out.push_str(&format!(
+            "    {{\"index\": {}, \"res\": \"{}\", \"x\": {:.3}, \"y\": {:.3}, \"z\": {:.3}}}{}\n",
+            i + 1,
+            ch,
+            pt[0],
+            pt[1],
+            pt[2],
+            comma
+        ));
+    }
+    out.push_str("  ],\n");
+
+    out.push_str("  \"pdb\": \"");
+    out.push_str(&crate::mcp::escape_json_str(pdb_content));
+    out.push_str("\"\n");
+    out.push_str("}\n");
+    out
+}
+
+/// Exports 3D folding result to structured JSON file.
+pub fn export_fold_json(
+    path: &str,
+    result: &crate::pipeline::FoldPipelineResult,
+) -> io::Result<()> {
+    let pdb_content = coords_to_pdb_string(&result.sequence, &result.protein_id, &result.coords);
+    let json = fold_to_json_string(result, &pdb_content);
+    let mut file = File::create(path)?;
+    file.write_all(json.as_bytes())?;
+    file.flush()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,5 +437,27 @@ mod tests {
         assert!(inpaint_json.contains("\"reconstructed_sequence\": \"C\""));
         assert!(inpaint_json.contains("\"predictions\": ["));
         assert!(inpaint_json.contains("85.50"));
+    }
+
+    #[test]
+    fn test_pdb_and_tsv_export() {
+        let seq = "MCA";
+        let coords = vec![[0.0, 0.0, 0.0], [3.8, 0.0, 0.0], [7.6, 0.0, 0.0]];
+        let pdb = coords_to_pdb_string(seq, "test_pdb", &coords);
+        assert!(pdb.contains("HEADER    CODON-INFER STRUCT-2 3D RECONSTRUCTION test_pdb"));
+        assert!(pdb.contains("ATOM      1  CA  MET A   1       0.000   0.000   0.000"));
+        assert!(pdb.contains("ATOM      2  CA  CYS A   2       3.800   0.000   0.000"));
+        assert!(pdb.contains("ATOM      3  CA  ALA A   3       7.600   0.000   0.000"));
+        assert!(pdb.ends_with("END\n"));
+
+        let test_pdb_path = "test_ca_scratch.pdb";
+        export_ca_pdb(test_pdb_path, seq, "test_pdb", &coords).expect("should export pdb");
+        assert!(std::path::Path::new(test_pdb_path).exists());
+        let _ = std::fs::remove_file(test_pdb_path);
+
+        let test_tsv_path = "test_ca_scratch.tsv";
+        export_fold_tsv(test_tsv_path, "test_pdb", seq, &coords).expect("should export tsv");
+        assert!(std::path::Path::new(test_tsv_path).exists());
+        let _ = std::fs::remove_file(test_tsv_path);
     }
 }

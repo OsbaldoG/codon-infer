@@ -32,6 +32,7 @@ pub use fasta::{FastaRecord, parse_fasta_file, parse_raw_sequence};
 pub use export::{
     DmsPositionRow, export_dms_csv, export_dms_json, export_contacts_csv, export_contacts_json,
     dms_to_json_string, contacts_to_json_string, inpaint_to_json_string,
+    aa1_to_aa3, coords_to_pdb_string, export_ca_pdb, export_fold_tsv, fold_to_json_string, export_fold_json,
 };
 pub use pipeline::{
     DmsScoringMode, run_pipeline_dms, run_pipeline_dms_parallel, run_pipeline_dms_with_mode,
@@ -40,6 +41,8 @@ pub use pipeline::{
     render_dms_heatmap, compute_pipeline_inpaint, compute_pipeline_inpaint_parallel,
     compute_pipeline_contacts, compute_pipeline_contacts_parallel,
     InpaintPipelineResult, InpaintSite, InpaintCandidate, ContactsPipelineResult,
+    FoldPipelineResult, mds_spectral_init, helical_init, reconstruct_3d_ca,
+    compute_pipeline_fold_parallel, render_fold_summary, run_pipeline_fold_parallel,
 };
 pub use benchmark::{
     ModelBenchmarkMetrics, MultiModelBenchmarkReport, MultiScaleSimdReport,
