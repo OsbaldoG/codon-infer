@@ -6,7 +6,7 @@
 
 [![Rust](https://img.shields.io/badge/rust-edición_2024-orange.svg)](https://www.rust-lang.org/)
 [![Version](https://img.shields.io/badge/versión-1.8.0-blue.svg)]()
-[![Tests](https://img.shields.io/badge/tests-55%20pasados%2C%200%20fallidos-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-57%20pasados%2C%200%20fallidos-brightgreen.svg)]()
 [![Dependencies](https://img.shields.io/badge/dependencias-0%20(std%20puro)-brightgreen.svg)]()
 [![License](https://img.shields.io/badge/licencia-MIT-blue.svg)](LICENSE)
 [![Model](https://img.shields.io/badge/modelo-ESM--2%20(8M%20a%203B)-blueviolet.svg)](https://github.com/facebookresearch/esm)
@@ -23,6 +23,8 @@ Al prescindir por completo de los ecosistemas de Python, PyTorch, C/CUDA y crate
 ---
 
 ## ⚡ Aspectos Destacados (Versión 1.8: Reconstrucción 3D Zero-Trunk, Motor Tiled GEMM y Suite Canónica de Contactos)
+
+> 💡 **Consolidación de Versión:** La versión 1.8.0 unifica las actualizaciones algorítmicas fundacionales de v1.7.0 (Motor Tiled GEMM Multi-Token `CI-1`, DMS Canónico `BIO-1` y Cabezal de Contacto Multicapa Oficial `STRUCT-1`) junto con el pionero pipeline de Reconstrucción Geométrica 3D Zero-Trunk (`STRUCT-2`).
 
 * **Reconstrucción Geométrica 3D Zero-Trunk (`STRUCT-2`):**
   * Resuelve plegamientos proteicos 3D *ab initio* y genera coordenadas atómicas $C_\alpha$ directamente a partir de las representaciones de atención de ESM-2 en **15–35 ms** sobre procesadores x86_64 estándar, prescindiendo por completo de los pesados troncos de plegamiento de 3 GB de ESMFold o AlphaFold.
@@ -125,7 +127,7 @@ Evaluado en Linux x86_64 (ejecución monohilo en CPU con instrucciones vectorial
 ### 1. Contraste frente a la Línea Base de Python / PyTorch
 La migración arquitectónica a Rust puro con garantías deterministas de cero asignaciones en memoria supera drásticamente al ecosistema tradicional de Python/PyTorch en todas las métricas operativas:
 
-| Métrica | Referencia PyTorch / Python (ESM-2 8M) | `codon-infer` v1.6 (Rust Puro + SIMD) | Ventaja de Ingeniería |
+| Métrica | Referencia PyTorch / Python (ESM-2 8M) | `codon-infer` v1.8 (Rust Puro + SIMD) | Ventaja de Ingeniería |
 | :--- | :--- | :--- | :--- |
 | **Dependencias** | Python, PyTorch, LibTorch, CUDA (~4–7 GB) | **`std` puro (0 crates, 0 dependencias dinámicas)** | **~99.9% más liviano** |
 | **Tamaño del Ejecutable** | Entorno multigigabyte | **~1.1 MB binario release compilado** | **Binario único ultra-portable** |
@@ -159,6 +161,10 @@ Evaluado en procesador de doble núcleo Intel Sandy Bridge (Core i5-2520M @ 2.50
 
 > [!NOTE]
 > **Saturación de Núcleos Físicos vs Hyper-Threading:** En arquitecturas donde los hilos lógicos SMT comparten el puerto de ejecución vectorial AVX de 256 bits por núcleo físico, asignar 2 hilos a los 2 núcleos reales (`-t 2`) otorga el rendimiento máximo (7.70 tok/s) y la mínima latencia de sincronización. `codon-infer` detecta automáticamente los núcleos físicos vía `detect_optimal_threads` si se omite `--threads`.
+
+> [!TIP]
+> **Aceleración con Motor Tiled GEMM Multi-Token (CI-1):**
+> En los pipelines forward de secuencias completas (`dms`, `contacts` y `fold`), el motor Tiled GEMM agrupa la evaluación de tokens en micro-kernels de $M_r = 4$ tokens bloqueados en caché (`dot_row_batch_m4_avx2_fma`), eliminando la relectura secuencial de matrices de pesos desde DRAM. Esto acelera las pasadas forward de secuencia completa hasta **3.76× en FP32** y **2.41×–3.44× en regímenes cuantizados (Q8_0/Q4_0)**, reduciendo el forward de ESM-2 650M a solo **2.3 s – 4.4 s** manteniendo paridad numérica bit a bit exacta ($\cos = 1.00000000$).
 
 ---
 
@@ -446,27 +452,30 @@ cargo test --release
 ```
 Salida esperada:
 ```text
-running 55 tests
+running 57 tests
 test benchmark::tests::test_benchmark_report_to_json_validity ... ok
 test benchmark::tests::test_discover_available_models ... ok
+test export::tests::test_dms_row_and_csv_generation ... ok
 test export::tests::test_json_string_serializers ... ok
+test export::tests::test_pdb_and_tsv_export ... ok
 test fasta::tests::test_parse_multi_fasta_with_masks ... ok
-test fasta::tests::test_parse_simple_fasta ... ok
 test fasta::tests::test_parse_raw_sequence_fallback ... ok
+test fasta::tests::test_parse_simple_fasta ... ok
+test mcp::tests::test_mcp_dispatch_with_weights_if_available ... ok
 test mcp::tests::test_mcp_json_parser_and_formatter ... ok
 test mcp::tests::test_mcp_resolve_record_fallback ... ok
-test export::tests::test_dms_row_and_csv_generation ... ok
+test mcp::tests::test_mcp_tools_list_schema ... ok
 test tests::test_attention_simd_parity_dk_16_24_32 ... ok
 test tests::test_attention_simd_parity_dk_64 ... ok
-test mcp::tests::test_mcp_tools_list_schema ... ok
-test tests::test_esm_config_autodetection ... ok
-test benchmark::tests::test_multi_scale_simd_parity ... ok
 test tests::test_bidirectional_logits_entropy ... ok
+test tests::test_esm_config_autodetection ... ok
 test tests::test_evaluation_metrics_unit ... ok
+test tests::test_forward_650m_if_available ... ok
+test tests::test_forward_650m_q8_and_multithread_if_available ... ok
 test tests::test_forward_bidirectional_if_available ... ok
 test tests::test_forward_pass_with_weights_if_available ... ok
 test tests::test_forward_q4_cosine_similarity_8m ... ok
-test mcp::tests::test_mcp_dispatch_with_weights_if_available ... ok
+test tests::test_forward_q8_cosine_similarity_8m ... ok
 test tests::test_layer_norm_stability ... ok
 test tests::test_log_softmax_canonical ... ok
 test tests::test_mask_token_encoding_and_decoding ... ok
@@ -474,35 +483,35 @@ test tests::test_matmul_avx1_and_dispatch_parity ... ok
 test tests::test_matmul_fp32_parallel_parity ... ok
 test tests::test_matmul_q8_simd_parity ... ok
 test tests::test_q8_0_quantization_roundtrip ... ok
-test tests::test_forward_q8_cosine_similarity_8m ... ok
+test tests::test_q8_weights_save_load_roundtrip ... ok
 test tests::test_simd_benchmark_parity_run ... ok
 test tests::test_softmax_sum_to_one ... ok
 test tests::test_tokenizer_boundaries ... ok
 test tests_q4_format::test_codq_header_valid_corrupt_incoherent ... ok
-test tests::test_q8_weights_save_load_roundtrip ... ok
+test tests_q4_format::test_first_block_alignment_at_offset_64 ... ok
 test tests_q4_format::test_no_ambiguity_650m_q4_vs_150m ... ok
 test tests_q4_format::test_q4_0_exact_nibble_packing ... ok
 test tests_q4_format::test_q4_0_roundtrip_quantize_dequantize_bound ... ok
 test tests_q4_format::test_q4_0_zero_block ... ok
-test tests_q4_format::test_first_block_alignment_at_offset_64 ... ok
 test tests_q4_format::test_q4_weights_save_load_roundtrip_8m ... ok
+test tests_q4_integration::test_forward_q4_integration_8m ... ok
 test tests_q4_integration::test_forward_q4_integration_35m ... ok
 test tests_q4_integration::test_forward_q4_integration_150m ... ok
-test tests_q4_integration::test_forward_q4_integration_8m ... ok
+test tests_q4_integration::test_forward_q4_integration_650m ... ok
 test tests_q4_integration::test_forward_q8_codq_header_integration ... ok
+test tests_q4_integration::test_generate_validation_report ... ignored
 test tests_q4_simd::test_q4_edge_case_extreme_values ... ok
 test tests_q4_simd::test_q4_edge_case_small_out_dim ... ok
 test tests_q4_simd::test_q4_edge_case_zero_blocks ... ok
 test tests_q4_simd::test_q4_parallel_vs_sequential_identity_threads ... ok
 test tests_q4_simd::test_q4_simd_parity_esm_dimensions ... ok
-test tests_q4_integration::test_forward_q4_integration_650m ... ok
-test tests_regression::test_strict_fp32_loader_rejects_corrupted_size ... ok
 test tests_regression::test_regression_esm2_fp32_all_scales_against_ref_npz ... ok
 test tests_regression::test_regression_quantized_q8_q4_against_ref_npz_including_3b ... ok
-test tests::test_forward_650m_if_available ... ok
-test tests::test_forward_650m_q8_and_multithread_if_available ... ok
+test tests_regression::test_strict_fp32_loader_rejects_corrupted_size ... ok
+test tests_regression::test_tiled_gemm_and_contact_head_v1_7_0 ... ok
+test benchmark::tests::test_multi_scale_simd_parity ... ok
 
-test result: ok. 54 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out
+test result: ok. 56 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out
 ```
 
 ### 4. Subcomandos y Pipelines Bioinformáticos
@@ -537,6 +546,9 @@ Ejecuta saturación mutagénica punto a punto con mapas de calor térmicos TrueC
 # Cribado masivo de alto rendimiento con ESM-2 8M:
 codon-infer dms --fasta proteins.fasta --window 128 --export-csv dms_matrix.csv --export-json dms_report.json
 
+# Modo ultra-rápido en 1 pasada Wildtype Marginal (>16,170 mutaciones/seg, aceleración de 42×):
+codon-infer dms --fasta proteins.fasta --fast --export-csv dms_fast.csv
+
 # Escaneo de alta precisión con ESM-2 150M o 650M:
 codon-infer dms --model esm2_150m_weights.bin --fasta target.fasta --window 128 --export-csv dms_150m.csv
 codon-infer dms --model esm2_650m_q8_0.bin --threads 2 --fasta target.fasta --window 128 --export-csv dms_650m.csv
@@ -548,6 +560,9 @@ Calcula acoplamientos epistáticos mediante mapas de atención multi-cabeza (con
 # Predicción de contactos 3D con ESM-2 150M o 650M para precisión de publicación:
 codon-infer contacts --model esm2_150m_weights.bin --fasta proteins.fasta --export-csv contacts.csv --export-json contacts.json
 codon-infer contacts --model esm2_650m_q8_0.bin --threads 2 --fasta proteins.fasta --export-csv contacts.csv
+
+# Predicción de contactos y exportación simultánea del esqueleto 3D C_alpha ab initio (.pdb):
+codon-infer contacts --model esm2_650m_q8_0.bin --threads 4 --sequence "MCMPCFTTDHQMARKCDD" --export-pdb contacts_backbone.pdb
 ```
 
 #### E. Cuantización Nativa de Modelos a Q4_0 y Q8_0 (`quantize`)
@@ -589,6 +604,19 @@ Suites disponibles:
 * `inpainting`: Reconstrucción posicional múltiple en secuencias enmascaradas bidireccionales.
 * `stress`: Prueba de estabilidad continua bajo sobrecarga de caché con cuantización dinámica de rebanadas Q8.
 * `scaling`: Benchmark de escalamiento de longitud de contexto (L = 32 → 256) adaptativo a la profundidad de capas del modelo.
+
+#### G. Reconstrucción y Plegamiento Proteico 3D Zero-Trunk (`fold`)
+Reconstruye coordenadas 3D $C_\alpha$ *ab initio* en formato estándar `.pdb` o `.tsv` en **15–35 ms** mediante MDS Métrico y optimización biofísica por gradiente:
+```bash
+# Reconstrucción 3D rápida del esqueleto desde secuencia con ESM-2 8M:
+codon-infer fold --sequence "MCMPCFTTDHQMARKCDD" --export-pdb structure_8m.pdb
+
+# Plegamiento de alta precisión con ESM-2 650M Q4_0 y motor multihilo Tiled GEMM:
+codon-infer fold --model esm2_650m_q4_0.bin --threads 4 --sequence "NLYIQWLKDGGPSSGRPPPS" --export-pdb trpcage.pdb --export-tsv trpcage.tsv
+
+# Plegar secuencia de proteína diana desde archivo multi-FASTA:
+codon-infer fold --model esm2_650m_q4_0.bin --threads 4 --fasta target.fasta --export-pdb target_folded.pdb
+```
 
 ### 5. Servidor Model Context Protocol (MCP)
 `codon-infer-mcp` expone la totalidad de las capacidades bioinformáticas como herramientas nativas para agentes LLM (Claude Desktop, Cursor, Gemini, etc.) sobre stdio mediante JSON-RPC:
@@ -669,12 +697,12 @@ codon-infer/
 │   ├── export.rs           # Serializadores de datos CSV, TSV, JSON y PDB para análisis de publicación
 │   ├── pipeline.rs         # Controladores de DMS, contactos, inpainting y plegamiento 3D STRUCT-2
 │   ├── contact_heads.rs    # Pesos y sesgos de regresión logística del cabezal oficial de Meta AI
-│   ├── benchmark.rs        # Automated bioinformatic & hardware stress suite
+│   ├── benchmark.rs        # Suite automatizada de estrés de microarquitectura y validación biológica
 │   ├── mcp.rs              # Servidor JSON-RPC MCP sobre stdio sin dependencias externas
 │   └── mcp_main.rs         # Punto de entrada ejecutable del servidor MCP autónomo
 ├── LICENSE                 # Licencia MIT
-├── README.md               # Main project documentation (English)
-└── README_ES.md            # Documentación completa del proyecto (Spanish)
+├── README.md               # Documentación técnica principal del proyecto (inglés)
+└── README_ES.md            # Documentación técnica completa del proyecto (español)
 ```
 
 ---
