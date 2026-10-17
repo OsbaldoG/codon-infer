@@ -4,15 +4,15 @@ use codon_infer::{
     active_simd_backend, export_contacts_csv, export_contacts_json,
     export_dms_csv, export_dms_json, generate_sequence_parallel,
     generate_sequence_q8, generate_sequence_q4, parse_fasta_file, parse_raw_sequence, render_dms_heatmap,
-    run_pipeline_contacts_parallel, run_pipeline_dms_parallel,
+    run_pipeline_contacts_parallel, run_pipeline_dms_with_mode,
     run_pipeline_inpaint_parallel, detect_optimal_threads, EsmConfig, EsmWeights, EsmWeightsQ8,
     EsmWeightsQ4, FastaRecord, ModelWeightsRef, RunState, TerminalTheme,
-    CodqHeader, CODQ_MAGIC, DTYPE_Q4_0, DTYPE_Q8_0, DTYPE_FP32, QuantizationMode,
+    CodqHeader, CODQ_MAGIC, DTYPE_Q4_0, DTYPE_Q8_0, DTYPE_FP32, QuantizationMode, DmsScoringMode,
 };
 
 fn print_version() {
     println!("codon-infer v{}", env!("CARGO_PKG_VERSION"));
-    println!("Engine: Pure Rust Zero-Dependencies (std)");
+    println!("Engine: Pure Rust Zero-Dependencies (std) + Cache-Blocked Tiled GEMM");
     println!("Vector Dispatch: {}", active_simd_backend());
     println!("Concurrency: Persistent Worker Pool with Atomic Barrier (zero OS thread spawning)");
     println!("Quantization: Multi-Format Block Engine (Q4_0 nibbles & Q8_0 blocks with CODQ header)");
@@ -23,12 +23,12 @@ fn print_help(theme: &TerminalTheme) {
     let logo = if theme.enabled {
         "\x1b[38;2;139;92;246m╔═══════════════════════════════════════════════════════════════════════════════╗\n\
          ║   \x1b[38;2;59;130;246mCODON-INFER\x1b[38;2;139;92;246m: High-Performance Zero-Allocation ESM-2 Engine in Pure Rust     ║\n\
-         ║   \x1b[38;2;16;185;129mVersion 1.6.0\x1b[38;2;139;92;246m     | Q4_0 / Q8_0 Multi-Scale Inference & Quantization Suite ║\n\
+         ║   \x1b[38;2;16;185;129mVersion 1.7.0\x1b[38;2;139;92;246m     | Tiled GEMM, Canonical DMS & Multi-Layer Contact Suite  ║\n\
          ╚═══════════════════════════════════════════════════════════════════════════════╝\x1b[0m"
     } else {
         "╔═══════════════════════════════════════════════════════════════════════════════╗\n\
          ║   CODON-INFER: High-Performance Zero-Allocation ESM-2 Engine in Pure Rust     ║\n\
-         ║   Version 1.6.0     | Q4_0 / Q8_0 Multi-Scale Inference & Quantization Suite ║\n\
+         ║   Version 1.7.0     | Tiled GEMM, Canonical DMS & Multi-Layer Contact Suite  ║\n\
          ╚═══════════════════════════════════════════════════════════════════════════════╝"
     };
     println!("{}", logo);
@@ -37,14 +37,14 @@ fn print_help(theme: &TerminalTheme) {
     println!("\nSUBCOMMANDS:");
     println!("    generate     Autoregressive de novo sequence generation (causal mode)");
     println!("    inpaint      Masked sequence infilling & functional active-site reconstruction");
-    println!("    dms          In silico Deep Mutational Scanning with TrueColor thermal heatmap");
-    println!("    contacts     Zero-shot 3D contact map prediction and disulfide bridge analysis");
+    println!("    dms          In silico Deep Mutational Scanning (Masked Marginal & 1-Pass Fast mode)");
+    println!("    contacts     Zero-shot 3D contact map prediction (Official Multi-Layer APC + LR Head)");
     println!("    quantize     Export quantized weights binary in Q4_0 or Q8_0 block format");
     println!("    benchmark    Hardware validation suite (SIMD parity, cache thrashing, scaling)");
     println!("\nGLOBAL OPTIONS:");
     println!("    -h, --help               Print help information");
     println!("    -V, --version            Print engine version and active vector acceleration");
-    println!("    -t, --threads <N>        Number of CPU threads (default: available logical cores)");
+    println!("    -t, --threads <N>        Number of CPU threads (default: available physical cores)");
     println!("    --quantize <q4_0|q8_0|fp32> Quantization mode for execution (default: auto/fp32)");
     println!("    --q4                     Shortcut flag for '--quantize q4_0'");
     println!("    --q8                     Shortcut flag for '--quantize q8_0'");
@@ -57,6 +57,7 @@ fn print_help(theme: &TerminalTheme) {
     println!("    codon-infer generate --sequence \"M\" --model esm2_650m_q4_0.bin --threads 4");
     println!("    codon-infer inpaint --sequence \"MCMPC*TTDHQMARKCDD\" --threads 4");
     println!("    codon-infer dms --fasta protein.fasta --window 128 --export-csv dms.csv --threads 4");
+    println!("    codon-infer dms --fasta protein.fasta --fast --export-csv dms_fast.csv --threads 4");
     println!("    codon-infer contacts --sequence \"MCMPCFTTDHQMARKCDDCCGGKGRGKCYGPQCLCR\" --threads 4");
     println!("    codon-infer quantize --model esm2_650m_weights.bin --output esm2_650m_q4_0.bin");
     println!("    codon-infer quantize q4_0 --model esm2_8m_weights.bin --output esm2_8m_q4_0.bin");
@@ -342,6 +343,7 @@ fn main() -> io::Result<()> {
             let mut export_json: Option<String> = None;
             let mut num_threads = global_threads.unwrap_or(default_threads);
             let mut quant_mode = global_quantize;
+            let mut dms_mode = DmsScoringMode::MaskedMarginal;
 
             let mut i = sub_args_start;
             while i < args.len() {
@@ -370,6 +372,17 @@ fn main() -> io::Result<()> {
                 } else if args[i] == "--q4" {
                     quant_mode = Some(QuantizationMode::Q4_0);
                     i += 1;
+                } else if args[i] == "--fast" || args[i] == "--wt-marginal" {
+                    dms_mode = DmsScoringMode::WildtypeMarginal;
+                    i += 1;
+                } else if args[i] == "--mode" && i + 1 < args.len() {
+                    let m_str = args[i + 1].to_lowercase();
+                    if m_str == "wt" || m_str == "fast" || m_str == "wildtype" || m_str == "wt-marginal" {
+                        dms_mode = DmsScoringMode::WildtypeMarginal;
+                    } else {
+                        dms_mode = DmsScoringMode::MaskedMarginal;
+                    }
+                    i += 2;
                 } else if args[i] == "--window" && i + 1 < args.len() {
                     if let Ok(w) = args[i + 1].parse::<usize>() { window_size = w; }
                     i += 2;
@@ -396,7 +409,7 @@ fn main() -> io::Result<()> {
             let record = load_input_record(fasta_path.as_deref(), sequence_arg.as_deref(), "target_protein")?;
             let (config, loaded_weights) = load_model_weights(&model_path, quant_mode)?;
 
-            let result = run_pipeline_dms_parallel(
+            let result = run_pipeline_dms_with_mode(
                 &record,
                 window_size,
                 stride,
@@ -404,6 +417,7 @@ fn main() -> io::Result<()> {
                 loaded_weights.as_ref(),
                 num_threads,
                 &theme,
+                dms_mode,
             );
             render_dms_heatmap(&result, 25, &theme);
 

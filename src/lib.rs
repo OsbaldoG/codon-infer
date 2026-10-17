@@ -25,6 +25,7 @@ pub mod ui;
 pub mod fasta;
 pub mod export;
 pub mod pipeline;
+pub mod contact_heads;
 
 pub use ui::TerminalTheme;
 pub use fasta::{FastaRecord, parse_fasta_file, parse_raw_sequence};
@@ -33,7 +34,7 @@ pub use export::{
     dms_to_json_string, contacts_to_json_string, inpaint_to_json_string,
 };
 pub use pipeline::{
-    run_pipeline_dms, run_pipeline_dms_parallel,
+    DmsScoringMode, run_pipeline_dms, run_pipeline_dms_parallel, run_pipeline_dms_with_mode,
     run_pipeline_inpaint, run_pipeline_inpaint_parallel,
     run_pipeline_contacts, run_pipeline_contacts_parallel,
     render_dms_heatmap, compute_pipeline_inpaint, compute_pipeline_inpaint_parallel,
@@ -131,6 +132,33 @@ impl EsmConfig {
     #[inline]
     pub fn head_dim(&self) -> usize {
         self.dim / self.n_heads
+    }
+
+    /// Returns the official Meta AI `esm.contact_head.regression` `(weight, bias)` for this architecture.
+    #[inline]
+    pub fn contact_head_weights(&self) -> (&'static [f32], f32) {
+        match self.arch {
+            EsmModelArch::Esm2_8M => (
+                &contact_heads::CONTACT_HEAD_8M_WEIGHT,
+                contact_heads::CONTACT_HEAD_8M_BIAS,
+            ),
+            EsmModelArch::Esm2_35M => (
+                &contact_heads::CONTACT_HEAD_35M_WEIGHT,
+                contact_heads::CONTACT_HEAD_35M_BIAS,
+            ),
+            EsmModelArch::Esm2_150M => (
+                &contact_heads::CONTACT_HEAD_150M_WEIGHT,
+                contact_heads::CONTACT_HEAD_150M_BIAS,
+            ),
+            EsmModelArch::Esm2_650M => (
+                &contact_heads::CONTACT_HEAD_650M_WEIGHT,
+                contact_heads::CONTACT_HEAD_650M_BIAS,
+            ),
+            EsmModelArch::Esm2_3B => (
+                &contact_heads::CONTACT_HEAD_3B_WEIGHT,
+                contact_heads::CONTACT_HEAD_3B_BIAS,
+            ),
+        }
     }
 
     pub fn model_name(&self) -> &'static str {
@@ -1852,6 +1880,9 @@ pub struct BidirectionalRunState {
     pub rope_cos: Vec<f32>,
     pub rope_sin: Vec<f32>,
     pub final_layer_att: Vec<f32>,
+    pub compute_contacts: bool,
+    pub head_att_buf: Vec<f32>,
+    pub contact_probs: Vec<f32>,
 }
 
 impl BidirectionalRunState {
@@ -1876,14 +1907,17 @@ impl BidirectionalRunState {
             v: vec![0.0; max_len * config.dim],
             att: vec![0.0; config.n_heads * max_len],
             out_att: vec![0.0; max_len * config.dim],
-            xb: vec![0.0; config.dim],
+            xb: vec![0.0; max_len * config.dim],
             xb2: vec![0.0; config.dim],
-            hb: vec![0.0; config.hidden_dim],
-            hb2: vec![0.0; config.hidden_dim],
+            hb: vec![0.0; max_len * config.hidden_dim],
+            hb2: vec![0.0; max_len * config.hidden_dim],
             logits: vec![0.0; max_len * config.vocab_size],
             rope_cos,
             rope_sin,
             final_layer_att: vec![0.0; max_len * max_len],
+            compute_contacts: true,
+            head_att_buf: vec![0.0; max_len * max_len],
+            contact_probs: vec![0.0; max_len * max_len],
         }
     }
 }
@@ -3595,6 +3629,563 @@ pub fn log_softmax_canonical(logits: &[f32]) -> [f32; 33] {
     out
 }
 
+/// Core 4-Token x 16-Float Register-Blocked AVX2+FMA Micro-Kernel.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn dot_row_batch_m4_avx2_fma(
+    out_batch: *mut f32,
+    out_stride: usize,
+    out_col: usize,
+    x_batch: *const f32,
+    w_row: *const f32,
+    bias_val: f32,
+    in_dim: usize,
+    seq_len: usize,
+) {
+    use std::arch::x86_64::*;
+    let chunks16 = in_dim / 16;
+    let rem_start = chunks16 * 16;
+
+    let mut p = 0;
+    while p + 4 <= seq_len {
+        let x0 = x_batch.add(p * in_dim);
+        let x1 = x_batch.add((p + 1) * in_dim);
+        let x2 = x_batch.add((p + 2) * in_dim);
+        let x3 = x_batch.add((p + 3) * in_dim);
+
+        let mut acc0_a = _mm256_setzero_ps();
+        let mut acc0_b = _mm256_setzero_ps();
+        let mut acc1_a = _mm256_setzero_ps();
+        let mut acc1_b = _mm256_setzero_ps();
+        let mut acc2_a = _mm256_setzero_ps();
+        let mut acc2_b = _mm256_setzero_ps();
+        let mut acc3_a = _mm256_setzero_ps();
+        let mut acc3_b = _mm256_setzero_ps();
+
+        for c in 0..chunks16 {
+            let k = c * 16;
+            let vw0 = _mm256_loadu_ps(w_row.add(k));
+            let vw1 = _mm256_loadu_ps(w_row.add(k + 8));
+
+            acc0_a = _mm256_fmadd_ps(vw0, _mm256_loadu_ps(x0.add(k)), acc0_a);
+            acc0_b = _mm256_fmadd_ps(vw1, _mm256_loadu_ps(x0.add(k + 8)), acc0_b);
+
+            acc1_a = _mm256_fmadd_ps(vw0, _mm256_loadu_ps(x1.add(k)), acc1_a);
+            acc1_b = _mm256_fmadd_ps(vw1, _mm256_loadu_ps(x1.add(k + 8)), acc1_b);
+
+            acc2_a = _mm256_fmadd_ps(vw0, _mm256_loadu_ps(x2.add(k)), acc2_a);
+            acc2_b = _mm256_fmadd_ps(vw1, _mm256_loadu_ps(x2.add(k + 8)), acc2_b);
+
+            acc3_a = _mm256_fmadd_ps(vw0, _mm256_loadu_ps(x3.add(k)), acc3_a);
+            acc3_b = _mm256_fmadd_ps(vw1, _mm256_loadu_ps(x3.add(k + 8)), acc3_b);
+        }
+
+        let mut v0 = hsum256_ps_avx(_mm256_add_ps(acc0_a, acc0_b));
+        let mut v1 = hsum256_ps_avx(_mm256_add_ps(acc1_a, acc1_b));
+        let mut v2 = hsum256_ps_avx(_mm256_add_ps(acc2_a, acc2_b));
+        let mut v3 = hsum256_ps_avx(_mm256_add_ps(acc3_a, acc3_b));
+
+        for k in rem_start..in_dim {
+            let wk = *w_row.add(k);
+            v0 += wk * *x0.add(k);
+            v1 += wk * *x1.add(k);
+            v2 += wk * *x2.add(k);
+            v3 += wk * *x3.add(k);
+        }
+
+        *out_batch.add(p * out_stride + out_col) = v0 + bias_val;
+        *out_batch.add((p + 1) * out_stride + out_col) = v1 + bias_val;
+        *out_batch.add((p + 2) * out_stride + out_col) = v2 + bias_val;
+        *out_batch.add((p + 3) * out_stride + out_col) = v3 + bias_val;
+
+        p += 4;
+    }
+
+    while p < seq_len {
+        let xp = x_batch.add(p * in_dim);
+        let mut acc_a = _mm256_setzero_ps();
+        let mut acc_b = _mm256_setzero_ps();
+        for c in 0..chunks16 {
+            let k = c * 16;
+            acc_a = _mm256_fmadd_ps(_mm256_loadu_ps(w_row.add(k)), _mm256_loadu_ps(xp.add(k)), acc_a);
+            acc_b = _mm256_fmadd_ps(_mm256_loadu_ps(w_row.add(k + 8)), _mm256_loadu_ps(xp.add(k + 8)), acc_b);
+        }
+        let mut v = hsum256_ps_avx(_mm256_add_ps(acc_a, acc_b));
+        for k in rem_start..in_dim {
+            v += *w_row.add(k) * *xp.add(k);
+        }
+        *out_batch.add(p * out_stride + out_col) = v + bias_val;
+        p += 1;
+    }
+}
+
+/// Core 4-Token x 16-Float Register-Blocked AVX1 Micro-Kernel (12 of 16 YMM registers -> 0 stack spills).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+pub unsafe fn dot_row_batch_m4_avx1(
+    out_batch: *mut f32,
+    out_stride: usize,
+    out_col: usize,
+    x_batch: *const f32,
+    w_row: *const f32,
+    bias_val: f32,
+    in_dim: usize,
+    seq_len: usize,
+) {
+    use std::arch::x86_64::*;
+    let chunks16 = in_dim / 16;
+    let rem_start = chunks16 * 16;
+
+    let mut p = 0;
+    while p + 4 <= seq_len {
+        let x0 = x_batch.add(p * in_dim);
+        let x1 = x_batch.add((p + 1) * in_dim);
+        let x2 = x_batch.add((p + 2) * in_dim);
+        let x3 = x_batch.add((p + 3) * in_dim);
+
+        let mut acc0_a = _mm256_setzero_ps();
+        let mut acc0_b = _mm256_setzero_ps();
+        let mut acc1_a = _mm256_setzero_ps();
+        let mut acc1_b = _mm256_setzero_ps();
+        let mut acc2_a = _mm256_setzero_ps();
+        let mut acc2_b = _mm256_setzero_ps();
+        let mut acc3_a = _mm256_setzero_ps();
+        let mut acc3_b = _mm256_setzero_ps();
+
+        for c in 0..chunks16 {
+            let k = c * 16;
+            let vw0 = _mm256_loadu_ps(w_row.add(k));
+            let vw1 = _mm256_loadu_ps(w_row.add(k + 8));
+
+            acc0_a = _mm256_add_ps(acc0_a, _mm256_mul_ps(vw0, _mm256_loadu_ps(x0.add(k))));
+            acc0_b = _mm256_add_ps(acc0_b, _mm256_mul_ps(vw1, _mm256_loadu_ps(x0.add(k + 8))));
+
+            acc1_a = _mm256_add_ps(acc1_a, _mm256_mul_ps(vw0, _mm256_loadu_ps(x1.add(k))));
+            acc1_b = _mm256_add_ps(acc1_b, _mm256_mul_ps(vw1, _mm256_loadu_ps(x1.add(k + 8))));
+
+            acc2_a = _mm256_add_ps(acc2_a, _mm256_mul_ps(vw0, _mm256_loadu_ps(x2.add(k))));
+            acc2_b = _mm256_add_ps(acc2_b, _mm256_mul_ps(vw1, _mm256_loadu_ps(x2.add(k + 8))));
+
+            acc3_a = _mm256_add_ps(acc3_a, _mm256_mul_ps(vw0, _mm256_loadu_ps(x3.add(k))));
+            acc3_b = _mm256_add_ps(acc3_b, _mm256_mul_ps(vw1, _mm256_loadu_ps(x3.add(k + 8))));
+        }
+
+        let mut v0 = hsum256_ps_avx(_mm256_add_ps(acc0_a, acc0_b));
+        let mut v1 = hsum256_ps_avx(_mm256_add_ps(acc1_a, acc1_b));
+        let mut v2 = hsum256_ps_avx(_mm256_add_ps(acc2_a, acc2_b));
+        let mut v3 = hsum256_ps_avx(_mm256_add_ps(acc3_a, acc3_b));
+
+        for k in rem_start..in_dim {
+            let wk = *w_row.add(k);
+            v0 += wk * *x0.add(k);
+            v1 += wk * *x1.add(k);
+            v2 += wk * *x2.add(k);
+            v3 += wk * *x3.add(k);
+        }
+
+        *out_batch.add(p * out_stride + out_col) = v0 + bias_val;
+        *out_batch.add((p + 1) * out_stride + out_col) = v1 + bias_val;
+        *out_batch.add((p + 2) * out_stride + out_col) = v2 + bias_val;
+        *out_batch.add((p + 3) * out_stride + out_col) = v3 + bias_val;
+
+        p += 4;
+    }
+
+    while p < seq_len {
+        let xp = x_batch.add(p * in_dim);
+        let mut acc_a = _mm256_setzero_ps();
+        let mut acc_b = _mm256_setzero_ps();
+        for c in 0..chunks16 {
+            let k = c * 16;
+            acc_a = _mm256_add_ps(acc_a, _mm256_mul_ps(_mm256_loadu_ps(w_row.add(k)), _mm256_loadu_ps(xp.add(k))));
+            acc_b = _mm256_add_ps(acc_b, _mm256_mul_ps(_mm256_loadu_ps(w_row.add(k + 8)), _mm256_loadu_ps(xp.add(k + 8))));
+        }
+        let mut v = hsum256_ps_avx(_mm256_add_ps(acc_a, acc_b));
+        for k in rem_start..in_dim {
+            v += *w_row.add(k) * *xp.add(k);
+        }
+        *out_batch.add(p * out_stride + out_col) = v + bias_val;
+        p += 1;
+    }
+}
+
+#[inline]
+pub unsafe fn dot_row_batch_m4_scalar(
+    out_batch: *mut f32,
+    out_stride: usize,
+    out_col: usize,
+    x_batch: *const f32,
+    w_row: *const f32,
+    bias_val: f32,
+    in_dim: usize,
+    seq_len: usize,
+) {
+    for p in 0..seq_len {
+        let xp = x_batch.add(p * in_dim);
+        let mut sum = 0.0f32;
+        for k in 0..in_dim {
+            sum += *w_row.add(k) * *xp.add(k);
+        }
+        *out_batch.add(p * out_stride + out_col) = sum + bias_val;
+    }
+}
+
+#[inline]
+pub unsafe fn dot_row_batch_m4(
+    out_batch: *mut f32,
+    out_stride: usize,
+    out_col: usize,
+    x_batch: *const f32,
+    w_row: *const f32,
+    bias_val: f32,
+    in_dim: usize,
+    seq_len: usize,
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            dot_row_batch_m4_avx2_fma(out_batch, out_stride, out_col, x_batch, w_row, bias_val, in_dim, seq_len);
+            return;
+        }
+        if std::is_x86_feature_detected!("avx") {
+            dot_row_batch_m4_avx1(out_batch, out_stride, out_col, x_batch, w_row, bias_val, in_dim, seq_len);
+            return;
+        }
+    }
+    dot_row_batch_m4_scalar(out_batch, out_stride, out_col, x_batch, w_row, bias_val, in_dim, seq_len);
+}
+
+/// Unpacks 1 row of `BlockQ8_0` (`in_dim / 32` blocks) ONCE into an L1d-resident FP32 buffer `w_buf[0..in_dim]`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+pub unsafe fn unpack_q8_row_avx1(row_blocks: &[BlockQ8_0], w_buf: *mut f32) {
+    use std::arch::x86_64::*;
+    for (b_idx, block) in row_blocks.iter().enumerate() {
+        let vd = _mm256_set1_ps(block.d);
+        let qs_ptr = block.qs.as_ptr();
+        let dst_ptr = w_buf.add(b_idx * 32);
+
+        for c in 0..4 {
+            let offset = c * 8;
+            let raw_8 = _mm_loadl_epi64(qs_ptr.add(offset) as *const __m128i);
+            let epi32_lo = _mm_cvtepi8_epi32(raw_8);
+            let epi32_hi = _mm_cvtepi8_epi32(_mm_srli_si128(raw_8, 4));
+            let ps_lo = _mm_cvtepi32_ps(epi32_lo);
+            let ps_hi = _mm_cvtepi32_ps(epi32_hi);
+            let vq = _mm256_set_m128(ps_hi, ps_lo);
+            _mm256_storeu_ps(dst_ptr.add(offset), _mm256_mul_ps(vq, vd));
+        }
+    }
+}
+
+#[inline]
+pub unsafe fn unpack_q8_row(row_blocks: &[BlockQ8_0], w_buf: *mut f32) {
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx") {
+        unpack_q8_row_avx1(row_blocks, w_buf);
+        return;
+    }
+    for (b_idx, block) in row_blocks.iter().enumerate() {
+        let dst_slice = std::slice::from_raw_parts_mut(w_buf.add(b_idx * 32), 32);
+        block.dequantize_to(dst_slice);
+    }
+}
+
+/// Unpacks 1 row of `BlockQ4_0` (`in_dim / 32` blocks) ONCE into an L1d-resident FP32 buffer `w_buf[0..in_dim]`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+pub unsafe fn unpack_q4_row_avx1(row_blocks: &[BlockQ4_0], w_buf: *mut f32) {
+    use std::arch::x86_64::*;
+    let mask_low = _mm_set1_epi8(0x0F);
+    let c8 = _mm_set1_epi8(8);
+
+    for (b_idx, block) in row_blocks.iter().enumerate() {
+        let vd = _mm256_set1_ps(block.d);
+        let dst_ptr = w_buf.add(b_idx * 32);
+        let raw16 = _mm_loadu_si128(block.qs.as_ptr() as *const __m128i);
+
+        let lo_i8 = _mm_sub_epi8(_mm_and_si128(raw16, mask_low), c8);
+        let hi_i8 = _mm_sub_epi8(_mm_and_si128(_mm_srli_epi16(raw16, 4), mask_low), c8);
+
+        let lo_0_3 = _mm_cvtepi8_epi32(lo_i8);
+        let lo_4_7 = _mm_cvtepi8_epi32(_mm_srli_si128(lo_i8, 4));
+        let vq0 = _mm256_set_m128(_mm_cvtepi32_ps(lo_4_7), _mm_cvtepi32_ps(lo_0_3));
+        _mm256_storeu_ps(dst_ptr, _mm256_mul_ps(vq0, vd));
+
+        let lo_hi64 = _mm_srli_si128(lo_i8, 8);
+        let lo_8_11 = _mm_cvtepi8_epi32(lo_hi64);
+        let lo_12_15 = _mm_cvtepi8_epi32(_mm_srli_si128(lo_hi64, 4));
+        let vq1 = _mm256_set_m128(_mm_cvtepi32_ps(lo_12_15), _mm_cvtepi32_ps(lo_8_11));
+        _mm256_storeu_ps(dst_ptr.add(8), _mm256_mul_ps(vq1, vd));
+
+        let hi_0_3 = _mm_cvtepi8_epi32(hi_i8);
+        let hi_4_7 = _mm_cvtepi8_epi32(_mm_srli_si128(hi_i8, 4));
+        let vq2 = _mm256_set_m128(_mm_cvtepi32_ps(hi_4_7), _mm_cvtepi32_ps(hi_0_3));
+        _mm256_storeu_ps(dst_ptr.add(16), _mm256_mul_ps(vq2, vd));
+
+        let hi_hi64 = _mm_srli_si128(hi_i8, 8);
+        let hi_8_11 = _mm_cvtepi8_epi32(hi_hi64);
+        let hi_12_15 = _mm_cvtepi8_epi32(_mm_srli_si128(hi_hi64, 4));
+        let vq3 = _mm256_set_m128(_mm_cvtepi32_ps(hi_12_15), _mm_cvtepi32_ps(hi_8_11));
+        _mm256_storeu_ps(dst_ptr.add(24), _mm256_mul_ps(vq3, vd));
+    }
+}
+
+#[inline]
+pub unsafe fn unpack_q4_row(row_blocks: &[BlockQ4_0], w_buf: *mut f32) {
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx") {
+        unpack_q4_row_avx1(row_blocks, w_buf);
+        return;
+    }
+    for (b_idx, block) in row_blocks.iter().enumerate() {
+        let dst_slice = std::slice::from_raw_parts_mut(w_buf.add(b_idx * 32), 32);
+        block.dequantize_to(dst_slice);
+    }
+}
+
+struct TiledFp32Job<'a> {
+    out_batch: *mut f32,
+    x_batch: &'a [f32],
+    w: &'a [f32],
+    bias: &'a [f32],
+    in_dim: usize,
+    out_dim: usize,
+    seq_len: usize,
+}
+
+unsafe fn run_tiled_fp32_slice(ctx: *const (), t_idx: usize, n_threads: usize) {
+    let job = &*(ctx as *const TiledFp32Job);
+    let chunk_size = (job.out_dim + n_threads - 1) / n_threads;
+    let start_row = t_idx * chunk_size;
+    if start_row >= job.out_dim {
+        return;
+    }
+    let end_row = (start_row + chunk_size).min(job.out_dim);
+    let x_ptr = job.x_batch.as_ptr();
+    let w_ptr = job.w.as_ptr();
+
+    for i in start_row..end_row {
+        let w_row = w_ptr.add(i * job.in_dim);
+        let bias_val = *job.bias.get_unchecked(i);
+        dot_row_batch_m4(
+            job.out_batch,
+            job.out_dim,
+            i,
+            x_ptr,
+            w_row,
+            bias_val,
+            job.in_dim,
+            job.seq_len,
+        );
+    }
+}
+
+pub fn matmul_tiled_fp32_parallel(
+    out_batch: &mut [f32],
+    x_batch: &[f32],
+    w: &[f32],
+    bias: &[f32],
+    in_dim: usize,
+    out_dim: usize,
+    seq_len: usize,
+    num_threads: usize,
+) {
+    let job = TiledFp32Job {
+        out_batch: out_batch.as_mut_ptr(),
+        x_batch,
+        w,
+        bias,
+        in_dim,
+        out_dim,
+        seq_len,
+    };
+    if num_threads <= 1 || out_dim < 16 {
+        unsafe { run_tiled_fp32_slice(&job as *const _ as *const (), 0, 1); }
+    } else {
+        get_global_pool().run_parallel(num_threads, run_tiled_fp32_slice, &job as *const _ as *const ());
+    }
+}
+
+struct TiledQ8Job<'a> {
+    out_batch: *mut f32,
+    x_batch: &'a [f32],
+    w: &'a [BlockQ8_0],
+    bias: &'a [f32],
+    in_dim: usize,
+    out_dim: usize,
+    seq_len: usize,
+}
+
+unsafe fn run_tiled_q8_slice(ctx: *const (), t_idx: usize, n_threads: usize) {
+    let job = &*(ctx as *const TiledQ8Job);
+    let chunk_size = (job.out_dim + n_threads - 1) / n_threads;
+    let start_row = t_idx * chunk_size;
+    if start_row >= job.out_dim {
+        return;
+    }
+    let end_row = (start_row + chunk_size).min(job.out_dim);
+    let blocks_per_row = job.in_dim / 32;
+    let x_ptr = job.x_batch.as_ptr();
+
+    let mut w_l1d = [0.0f32; 10240];
+    let w_buf_ptr = w_l1d.as_mut_ptr();
+
+    for i in start_row..end_row {
+        let row_blocks = &job.w[i * blocks_per_row..(i + 1) * blocks_per_row];
+        let bias_val = *job.bias.get_unchecked(i);
+        unpack_q8_row(row_blocks, w_buf_ptr);
+        dot_row_batch_m4(
+            job.out_batch,
+            job.out_dim,
+            i,
+            x_ptr,
+            w_buf_ptr,
+            bias_val,
+            job.in_dim,
+            job.seq_len,
+        );
+    }
+}
+
+pub fn matmul_tiled_q8_parallel(
+    out_batch: &mut [f32],
+    x_batch: &[f32],
+    w: &[BlockQ8_0],
+    bias: &[f32],
+    in_dim: usize,
+    out_dim: usize,
+    seq_len: usize,
+    num_threads: usize,
+) {
+    let job = TiledQ8Job {
+        out_batch: out_batch.as_mut_ptr(),
+        x_batch,
+        w,
+        bias,
+        in_dim,
+        out_dim,
+        seq_len,
+    };
+    if num_threads <= 1 || out_dim < 16 {
+        unsafe { run_tiled_q8_slice(&job as *const _ as *const (), 0, 1); }
+    } else {
+        get_global_pool().run_parallel(num_threads, run_tiled_q8_slice, &job as *const _ as *const ());
+    }
+}
+
+struct TiledQ4Job<'a> {
+    out_batch: *mut f32,
+    x_batch: &'a [f32],
+    w: &'a [BlockQ4_0],
+    bias: &'a [f32],
+    in_dim: usize,
+    out_dim: usize,
+    seq_len: usize,
+}
+
+unsafe fn run_tiled_q4_slice(ctx: *const (), t_idx: usize, n_threads: usize) {
+    let job = &*(ctx as *const TiledQ4Job);
+    let chunk_size = (job.out_dim + n_threads - 1) / n_threads;
+    let start_row = t_idx * chunk_size;
+    if start_row >= job.out_dim {
+        return;
+    }
+    let end_row = (start_row + chunk_size).min(job.out_dim);
+    let blocks_per_row = job.in_dim / 32;
+    let x_ptr = job.x_batch.as_ptr();
+
+    let mut w_l1d = [0.0f32; 10240];
+    let w_buf_ptr = w_l1d.as_mut_ptr();
+
+    for i in start_row..end_row {
+        let row_blocks = &job.w[i * blocks_per_row..(i + 1) * blocks_per_row];
+        let bias_val = *job.bias.get_unchecked(i);
+        unpack_q4_row(row_blocks, w_buf_ptr);
+        dot_row_batch_m4(
+            job.out_batch,
+            job.out_dim,
+            i,
+            x_ptr,
+            w_buf_ptr,
+            bias_val,
+            job.in_dim,
+            job.seq_len,
+        );
+    }
+}
+
+pub fn matmul_tiled_q4_parallel(
+    out_batch: &mut [f32],
+    x_batch: &[f32],
+    w: &[BlockQ4_0],
+    bias: &[f32],
+    in_dim: usize,
+    out_dim: usize,
+    seq_len: usize,
+    num_threads: usize,
+) {
+    let job = TiledQ4Job {
+        out_batch: out_batch.as_mut_ptr(),
+        x_batch,
+        w,
+        bias,
+        in_dim,
+        out_dim,
+        seq_len,
+    };
+    if num_threads <= 1 || out_dim < 16 {
+        unsafe { run_tiled_q4_slice(&job as *const _ as *const (), 0, 1); }
+    } else {
+        get_global_pool().run_parallel(num_threads, run_tiled_q4_slice, &job as *const _ as *const ());
+    }
+}
+
+/// Accumulates one attention head's symmetrized + APC-corrected feature map into `contact_logits`
+/// in $O(N^2)$ memory, matching HuggingFace `EsmContactPredictionHead` bit-for-bit.
+#[inline]
+pub fn accumulate_head_apc(
+    head_att: &[f32],
+    contact_logits: &mut [f32],
+    seq_len: usize,
+    n_res: usize,
+    w_lh: f32,
+) {
+    if n_res == 0 || w_lh == 0.0 {
+        return;
+    }
+    let mut row_sums = [0.0f32; 1024];
+    let mut total_sum = 0.0f32;
+
+    for i in 0..n_res {
+        let mut r_sum = 0.0f32;
+        let row_i = (i + 1) * seq_len;
+        for j in 0..n_res {
+            let s_ij = head_att[row_i + (j + 1)] + head_att[(j + 1) * seq_len + (i + 1)];
+            r_sum += s_ij;
+        }
+        row_sums[i] = r_sum;
+        total_sum += r_sum;
+    }
+
+    let inv_total = if total_sum.abs() > 1e-12 {
+        1.0 / total_sum
+    } else {
+        0.0
+    };
+
+    for i in 0..n_res {
+        let r_i = row_sums[i] * inv_total;
+        let row_i = (i + 1) * seq_len;
+        let out_row = i * n_res;
+        for j in 0..n_res {
+            let s_ij = head_att[row_i + (j + 1)] + head_att[(j + 1) * seq_len + (i + 1)];
+            let apc = s_ij - r_i * row_sums[j];
+            contact_logits[out_row + j] += w_lh * apc;
+        }
+    }
+}
+
 pub fn forward_bidirectional(
     tokens: &[usize],
     config: &EsmConfig,
@@ -3650,6 +4241,13 @@ pub fn forward_bidirectional_parallel_ext(
         }
     }
 
+    let n_res = seq_len.saturating_sub(2);
+    let do_contacts = state.compute_contacts && n_res > 0;
+    let (ch_weights, ch_bias) = config.contact_head_weights();
+    if do_contacts {
+        state.contact_probs[0..n_res * n_res].fill(0.0);
+    }
+
     for l in 0..config.n_layers {
         let layer_dim_offset = l * dim;
         let layer_matrix_offset = l * dim * dim;
@@ -3657,16 +4255,58 @@ pub fn forward_bidirectional_parallel_ext(
         let fc1_b_offset = l * hidden_dim;
         let fc2_w_offset = l * hidden_dim * dim;
 
+        let ln1_w = &weights.ln_1_weight[layer_dim_offset..layer_dim_offset + dim];
+        let ln1_b = &weights.ln_1_bias[layer_dim_offset..layer_dim_offset + dim];
         for p in 0..seq_len {
-            let xp = &state.x[p * dim..(p + 1) * dim];
-            layer_norm(&mut state.xb, xp, &weights.ln_1_weight[layer_dim_offset..layer_dim_offset + dim], &weights.ln_1_bias[layer_dim_offset..layer_dim_offset + dim]);
-            let q_slice = &mut state.q[p * dim..(p + 1) * dim];
-            matmul_parallel(q_slice, &state.xb, &weights.wq[layer_matrix_offset..layer_matrix_offset + dim * dim], &weights.bq[layer_dim_offset..layer_dim_offset + dim], dim, dim, num_threads);
-            let k_slice = &mut state.k[p * dim..(p + 1) * dim];
-            matmul_parallel(k_slice, &state.xb, &weights.wk[layer_matrix_offset..layer_matrix_offset + dim * dim], &weights.bk[layer_dim_offset..layer_dim_offset + dim], dim, dim, num_threads);
-            let v_slice = &mut state.v[p * dim..(p + 1) * dim];
-            matmul_parallel(v_slice, &state.xb, &weights.wv[layer_matrix_offset..layer_matrix_offset + dim * dim], &weights.bv[layer_dim_offset..layer_dim_offset + dim], dim, dim, num_threads);
-            apply_rope(q_slice, k_slice, &state.rope_cos, &state.rope_sin, p, dim, config.n_heads);
+            layer_norm(
+                &mut state.xb[p * dim..(p + 1) * dim],
+                &state.x[p * dim..(p + 1) * dim],
+                ln1_w,
+                ln1_b,
+            );
+        }
+
+        matmul_tiled_fp32_parallel(
+            &mut state.q[0..seq_len * dim],
+            &state.xb[0..seq_len * dim],
+            &weights.wq[layer_matrix_offset..layer_matrix_offset + dim * dim],
+            &weights.bq[layer_dim_offset..layer_dim_offset + dim],
+            dim,
+            dim,
+            seq_len,
+            num_threads,
+        );
+        matmul_tiled_fp32_parallel(
+            &mut state.k[0..seq_len * dim],
+            &state.xb[0..seq_len * dim],
+            &weights.wk[layer_matrix_offset..layer_matrix_offset + dim * dim],
+            &weights.bk[layer_dim_offset..layer_dim_offset + dim],
+            dim,
+            dim,
+            seq_len,
+            num_threads,
+        );
+        matmul_tiled_fp32_parallel(
+            &mut state.v[0..seq_len * dim],
+            &state.xb[0..seq_len * dim],
+            &weights.wv[layer_matrix_offset..layer_matrix_offset + dim * dim],
+            &weights.bv[layer_dim_offset..layer_dim_offset + dim],
+            dim,
+            dim,
+            seq_len,
+            num_threads,
+        );
+
+        for p in 0..seq_len {
+            apply_rope(
+                &mut state.q[p * dim..(p + 1) * dim],
+                &mut state.k[p * dim..(p + 1) * dim],
+                &state.rope_cos,
+                &state.rope_sin,
+                p,
+                dim,
+                config.n_heads,
+            );
         }
 
         let is_last_layer = l == config.n_layers - 1;
@@ -3674,8 +4314,8 @@ pub fn forward_bidirectional_parallel_ext(
             state.final_layer_att[0..seq_len * seq_len].fill(0.0);
         }
 
-        for p in 0..seq_len {
-            for h in 0..config.n_heads {
+        for h in 0..config.n_heads {
+            for p in 0..seq_len {
                 let q_offset = p * dim + h * head_dim;
                 let q_head = &state.q[q_offset..q_offset + head_dim];
                 let att_head = &mut state.att[h * state.max_len..h * state.max_len + seq_len];
@@ -3719,6 +4359,10 @@ pub fn forward_bidirectional_parallel_ext(
                     }
                 }
                 softmax(att_head);
+
+                if do_contacts {
+                    state.head_att_buf[p * seq_len..(p + 1) * seq_len].copy_from_slice(att_head);
+                }
 
                 if is_last_layer {
                     let head_weight = 1.0 / config.n_heads as f32;
@@ -3767,16 +4411,69 @@ pub fn forward_bidirectional_parallel_ext(
                 }
             }
 
-            let out_slice = &state.out_att[p * dim..(p + 1) * dim];
-            matmul_parallel(&mut state.xb, out_slice, &weights.wo[layer_matrix_offset..layer_matrix_offset + dim * dim], &weights.bo[layer_dim_offset..layer_dim_offset + dim], dim, dim, num_threads);
-            for i in 0..dim { state.x[p * dim + i] += state.xb[i]; }
+            if do_contacts {
+                let w_lh = ch_weights[l * config.n_heads + h];
+                accumulate_head_apc(
+                    &state.head_att_buf[0..seq_len * seq_len],
+                    &mut state.contact_probs[0..n_res * n_res],
+                    seq_len,
+                    n_res,
+                    w_lh,
+                );
+            }
+        }
 
-            let xp = &state.x[p * dim..(p + 1) * dim];
-            layer_norm(&mut state.xb, xp, &weights.ln_2_weight[layer_dim_offset..layer_dim_offset + dim], &weights.ln_2_bias[layer_dim_offset..layer_dim_offset + dim]);
-            matmul_parallel(&mut state.hb, &state.xb, &weights.fc1_weight[fc1_w_offset..fc1_w_offset + dim * hidden_dim], &weights.fc1_bias[fc1_b_offset..fc1_b_offset + hidden_dim], dim, hidden_dim, num_threads);
-            gelu(&mut state.hb2, &state.hb);
-            matmul_parallel(&mut state.xb, &state.hb2, &weights.fc2_weight[fc2_w_offset..fc2_w_offset + hidden_dim * dim], &weights.fc2_bias[layer_dim_offset..layer_dim_offset + dim], hidden_dim, dim, num_threads);
-            for i in 0..dim { state.x[p * dim + i] += state.xb[i]; }
+        matmul_tiled_fp32_parallel(
+            &mut state.xb[0..seq_len * dim],
+            &state.out_att[0..seq_len * dim],
+            &weights.wo[layer_matrix_offset..layer_matrix_offset + dim * dim],
+            &weights.bo[layer_dim_offset..layer_dim_offset + dim],
+            dim,
+            dim,
+            seq_len,
+            num_threads,
+        );
+        for idx in 0..seq_len * dim {
+            state.x[idx] += state.xb[idx];
+        }
+
+        let ln2_w = &weights.ln_2_weight[layer_dim_offset..layer_dim_offset + dim];
+        let ln2_b = &weights.ln_2_bias[layer_dim_offset..layer_dim_offset + dim];
+        for p in 0..seq_len {
+            layer_norm(
+                &mut state.xb[p * dim..(p + 1) * dim],
+                &state.x[p * dim..(p + 1) * dim],
+                ln2_w,
+                ln2_b,
+            );
+        }
+
+        matmul_tiled_fp32_parallel(
+            &mut state.hb[0..seq_len * hidden_dim],
+            &state.xb[0..seq_len * dim],
+            &weights.fc1_weight[fc1_w_offset..fc1_w_offset + dim * hidden_dim],
+            &weights.fc1_bias[fc1_b_offset..fc1_b_offset + hidden_dim],
+            dim,
+            hidden_dim,
+            seq_len,
+            num_threads,
+        );
+        gelu(
+            &mut state.hb2[0..seq_len * hidden_dim],
+            &state.hb[0..seq_len * hidden_dim],
+        );
+        matmul_tiled_fp32_parallel(
+            &mut state.xb[0..seq_len * dim],
+            &state.hb2[0..seq_len * hidden_dim],
+            &weights.fc2_weight[fc2_w_offset..fc2_w_offset + hidden_dim * dim],
+            &weights.fc2_bias[layer_dim_offset..layer_dim_offset + dim],
+            hidden_dim,
+            dim,
+            seq_len,
+            num_threads,
+        );
+        for idx in 0..seq_len * dim {
+            state.x[idx] += state.xb[idx];
         }
 
         if let Some(ref mut cb) = on_layer {
@@ -3784,12 +4481,72 @@ pub fn forward_bidirectional_parallel_ext(
         }
     }
 
+    if do_contacts {
+        for val in &mut state.contact_probs[0..n_res * n_res] {
+            *val = 1.0 / (1.0 + (-(*val + ch_bias)).exp());
+        }
+    }
+
     for p in 0..seq_len {
-        let xp = &state.x[p * dim..(p + 1) * dim];
-        layer_norm(&mut state.xb, xp, &weights.ln_f_weight, &weights.ln_f_bias);
-        state.x[p * dim..(p + 1) * dim].copy_from_slice(&state.xb);
-        let logits_p = &mut state.logits[p * config.vocab_size..(p + 1) * config.vocab_size];
-        project_lm_head_parallel(logits_p, &state.xb, &weights.classifier_weights, &weights.token_embedding_table, config, &mut state.hb, &mut state.hb2, num_threads);
+        layer_norm(
+            &mut state.xb[p * dim..(p + 1) * dim],
+            &state.x[p * dim..(p + 1) * dim],
+            &weights.ln_f_weight,
+            &weights.ln_f_bias,
+        );
+    }
+    state.x[0..seq_len * dim].copy_from_slice(&state.xb[0..seq_len * dim]);
+
+    let required_len = 3 * dim + dim * dim + config.vocab_size * dim + config.vocab_size;
+    if weights.classifier_weights.len() >= required_len {
+        let lm_ln_w = &weights.classifier_weights[0..dim];
+        let lm_ln_b = &weights.classifier_weights[dim..2 * dim];
+        let lm_dense_w = &weights.classifier_weights[2 * dim..2 * dim + dim * dim];
+        let lm_dense_b = &weights.classifier_weights[2 * dim + dim * dim..3 * dim + dim * dim];
+        let lm_dec_w = &weights.classifier_weights[3 * dim + dim * dim..3 * dim + dim * dim + config.vocab_size * dim];
+        let lm_dec_b = &weights.classifier_weights[3 * dim + dim * dim + config.vocab_size * dim..required_len];
+
+        matmul_tiled_fp32_parallel(
+            &mut state.hb[0..seq_len * dim],
+            &state.x[0..seq_len * dim],
+            lm_dense_w,
+            lm_dense_b,
+            dim,
+            dim,
+            seq_len,
+            num_threads,
+        );
+        gelu(&mut state.hb2[0..seq_len * dim], &state.hb[0..seq_len * dim]);
+        for p in 0..seq_len {
+            layer_norm(
+                &mut state.xb[p * dim..(p + 1) * dim],
+                &state.hb2[p * dim..(p + 1) * dim],
+                lm_ln_w,
+                lm_ln_b,
+            );
+        }
+        matmul_tiled_fp32_parallel(
+            &mut state.logits[0..seq_len * config.vocab_size],
+            &state.xb[0..seq_len * dim],
+            lm_dec_w,
+            lm_dec_b,
+            dim,
+            config.vocab_size,
+            seq_len,
+            num_threads,
+        );
+    } else {
+        const ZERO_BIAS: [f32; 33] = [0.0; 33];
+        matmul_tiled_fp32_parallel(
+            &mut state.logits[0..seq_len * config.vocab_size],
+            &state.x[0..seq_len * dim],
+            &weights.token_embedding_table,
+            &ZERO_BIAS,
+            dim,
+            config.vocab_size,
+            seq_len,
+            num_threads,
+        );
     }
 }
 
@@ -3832,6 +4589,13 @@ pub fn forward_bidirectional_q8(
         }
     }
 
+    let n_res = seq_len.saturating_sub(2);
+    let do_contacts = state.compute_contacts && n_res > 0;
+    let (ch_weights, ch_bias) = config.contact_head_weights();
+    if do_contacts {
+        state.contact_probs[0..n_res * n_res].fill(0.0);
+    }
+
     let q8_matrix_blocks = dim * (dim / 32);
     let q8_fc1_blocks = hidden_dim * (dim / 32);
     let q8_fc2_blocks = dim * (hidden_dim / 32);
@@ -3843,16 +4607,58 @@ pub fn forward_bidirectional_q8(
         let fc1_b = l * hidden_dim;
         let fc2_q8 = l * q8_fc2_blocks;
 
+        let ln1_w = &weights.ln_1_weight[layer_dim_offset..layer_dim_offset + dim];
+        let ln1_b = &weights.ln_1_bias[layer_dim_offset..layer_dim_offset + dim];
         for p in 0..seq_len {
-            let xp = &state.x[p * dim..(p + 1) * dim];
-            layer_norm(&mut state.xb, xp, &weights.ln_1_weight[layer_dim_offset..layer_dim_offset + dim], &weights.ln_1_bias[layer_dim_offset..layer_dim_offset + dim]);
-            let q_slice = &mut state.q[p * dim..(p + 1) * dim];
-            matmul_q8_parallel(q_slice, &state.xb, &weights.wq[layer_matrix_q8..layer_matrix_q8 + q8_matrix_blocks], &weights.bq[layer_dim_offset..layer_dim_offset + dim], dim, dim, num_threads);
-            let k_slice = &mut state.k[p * dim..(p + 1) * dim];
-            matmul_q8_parallel(k_slice, &state.xb, &weights.wk[layer_matrix_q8..layer_matrix_q8 + q8_matrix_blocks], &weights.bk[layer_dim_offset..layer_dim_offset + dim], dim, dim, num_threads);
-            let v_slice = &mut state.v[p * dim..(p + 1) * dim];
-            matmul_q8_parallel(v_slice, &state.xb, &weights.wv[layer_matrix_q8..layer_matrix_q8 + q8_matrix_blocks], &weights.bv[layer_dim_offset..layer_dim_offset + dim], dim, dim, num_threads);
-            apply_rope(q_slice, k_slice, &state.rope_cos, &state.rope_sin, p, dim, config.n_heads);
+            layer_norm(
+                &mut state.xb[p * dim..(p + 1) * dim],
+                &state.x[p * dim..(p + 1) * dim],
+                ln1_w,
+                ln1_b,
+            );
+        }
+
+        matmul_tiled_q8_parallel(
+            &mut state.q[0..seq_len * dim],
+            &state.xb[0..seq_len * dim],
+            &weights.wq[layer_matrix_q8..layer_matrix_q8 + q8_matrix_blocks],
+            &weights.bq[layer_dim_offset..layer_dim_offset + dim],
+            dim,
+            dim,
+            seq_len,
+            num_threads,
+        );
+        matmul_tiled_q8_parallel(
+            &mut state.k[0..seq_len * dim],
+            &state.xb[0..seq_len * dim],
+            &weights.wk[layer_matrix_q8..layer_matrix_q8 + q8_matrix_blocks],
+            &weights.bk[layer_dim_offset..layer_dim_offset + dim],
+            dim,
+            dim,
+            seq_len,
+            num_threads,
+        );
+        matmul_tiled_q8_parallel(
+            &mut state.v[0..seq_len * dim],
+            &state.xb[0..seq_len * dim],
+            &weights.wv[layer_matrix_q8..layer_matrix_q8 + q8_matrix_blocks],
+            &weights.bv[layer_dim_offset..layer_dim_offset + dim],
+            dim,
+            dim,
+            seq_len,
+            num_threads,
+        );
+
+        for p in 0..seq_len {
+            apply_rope(
+                &mut state.q[p * dim..(p + 1) * dim],
+                &mut state.k[p * dim..(p + 1) * dim],
+                &state.rope_cos,
+                &state.rope_sin,
+                p,
+                dim,
+                config.n_heads,
+            );
         }
 
         let is_last_layer = l == config.n_layers - 1;
@@ -3860,8 +4666,8 @@ pub fn forward_bidirectional_q8(
             state.final_layer_att[0..seq_len * seq_len].fill(0.0);
         }
 
-        for p in 0..seq_len {
-            for h in 0..config.n_heads {
+        for h in 0..config.n_heads {
+            for p in 0..seq_len {
                 let q_offset = p * dim + h * head_dim;
                 let q_head = &state.q[q_offset..q_offset + head_dim];
                 let att_head = &mut state.att[h * state.max_len..h * state.max_len + seq_len];
@@ -3905,6 +4711,10 @@ pub fn forward_bidirectional_q8(
                     }
                 }
                 softmax(att_head);
+
+                if do_contacts {
+                    state.head_att_buf[p * seq_len..(p + 1) * seq_len].copy_from_slice(att_head);
+                }
 
                 if is_last_layer {
                     let head_weight = 1.0 / config.n_heads as f32;
@@ -3953,25 +4763,138 @@ pub fn forward_bidirectional_q8(
                 }
             }
 
-            let out_slice = &state.out_att[p * dim..(p + 1) * dim];
-            matmul_q8_parallel(&mut state.xb, out_slice, &weights.wo[layer_matrix_q8..layer_matrix_q8 + q8_matrix_blocks], &weights.bo[layer_dim_offset..layer_dim_offset + dim], dim, dim, num_threads);
-            for i in 0..dim { state.x[p * dim + i] += state.xb[i]; }
+            if do_contacts {
+                let w_lh = ch_weights[l * config.n_heads + h];
+                accumulate_head_apc(
+                    &state.head_att_buf[0..seq_len * seq_len],
+                    &mut state.contact_probs[0..n_res * n_res],
+                    seq_len,
+                    n_res,
+                    w_lh,
+                );
+            }
+        }
 
-            let xp = &state.x[p * dim..(p + 1) * dim];
-            layer_norm(&mut state.xb, xp, &weights.ln_2_weight[layer_dim_offset..layer_dim_offset + dim], &weights.ln_2_bias[layer_dim_offset..layer_dim_offset + dim]);
-            matmul_q8_parallel(&mut state.hb, &state.xb, &weights.fc1_weight[fc1_q8..fc1_q8 + q8_fc1_blocks], &weights.fc1_bias[fc1_b..fc1_b + hidden_dim], dim, hidden_dim, num_threads);
-            gelu(&mut state.hb2, &state.hb);
-            matmul_q8_parallel(&mut state.xb, &state.hb2, &weights.fc2_weight[fc2_q8..fc2_q8 + q8_fc2_blocks], &weights.fc2_bias[layer_dim_offset..layer_dim_offset + dim], hidden_dim, dim, num_threads);
-            for i in 0..dim { state.x[p * dim + i] += state.xb[i]; }
+        matmul_tiled_q8_parallel(
+            &mut state.xb[0..seq_len * dim],
+            &state.out_att[0..seq_len * dim],
+            &weights.wo[layer_matrix_q8..layer_matrix_q8 + q8_matrix_blocks],
+            &weights.bo[layer_dim_offset..layer_dim_offset + dim],
+            dim,
+            dim,
+            seq_len,
+            num_threads,
+        );
+        for idx in 0..seq_len * dim {
+            state.x[idx] += state.xb[idx];
+        }
+
+        let ln2_w = &weights.ln_2_weight[layer_dim_offset..layer_dim_offset + dim];
+        let ln2_b = &weights.ln_2_bias[layer_dim_offset..layer_dim_offset + dim];
+        for p in 0..seq_len {
+            layer_norm(
+                &mut state.xb[p * dim..(p + 1) * dim],
+                &state.x[p * dim..(p + 1) * dim],
+                ln2_w,
+                ln2_b,
+            );
+        }
+
+        matmul_tiled_q8_parallel(
+            &mut state.hb[0..seq_len * hidden_dim],
+            &state.xb[0..seq_len * dim],
+            &weights.fc1_weight[fc1_q8..fc1_q8 + q8_fc1_blocks],
+            &weights.fc1_bias[fc1_b..fc1_b + hidden_dim],
+            dim,
+            hidden_dim,
+            seq_len,
+            num_threads,
+        );
+        gelu(
+            &mut state.hb2[0..seq_len * hidden_dim],
+            &state.hb[0..seq_len * hidden_dim],
+        );
+        matmul_tiled_q8_parallel(
+            &mut state.xb[0..seq_len * dim],
+            &state.hb2[0..seq_len * hidden_dim],
+            &weights.fc2_weight[fc2_q8..fc2_q8 + q8_fc2_blocks],
+            &weights.fc2_bias[layer_dim_offset..layer_dim_offset + dim],
+            hidden_dim,
+            dim,
+            seq_len,
+            num_threads,
+        );
+        for idx in 0..seq_len * dim {
+            state.x[idx] += state.xb[idx];
+        }
+    }
+
+    if do_contacts {
+        for val in &mut state.contact_probs[0..n_res * n_res] {
+            *val = 1.0 / (1.0 + (-(*val + ch_bias)).exp());
         }
     }
 
     for p in 0..seq_len {
-        let xp = &state.x[p * dim..(p + 1) * dim];
-        layer_norm(&mut state.xb, xp, &weights.ln_f_weight, &weights.ln_f_bias);
-        state.x[p * dim..(p + 1) * dim].copy_from_slice(&state.xb);
-        let logits_p = &mut state.logits[p * config.vocab_size..(p + 1) * config.vocab_size];
-        project_lm_head_q8(logits_p, &state.xb, &weights.classifier_weights, &weights.token_embedding_table, config, &mut state.hb, &mut state.hb2, num_threads);
+        layer_norm(
+            &mut state.xb[p * dim..(p + 1) * dim],
+            &state.x[p * dim..(p + 1) * dim],
+            &weights.ln_f_weight,
+            &weights.ln_f_bias,
+        );
+    }
+    state.x[0..seq_len * dim].copy_from_slice(&state.xb[0..seq_len * dim]);
+
+    let required_len = 3 * dim + dim * dim + config.vocab_size * dim + config.vocab_size;
+    if weights.classifier_weights.len() >= required_len {
+        let lm_ln_w = &weights.classifier_weights[0..dim];
+        let lm_ln_b = &weights.classifier_weights[dim..2 * dim];
+        let lm_dense_w = &weights.classifier_weights[2 * dim..2 * dim + dim * dim];
+        let lm_dense_b = &weights.classifier_weights[2 * dim + dim * dim..3 * dim + dim * dim];
+        let lm_dec_w = &weights.classifier_weights[3 * dim + dim * dim..3 * dim + dim * dim + config.vocab_size * dim];
+        let lm_dec_b = &weights.classifier_weights[3 * dim + dim * dim + config.vocab_size * dim..required_len];
+
+        matmul_tiled_fp32_parallel(
+            &mut state.hb[0..seq_len * dim],
+            &state.x[0..seq_len * dim],
+            lm_dense_w,
+            lm_dense_b,
+            dim,
+            dim,
+            seq_len,
+            num_threads,
+        );
+        gelu(&mut state.hb2[0..seq_len * dim], &state.hb[0..seq_len * dim]);
+        for p in 0..seq_len {
+            layer_norm(
+                &mut state.xb[p * dim..(p + 1) * dim],
+                &state.hb2[p * dim..(p + 1) * dim],
+                lm_ln_w,
+                lm_ln_b,
+            );
+        }
+        matmul_tiled_fp32_parallel(
+            &mut state.logits[0..seq_len * config.vocab_size],
+            &state.xb[0..seq_len * dim],
+            lm_dec_w,
+            lm_dec_b,
+            dim,
+            config.vocab_size,
+            seq_len,
+            num_threads,
+        );
+    } else {
+        const ZERO_BIAS: [f32; 33] = [0.0; 33];
+        matmul_tiled_q8_parallel(
+            &mut state.logits[0..seq_len * config.vocab_size],
+            &state.x[0..seq_len * dim],
+            &weights.token_embedding_table,
+            &ZERO_BIAS,
+            dim,
+            config.vocab_size,
+            seq_len,
+            num_threads,
+        );
     }
 }
 
@@ -4021,6 +4944,13 @@ pub fn forward_bidirectional_q4_ext(
         }
     }
 
+    let n_res = seq_len.saturating_sub(2);
+    let do_contacts = state.compute_contacts && n_res > 0;
+    let (ch_weights, ch_bias) = config.contact_head_weights();
+    if do_contacts {
+        state.contact_probs[0..n_res * n_res].fill(0.0);
+    }
+
     let q4_matrix_blocks = dim * (dim / 32);
     let q4_fc1_blocks = hidden_dim * (dim / 32);
     let q4_fc2_blocks = dim * (hidden_dim / 32);
@@ -4032,16 +4962,58 @@ pub fn forward_bidirectional_q4_ext(
         let fc1_b = l * hidden_dim;
         let fc2_q4 = l * q4_fc2_blocks;
 
+        let ln1_w = &weights.ln_1_weight[layer_dim_offset..layer_dim_offset + dim];
+        let ln1_b = &weights.ln_1_bias[layer_dim_offset..layer_dim_offset + dim];
         for p in 0..seq_len {
-            let xp = &state.x[p * dim..(p + 1) * dim];
-            layer_norm(&mut state.xb, xp, &weights.ln_1_weight[layer_dim_offset..layer_dim_offset + dim], &weights.ln_1_bias[layer_dim_offset..layer_dim_offset + dim]);
-            let q_slice = &mut state.q[p * dim..(p + 1) * dim];
-            matmul_q4_parallel(q_slice, &state.xb, &weights.wq[layer_matrix_q4..layer_matrix_q4 + q4_matrix_blocks], &weights.bq[layer_dim_offset..layer_dim_offset + dim], dim, dim, num_threads);
-            let k_slice = &mut state.k[p * dim..(p + 1) * dim];
-            matmul_q4_parallel(k_slice, &state.xb, &weights.wk[layer_matrix_q4..layer_matrix_q4 + q4_matrix_blocks], &weights.bk[layer_dim_offset..layer_dim_offset + dim], dim, dim, num_threads);
-            let v_slice = &mut state.v[p * dim..(p + 1) * dim];
-            matmul_q4_parallel(v_slice, &state.xb, &weights.wv[layer_matrix_q4..layer_matrix_q4 + q4_matrix_blocks], &weights.bv[layer_dim_offset..layer_dim_offset + dim], dim, dim, num_threads);
-            apply_rope(q_slice, k_slice, &state.rope_cos, &state.rope_sin, p, dim, config.n_heads);
+            layer_norm(
+                &mut state.xb[p * dim..(p + 1) * dim],
+                &state.x[p * dim..(p + 1) * dim],
+                ln1_w,
+                ln1_b,
+            );
+        }
+
+        matmul_tiled_q4_parallel(
+            &mut state.q[0..seq_len * dim],
+            &state.xb[0..seq_len * dim],
+            &weights.wq[layer_matrix_q4..layer_matrix_q4 + q4_matrix_blocks],
+            &weights.bq[layer_dim_offset..layer_dim_offset + dim],
+            dim,
+            dim,
+            seq_len,
+            num_threads,
+        );
+        matmul_tiled_q4_parallel(
+            &mut state.k[0..seq_len * dim],
+            &state.xb[0..seq_len * dim],
+            &weights.wk[layer_matrix_q4..layer_matrix_q4 + q4_matrix_blocks],
+            &weights.bk[layer_dim_offset..layer_dim_offset + dim],
+            dim,
+            dim,
+            seq_len,
+            num_threads,
+        );
+        matmul_tiled_q4_parallel(
+            &mut state.v[0..seq_len * dim],
+            &state.xb[0..seq_len * dim],
+            &weights.wv[layer_matrix_q4..layer_matrix_q4 + q4_matrix_blocks],
+            &weights.bv[layer_dim_offset..layer_dim_offset + dim],
+            dim,
+            dim,
+            seq_len,
+            num_threads,
+        );
+
+        for p in 0..seq_len {
+            apply_rope(
+                &mut state.q[p * dim..(p + 1) * dim],
+                &mut state.k[p * dim..(p + 1) * dim],
+                &state.rope_cos,
+                &state.rope_sin,
+                p,
+                dim,
+                config.n_heads,
+            );
         }
 
         let is_last_layer = l == config.n_layers - 1;
@@ -4049,8 +5021,8 @@ pub fn forward_bidirectional_q4_ext(
             state.final_layer_att[0..seq_len * seq_len].fill(0.0);
         }
 
-        for p in 0..seq_len {
-            for h in 0..config.n_heads {
+        for h in 0..config.n_heads {
+            for p in 0..seq_len {
                 let q_offset = p * dim + h * head_dim;
                 let q_head = &state.q[q_offset..q_offset + head_dim];
                 let att_head = &mut state.att[h * state.max_len..h * state.max_len + seq_len];
@@ -4094,6 +5066,10 @@ pub fn forward_bidirectional_q4_ext(
                     }
                 }
                 softmax(att_head);
+
+                if do_contacts {
+                    state.head_att_buf[p * seq_len..(p + 1) * seq_len].copy_from_slice(att_head);
+                }
 
                 if is_last_layer {
                     let head_weight = 1.0 / config.n_heads as f32;
@@ -4142,16 +5118,69 @@ pub fn forward_bidirectional_q4_ext(
                 }
             }
 
-            let out_slice = &state.out_att[p * dim..(p + 1) * dim];
-            matmul_q4_parallel(&mut state.xb, out_slice, &weights.wo[layer_matrix_q4..layer_matrix_q4 + q4_matrix_blocks], &weights.bo[layer_dim_offset..layer_dim_offset + dim], dim, dim, num_threads);
-            for i in 0..dim { state.x[p * dim + i] += state.xb[i]; }
+            if do_contacts {
+                let w_lh = ch_weights[l * config.n_heads + h];
+                accumulate_head_apc(
+                    &state.head_att_buf[0..seq_len * seq_len],
+                    &mut state.contact_probs[0..n_res * n_res],
+                    seq_len,
+                    n_res,
+                    w_lh,
+                );
+            }
+        }
 
-            let xp = &state.x[p * dim..(p + 1) * dim];
-            layer_norm(&mut state.xb, xp, &weights.ln_2_weight[layer_dim_offset..layer_dim_offset + dim], &weights.ln_2_bias[layer_dim_offset..layer_dim_offset + dim]);
-            matmul_q4_parallel(&mut state.hb, &state.xb, &weights.fc1_weight[fc1_q4..fc1_q4 + q4_fc1_blocks], &weights.fc1_bias[fc1_b..fc1_b + hidden_dim], dim, hidden_dim, num_threads);
-            gelu(&mut state.hb2, &state.hb);
-            matmul_q4_parallel(&mut state.xb, &state.hb2, &weights.fc2_weight[fc2_q4..fc2_q4 + q4_fc2_blocks], &weights.fc2_bias[layer_dim_offset..layer_dim_offset + dim], hidden_dim, dim, num_threads);
-            for i in 0..dim { state.x[p * dim + i] += state.xb[i]; }
+        matmul_tiled_q4_parallel(
+            &mut state.xb[0..seq_len * dim],
+            &state.out_att[0..seq_len * dim],
+            &weights.wo[layer_matrix_q4..layer_matrix_q4 + q4_matrix_blocks],
+            &weights.bo[layer_dim_offset..layer_dim_offset + dim],
+            dim,
+            dim,
+            seq_len,
+            num_threads,
+        );
+        for idx in 0..seq_len * dim {
+            state.x[idx] += state.xb[idx];
+        }
+
+        let ln2_w = &weights.ln_2_weight[layer_dim_offset..layer_dim_offset + dim];
+        let ln2_b = &weights.ln_2_bias[layer_dim_offset..layer_dim_offset + dim];
+        for p in 0..seq_len {
+            layer_norm(
+                &mut state.xb[p * dim..(p + 1) * dim],
+                &state.x[p * dim..(p + 1) * dim],
+                ln2_w,
+                ln2_b,
+            );
+        }
+
+        matmul_tiled_q4_parallel(
+            &mut state.hb[0..seq_len * hidden_dim],
+            &state.xb[0..seq_len * dim],
+            &weights.fc1_weight[fc1_q4..fc1_q4 + q4_fc1_blocks],
+            &weights.fc1_bias[fc1_b..fc1_b + hidden_dim],
+            dim,
+            hidden_dim,
+            seq_len,
+            num_threads,
+        );
+        gelu(
+            &mut state.hb2[0..seq_len * hidden_dim],
+            &state.hb[0..seq_len * hidden_dim],
+        );
+        matmul_tiled_q4_parallel(
+            &mut state.xb[0..seq_len * dim],
+            &state.hb2[0..seq_len * hidden_dim],
+            &weights.fc2_weight[fc2_q4..fc2_q4 + q4_fc2_blocks],
+            &weights.fc2_bias[layer_dim_offset..layer_dim_offset + dim],
+            hidden_dim,
+            dim,
+            seq_len,
+            num_threads,
+        );
+        for idx in 0..seq_len * dim {
+            state.x[idx] += state.xb[idx];
         }
 
         if let Some(ref mut cb) = on_layer {
@@ -4159,12 +5188,72 @@ pub fn forward_bidirectional_q4_ext(
         }
     }
 
+    if do_contacts {
+        for val in &mut state.contact_probs[0..n_res * n_res] {
+            *val = 1.0 / (1.0 + (-(*val + ch_bias)).exp());
+        }
+    }
+
     for p in 0..seq_len {
-        let xp = &state.x[p * dim..(p + 1) * dim];
-        layer_norm(&mut state.xb, xp, &weights.ln_f_weight, &weights.ln_f_bias);
-        state.x[p * dim..(p + 1) * dim].copy_from_slice(&state.xb);
-        let logits_p = &mut state.logits[p * config.vocab_size..(p + 1) * config.vocab_size];
-        project_lm_head_q4(logits_p, &state.xb, &weights.classifier_weights, &weights.token_embedding_table, config, &mut state.hb, &mut state.hb2, num_threads);
+        layer_norm(
+            &mut state.xb[p * dim..(p + 1) * dim],
+            &state.x[p * dim..(p + 1) * dim],
+            &weights.ln_f_weight,
+            &weights.ln_f_bias,
+        );
+    }
+    state.x[0..seq_len * dim].copy_from_slice(&state.xb[0..seq_len * dim]);
+
+    let required_len = 3 * dim + dim * dim + config.vocab_size * dim + config.vocab_size;
+    if weights.classifier_weights.len() >= required_len {
+        let lm_ln_w = &weights.classifier_weights[0..dim];
+        let lm_ln_b = &weights.classifier_weights[dim..2 * dim];
+        let lm_dense_w = &weights.classifier_weights[2 * dim..2 * dim + dim * dim];
+        let lm_dense_b = &weights.classifier_weights[2 * dim + dim * dim..3 * dim + dim * dim];
+        let lm_dec_w = &weights.classifier_weights[3 * dim + dim * dim..3 * dim + dim * dim + config.vocab_size * dim];
+        let lm_dec_b = &weights.classifier_weights[3 * dim + dim * dim + config.vocab_size * dim..required_len];
+
+        matmul_tiled_fp32_parallel(
+            &mut state.hb[0..seq_len * dim],
+            &state.x[0..seq_len * dim],
+            lm_dense_w,
+            lm_dense_b,
+            dim,
+            dim,
+            seq_len,
+            num_threads,
+        );
+        gelu(&mut state.hb2[0..seq_len * dim], &state.hb[0..seq_len * dim]);
+        for p in 0..seq_len {
+            layer_norm(
+                &mut state.xb[p * dim..(p + 1) * dim],
+                &state.hb2[p * dim..(p + 1) * dim],
+                lm_ln_w,
+                lm_ln_b,
+            );
+        }
+        matmul_tiled_fp32_parallel(
+            &mut state.logits[0..seq_len * config.vocab_size],
+            &state.xb[0..seq_len * dim],
+            lm_dec_w,
+            lm_dec_b,
+            dim,
+            config.vocab_size,
+            seq_len,
+            num_threads,
+        );
+    } else {
+        const ZERO_BIAS: [f32; 33] = [0.0; 33];
+        matmul_tiled_fp32_parallel(
+            &mut state.logits[0..seq_len * config.vocab_size],
+            &state.x[0..seq_len * dim],
+            &weights.token_embedding_table,
+            &ZERO_BIAS,
+            dim,
+            config.vocab_size,
+            seq_len,
+            num_threads,
+        );
     }
 }
 
@@ -6030,6 +7119,93 @@ mod tests_regression {
                 println!("{} Q4_0 vs HF: HS Cos = {:.6}, Logits Cos = {:.6}", name, cos_hs, cos_log);
                 assert!(cos_hs >= 0.900, "{} Q4_0 HS cosine {:.6} < 0.900", name, cos_hs);
                 assert!(cos_log >= 0.900, "{} Q4_0 Logits cosine {:.6} < 0.900", name, cos_log);
+            }
+        }
+    }
+
+    #[test]
+    fn test_tiled_gemm_and_contact_head_v1_7_0() {
+        // 1. Verify Contact Head weights dimensions for all 5 scales
+        for cfg in [
+            EsmConfig::esm2_8m(),
+            EsmConfig::esm2_35m(),
+            EsmConfig::esm2_150m(),
+            EsmConfig::esm2_650m(),
+            EsmConfig::esm2_3b(),
+        ] {
+            let (w, b) = cfg.contact_head_weights();
+            assert_eq!(w.len(), cfg.n_layers * cfg.n_heads);
+            assert!(b.is_finite());
+        }
+
+        // 2. Verify Tiled GEMM parity vs GEMV across odd/even sequence lengths (seq_len = 7, 12)
+        let in_dim = 320;
+        let out_dim = 64;
+        for seq_len in [7usize, 12usize] {
+            let x: Vec<f32> = (0..seq_len * in_dim).map(|i| ((i as f32) * 0.013).sin()).collect();
+            let w_fp32: Vec<f32> = (0..out_dim * in_dim).map(|i| ((i as f32) * 0.007).cos() * 0.5).collect();
+            let bias: Vec<f32> = (0..out_dim).map(|i| (i as f32) * 0.01 - 0.2).collect();
+
+            // FP32 parity
+            let mut ref_fp32 = vec![0.0f32; seq_len * out_dim];
+            for p in 0..seq_len {
+                matmul(&mut ref_fp32[p * out_dim..(p + 1) * out_dim], &x[p * in_dim..(p + 1) * in_dim], &w_fp32, &bias, in_dim, out_dim);
+            }
+            let mut tiled_fp32 = vec![0.0f32; seq_len * out_dim];
+            matmul_tiled_fp32_parallel(&mut tiled_fp32, &x, &w_fp32, &bias, in_dim, out_dim, seq_len, 2);
+            for i in 0..seq_len * out_dim {
+                assert!((ref_fp32[i] - tiled_fp32[i]).abs() < 1e-4, "FP32 Tiled GEMM mismatch at {}", i);
+            }
+
+            // Q8_0 parity
+            let w_q8 = quantize_slice_to_q8(&w_fp32);
+            let mut ref_q8 = vec![0.0f32; seq_len * out_dim];
+            for p in 0..seq_len {
+                matmul_q8_simd(&mut ref_q8[p * out_dim..(p + 1) * out_dim], &x[p * in_dim..(p + 1) * in_dim], &w_q8, &bias, in_dim, out_dim);
+            }
+            let mut tiled_q8 = vec![0.0f32; seq_len * out_dim];
+            matmul_tiled_q8_parallel(&mut tiled_q8, &x, &w_q8, &bias, in_dim, out_dim, seq_len, 2);
+            for i in 0..seq_len * out_dim {
+                assert!((ref_q8[i] - tiled_q8[i]).abs() < 1e-3, "Q8_0 Tiled GEMM mismatch at {}", i);
+            }
+
+            // Q4_0 parity
+            let w_q4 = quantize_slice_to_q4(&w_fp32);
+            let mut ref_q4 = vec![0.0f32; seq_len * out_dim];
+            for p in 0..seq_len {
+                matmul_q4_simd(&mut ref_q4[p * out_dim..(p + 1) * out_dim], &x[p * in_dim..(p + 1) * in_dim], &w_q4, &bias, in_dim, out_dim);
+            }
+            let mut tiled_q4 = vec![0.0f32; seq_len * out_dim];
+            matmul_tiled_q4_parallel(&mut tiled_q4, &x, &w_q4, &bias, in_dim, out_dim, seq_len, 2);
+            for i in 0..seq_len * out_dim {
+                assert!((ref_q4[i] - tiled_q4[i]).abs() < 1e-3, "Q4_0 Tiled GEMM mismatch at {}", i);
+            }
+        }
+
+        // 3. Verify pure canonical DMS (MaskedMarginal & WildtypeMarginal) and Multi-Layer Contact Head on 8M
+        let model_path = "esm2_8m_weights.bin";
+        if std::path::Path::new(model_path).exists() {
+            let config = EsmConfig::esm2_8m();
+            let weights = EsmWeights::from_file(model_path, &config).expect("Load 8M");
+            let rec = crate::fasta::parse_raw_sequence("MCMPCFTTDHQMARKCDDCCGGKGRGKCYGPQCLCR", "1CHL");
+            let theme = crate::ui::TerminalTheme::no_color();
+
+            let dms_masked = crate::pipeline::run_pipeline_dms_with_mode(
+                &rec, 128, 64, &config, ModelWeightsRef::Fp32(&weights), 2, &theme, crate::pipeline::DmsScoringMode::MaskedMarginal,
+            );
+            let dms_wt = crate::pipeline::run_pipeline_dms_with_mode(
+                &rec, 128, 64, &config, ModelWeightsRef::Fp32(&weights), 2, &theme, crate::pipeline::DmsScoringMode::WildtypeMarginal,
+            );
+            assert_eq!(dms_masked.rows.len(), 36);
+            assert_eq!(dms_wt.rows.len(), 36);
+            assert!(dms_wt.elapsed_ms < dms_masked.elapsed_ms, "1-Pass WT Marginal must be faster than L-Pass Masked Marginal");
+
+            let contacts = crate::pipeline::compute_pipeline_contacts_parallel(
+                &rec, 6, 1.0, Some(10), &config, ModelWeightsRef::Fp32(&weights), 2,
+            );
+            assert_eq!(contacts.top_contacts.len(), 10);
+            for c in &contacts.top_contacts {
+                assert!(c.apc_score > 0.0 && c.apc_score < 1.0, "Contact probability {} must be in (0, 1)", c.apc_score);
             }
         }
     }

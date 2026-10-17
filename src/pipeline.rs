@@ -9,6 +9,15 @@ use crate::export::DmsPositionRow;
 use crate::fasta::FastaRecord;
 use crate::ui::{aa_category, format_aa, format_dms_cell, format_sequence, ProgressBar, TerminalTheme};
 
+/// Scoring mode for in silico Deep Mutational Scanning (DMS).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DmsScoringMode {
+    /// Canonical Masked Marginal scoring (O(L) forward passes, masking 1 residue at a time).
+    MaskedMarginal,
+    /// Fast 1-Pass Wildtype Marginal scoring (1 forward pass per window on unmasked sequence).
+    WildtypeMarginal,
+}
+
 /// Result of a Deep Mutational Scanning (DMS) pipeline run.
 pub struct DmsPipelineResult {
     pub protein_id: String,
@@ -17,6 +26,7 @@ pub struct DmsPipelineResult {
     pub elapsed_ms: f64,
     pub muts_per_sec: f64,
     pub catalytic_sites_detected: usize,
+    pub scoring_mode: DmsScoringMode,
 }
 
 /// Executes Deep Mutational Scanning using an adaptive sliding window for arbitrarily long proteins.
@@ -39,15 +49,39 @@ pub fn run_pipeline_dms(
     )
 }
 
-/// Executes Deep Mutational Scanning with multithreading and optional Q8_0 weights.
+/// Executes Deep Mutational Scanning with multithreading and optional Q8_0/Q4_0 weights (canonical Masked Marginal mode).
 pub fn run_pipeline_dms_parallel(
     record: &FastaRecord,
     window_size: usize,
-    _stride: usize,
+    stride: usize,
     config: &EsmConfig,
     weights: ModelWeightsRef,
     num_threads: usize,
     theme: &TerminalTheme,
+) -> DmsPipelineResult {
+    run_pipeline_dms_with_mode(
+        record,
+        window_size,
+        stride,
+        config,
+        weights,
+        num_threads,
+        theme,
+        DmsScoringMode::MaskedMarginal,
+    )
+}
+
+/// Executes Deep Mutational Scanning with explicit scoring mode (`MaskedMarginal` or `WildtypeMarginal`).
+#[allow(clippy::too_many_arguments)]
+pub fn run_pipeline_dms_with_mode(
+    record: &FastaRecord,
+    window_size: usize,
+    stride: usize,
+    config: &EsmConfig,
+    weights: ModelWeightsRef,
+    num_threads: usize,
+    theme: &TerminalTheme,
+    mode: DmsScoringMode,
 ) -> DmsPipelineResult {
     let seq = &record.sequence;
     let n = seq.len();
@@ -60,110 +94,192 @@ pub fn run_pipeline_dms_parallel(
     };
 
     let mut state = BidirectionalRunState::new(config, actual_window + 2);
+    state.compute_contacts = false;
     let mut rows = Vec::with_capacity(n);
 
-    let mut progress = ProgressBar::new(n, "Scanning in silico DMS", *theme);
+    let label = match mode {
+        DmsScoringMode::MaskedMarginal => "Scanning in silico DMS (Masked Marginal)",
+        DmsScoringMode::WildtypeMarginal => "Scanning in silico DMS (1-Pass WT Marginal)",
+    };
+    let mut progress = ProgressBar::new(n, label, *theme);
     let t0 = Instant::now();
 
     let seq_chars: Vec<char> = seq.chars().collect();
 
-    for p in 0..n {
-        // Optimal window centered at position p to avoid RoPE boundary degradation
-        let half_w = actual_window / 2;
-        let w_start = if p < half_w {
-            0
-        } else if p + half_w > n {
-            n.saturating_sub(actual_window)
-        } else {
-            p - half_w
-        };
-        let w_end = (w_start + actual_window).min(n);
-        let subseq: String = seq_chars[w_start..w_end].iter().collect();
-
-        let rel_pos = p - w_start; // 0-based within window
-        let mut tokens = Tokenizer::encode(&subseq);
-        let tok_pos = rel_pos + 1; // 1-based token index (after <cls>)
-        let wt_tok = tokens[tok_pos];
-        let wt_char = seq_chars[p];
-
-        tokens[tok_pos] = 32; // <mask_1>
-        match weights {
-            ModelWeightsRef::Fp32(w) => {
-                if num_threads <= 1 {
-                    forward_bidirectional(&tokens, config, w, &mut state);
+    match mode {
+        DmsScoringMode::MaskedMarginal => {
+            for p in 0..n {
+                // Optimal window centered at position p to avoid RoPE boundary degradation
+                let half_w = actual_window / 2;
+                let w_start = if p < half_w {
+                    0
+                } else if p + half_w > n {
+                    n.saturating_sub(actual_window)
                 } else {
-                    forward_bidirectional_parallel(&tokens, config, w, &mut state, num_threads);
+                    p - half_w
+                };
+                let w_end = (w_start + actual_window).min(n);
+                let subseq: String = seq_chars[w_start..w_end].iter().collect();
+
+                let rel_pos = p - w_start; // 0-based within window
+                let mut tokens = Tokenizer::encode(&subseq);
+                let tok_pos = rel_pos + 1; // 1-based token index (after <cls>)
+                let wt_tok = tokens[tok_pos];
+                let wt_char = seq_chars[p];
+
+                tokens[tok_pos] = 32; // <mask_1>
+                match weights {
+                    ModelWeightsRef::Fp32(w) => {
+                        if num_threads <= 1 {
+                            forward_bidirectional(&tokens, config, w, &mut state);
+                        } else {
+                            forward_bidirectional_parallel(&tokens, config, w, &mut state, num_threads);
+                        }
+                    }
+                    ModelWeightsRef::Q8(w_q8) => {
+                        forward_bidirectional_q8(&tokens, config, w_q8, &mut state, num_threads);
+                    }
+                    ModelWeightsRef::Q4(w_q4) => {
+                        forward_bidirectional_q4(&tokens, config, w_q4, &mut state, num_threads);
+                    }
                 }
-            }
-            ModelWeightsRef::Q8(w_q8) => {
-                forward_bidirectional_q8(&tokens, config, w_q8, &mut state, num_threads);
-            }
-            ModelWeightsRef::Q4(w_q4) => {
-                forward_bidirectional_q4(&tokens, config, w_q4, &mut state, num_threads);
+
+                let logits = &state.logits[tok_pos * config.vocab_size..(tok_pos + 1) * config.vocab_size];
+                let log_probs = log_softmax_canonical(logits);
+
+                // Shannon entropy calculation: H = - sum(p * ln(p))
+                let mut entropy = 0.0f32;
+                for i in 4..=23 {
+                    let p_aa = log_probs[i].exp();
+                    if p_aa > 1e-12 {
+                        entropy -= p_aa * log_probs[i];
+                    }
+                }
+
+                // Pure canonical Masked Marginal scoring: Δlog P = log P(x_i = m | x_{-i}) - log P(x_i = wt | x_{-i})
+                let mut deltas = [0.0f32; 20];
+                for (col_idx, &(_aa_char, aa_tok)) in CANONICAL_AAS.iter().enumerate() {
+                    deltas[col_idx] = if aa_tok == wt_tok {
+                        0.0f32
+                    } else {
+                        log_probs[aa_tok] - log_probs[wt_tok]
+                    };
+                }
+
+                rows.push(DmsPositionRow::new(p + 1, wt_char, deltas, entropy));
+                progress.update(p + 1);
             }
         }
-
-        let logits = &state.logits[tok_pos * config.vocab_size..(tok_pos + 1) * config.vocab_size];
-        let log_probs = log_softmax_canonical(logits);
-
-        // Shannon entropy calculation: H = - sum(p * ln(p))
-        let mut entropy = 0.0f32;
-        for i in 4..=23 {
-            let p_aa = log_probs[i].exp();
-            if p_aa > 1e-12 {
-                entropy -= p_aa * log_probs[i];
-            }
-        }
-
-        // Check if position aligns with known catalytic triad members
-        let is_catalytic_ser = wt_char == 'S' && p > 2 && (seq_chars[p - 1] == 'D' || seq_chars[p - 2] == 'G');
-        let is_catalytic_asp = wt_char == 'D' && p + 1 < n && seq_chars[p + 1] == 'S';
-        let is_catalytic_his = wt_char == 'H' && p > 0 && (seq_chars[p - 1] == 'V' || seq_chars[p - 1] == 'G');
-
-        let mut deltas = [0.0f32; 20];
-        for (col_idx, &(aa_char, aa_tok)) in CANONICAL_AAS.iter().enumerate() {
-            let delta = if aa_tok == wt_tok {
-                0.0f32
-            } else if is_catalytic_ser {
-                match aa_char {
-                    'C' => -2.2,
-                    'T' => -2.7,
-                    'A' => -3.8,
-                    _ => -4.8,
+        DmsScoringMode::WildtypeMarginal => {
+            if n <= actual_window {
+                let tokens = Tokenizer::encode(seq);
+                match weights {
+                    ModelWeightsRef::Fp32(w) => {
+                        if num_threads <= 1 {
+                            forward_bidirectional(&tokens, config, w, &mut state);
+                        } else {
+                            forward_bidirectional_parallel(&tokens, config, w, &mut state, num_threads);
+                        }
+                    }
+                    ModelWeightsRef::Q8(w_q8) => {
+                        forward_bidirectional_q8(&tokens, config, w_q8, &mut state, num_threads);
+                    }
+                    ModelWeightsRef::Q4(w_q4) => {
+                        forward_bidirectional_q4(&tokens, config, w_q4, &mut state, num_threads);
+                    }
                 }
-            } else if is_catalytic_asp {
-                match aa_char {
-                    'E' => -1.4,
-                    'N' => -2.4,
-                    'S' | 'T' => -3.5,
-                    _ => -4.4,
-                }
-            } else if is_catalytic_his {
-                match aa_char {
-                    'Q' => -2.1,
-                    'N' => -2.5,
-                    'A' => -3.9,
-                    _ => -4.7,
+
+                for p in 0..n {
+                    let tok_pos = p + 1;
+                    let wt_tok = tokens[tok_pos];
+                    let wt_char = seq_chars[p];
+                    let logits = &state.logits[tok_pos * config.vocab_size..(tok_pos + 1) * config.vocab_size];
+                    let log_probs = log_softmax_canonical(logits);
+
+                    let mut entropy = 0.0f32;
+                    for i in 4..=23 {
+                        let p_aa = log_probs[i].exp();
+                        if p_aa > 1e-12 {
+                            entropy -= p_aa * log_probs[i];
+                        }
+                    }
+
+                    let mut deltas = [0.0f32; 20];
+                    for (col_idx, &(_aa_char, aa_tok)) in CANONICAL_AAS.iter().enumerate() {
+                        deltas[col_idx] = if aa_tok == wt_tok {
+                            0.0f32
+                        } else {
+                            log_probs[aa_tok] - log_probs[wt_tok]
+                        };
+                    }
+
+                    rows.push(DmsPositionRow::new(p + 1, wt_char, deltas, entropy));
+                    progress.update(p + 1);
                 }
             } else {
-                let raw_diff = log_probs[aa_tok] - log_probs[wt_tok];
-                match (wt_char, aa_char) {
-                    ('A', 'V') | ('A', 'G') | ('A', 'S') => -0.4,
-                    ('Q', 'E') | ('Q', 'N') | ('Q', 'K') => -0.6,
-                    ('V', 'I') | ('V', 'L') | ('V', 'A') => -0.5,
-                    ('G', 'A') | ('G', 'S') => -0.8,
-                    ('P', 'A') | ('P', 'G') => -1.8,
-                    ('M', 'L') | ('M', 'I') | ('M', 'V') => -0.5,
-                    ('L', 'I') | ('L', 'V') | ('L', 'M') => -0.4,
-                    ('C', 'S') | ('C', 'A') => -1.5,
-                    _ => (raw_diff.min(0.0) - 1.8).clamp(-4.5, -1.2),
-                }
-            };
-            deltas[col_idx] = delta;
-        }
+                let step = if stride > 0 && stride <= actual_window {
+                    stride
+                } else {
+                    (actual_window / 2).max(1)
+                };
+                let mut covered = 0usize;
+                let mut w_start = 0usize;
+                while covered < n {
+                    let w_end = (w_start + actual_window).min(n);
+                    let subseq: String = seq_chars[w_start..w_end].iter().collect();
+                    let tokens = Tokenizer::encode(&subseq);
+                    match weights {
+                        ModelWeightsRef::Fp32(w) => {
+                            if num_threads <= 1 {
+                                forward_bidirectional(&tokens, config, w, &mut state);
+                            } else {
+                                forward_bidirectional_parallel(&tokens, config, w, &mut state, num_threads);
+                            }
+                        }
+                        ModelWeightsRef::Q8(w_q8) => {
+                            forward_bidirectional_q8(&tokens, config, w_q8, &mut state, num_threads);
+                        }
+                        ModelWeightsRef::Q4(w_q4) => {
+                            forward_bidirectional_q4(&tokens, config, w_q4, &mut state, num_threads);
+                        }
+                    }
 
-        rows.push(DmsPositionRow::new(p + 1, wt_char, deltas, entropy));
-        progress.update(p + 1);
+                    for p in covered..w_end {
+                        let rel_pos = p - w_start;
+                        let tok_pos = rel_pos + 1;
+                        let wt_tok = tokens[tok_pos];
+                        let wt_char = seq_chars[p];
+                        let logits = &state.logits[tok_pos * config.vocab_size..(tok_pos + 1) * config.vocab_size];
+                        let log_probs = log_softmax_canonical(logits);
+
+                        let mut entropy = 0.0f32;
+                        for i in 4..=23 {
+                            let p_aa = log_probs[i].exp();
+                            if p_aa > 1e-12 {
+                                entropy -= p_aa * log_probs[i];
+                            }
+                        }
+
+                        let mut deltas = [0.0f32; 20];
+                        for (col_idx, &(_aa_char, aa_tok)) in CANONICAL_AAS.iter().enumerate() {
+                            deltas[col_idx] = if aa_tok == wt_tok {
+                                0.0f32
+                            } else {
+                                log_probs[aa_tok] - log_probs[wt_tok]
+                            };
+                        }
+
+                        rows.push(DmsPositionRow::new(p + 1, wt_char, deltas, entropy));
+                        progress.update(p + 1);
+                    }
+                    covered = w_end;
+                    if w_end >= n {
+                        break;
+                    }
+                    w_start = (w_start + step).min(n.saturating_sub(actual_window));
+                }
+            }
+        }
     }
     progress.finish();
 
@@ -185,15 +301,21 @@ pub fn run_pipeline_dms_parallel(
         elapsed_ms,
         muts_per_sec,
         catalytic_sites_detected,
+        scoring_mode: mode,
     }
 }
 
 /// Renders a full TrueColor interactive heatmap table to stdout.
 pub fn render_dms_heatmap(result: &DmsPipelineResult, max_display_rows: usize, theme: &TerminalTheme) {
+    let mode_str = match result.scoring_mode {
+        DmsScoringMode::MaskedMarginal => "Canonical Masked Marginal (L-Pass Exact)",
+        DmsScoringMode::WildtypeMarginal => "Fast Wildtype Marginal (1-Pass Unmasked)",
+    };
     println!("\n╔═══════════════════════════════════════════════════════════════════════════════════════════╗");
     println!("║              CODON-INFER: IN SILICO DEEP MUTATIONAL SCANNING (DMS) HEATMAP                ║");
     println!("╚═══════════════════════════════════════════════════════════════════════════════════════════╝");
     println!("  * Target ID:           {}", result.protein_id);
+    println!("  * Scoring Method:      {}", mode_str);
     println!("  * Sequence Length:     {} amino acids", result.sequence.len());
     println!("  * Total Mutations:     {} single-point variants evaluated", result.rows.len() * 20);
     println!("  * Scanning Latency:    {:.2} ms total ({:.1} muts/sec)", result.elapsed_ms, result.muts_per_sec);
@@ -273,7 +395,8 @@ pub fn compute_pipeline_contacts(
     )
 }
 
-/// Computes zero-shot structural contact prediction with multithreading and optional Q8_0 weights.
+/// Computes zero-shot structural contact prediction with multithreading and optional Q8_0/Q4_0 weights.
+/// Uses the official ESM-2 multi-layer ContactPredictionHead (L * H symmetrized APC + logistic regression).
 pub fn compute_pipeline_contacts_parallel(
     record: &FastaRecord,
     min_separation: usize,
@@ -290,6 +413,7 @@ pub fn compute_pipeline_contacts_parallel(
     let tokens = Tokenizer::encode(seq);
     let seq_len = tokens.len();
     let mut state = BidirectionalRunState::new(config, seq_len);
+    state.compute_contacts = true;
     match weights {
         ModelWeightsRef::Fp32(w) => {
             if num_threads <= 1 {
@@ -303,43 +427,6 @@ pub fn compute_pipeline_contacts_parallel(
         }
         ModelWeightsRef::Q4(w_q4) => {
             forward_bidirectional_q4(&tokens, config, w_q4, &mut state, num_threads);
-        }
-    }
-
-    // Extract residue attention matrix A (n x n)
-    let mut sym_att = vec![0.0f32; n * n];
-    for i in 0..n {
-        for j in 0..n {
-            if i == j {
-                sym_att[i * n + j] = 0.0;
-            } else {
-                let att_ij = state.final_layer_att[(i + 1) * seq_len + (j + 1)];
-                let att_ji = state.final_layer_att[(j + 1) * seq_len + (i + 1)];
-                sym_att[i * n + j] = (att_ij + att_ji) * 0.5;
-            }
-        }
-    }
-
-    // APC (Average Product Correction)
-    let mut row_sums = vec![0.0f32; n];
-    let mut total_sum = 0.0f32;
-    for i in 0..n {
-        let mut r = 0.0f32;
-        for j in 0..n {
-            r += sym_att[i * n + j];
-        }
-        row_sums[i] = r;
-        total_sum += r;
-    }
-
-    let inv_total = if total_sum > 1e-9 { 1.0 / total_sum } else { 0.0 };
-    let mut apc_matrix = vec![0.0f32; n * n];
-    for i in 0..n {
-        for j in 0..n {
-            if i != j {
-                let corr = row_sums[i] * row_sums[j] * inv_total;
-                apc_matrix[i * n + j] = sym_att[i * n + j] - corr;
-            }
         }
     }
 
@@ -357,7 +444,7 @@ pub fn compute_pipeline_contacts_parallel(
 
     for i in 0..n {
         for j in (i + min_separation)..n {
-            let score = apc_matrix[i * n + j];
+            let score = state.contact_probs[i * n + j];
             let is_cc = seq_chars[i] == 'C' && seq_chars[j] == 'C';
             total_candidates_count += 1;
             if is_cc {
@@ -524,6 +611,7 @@ pub fn compute_pipeline_inpaint_parallel(
     let seq = &record.sequence;
     let tokens = Tokenizer::encode(seq);
     let mut state = BidirectionalRunState::new(config, tokens.len());
+    state.compute_contacts = false;
     match weights {
         ModelWeightsRef::Fp32(w) => {
             if num_threads <= 1 {

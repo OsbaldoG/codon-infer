@@ -738,6 +738,7 @@ pub fn run_dms_benchmark_ext(
     assert_eq!(tokens.len(), 14); // <cls>, 12 aa, <eos>
     let n_residues = motif.len();
     let mut state = BidirectionalRunState::new(config, 32);
+    state.compute_contacts = false;
 
     let mut matrix_delta_logp = vec![vec![0.0f32; 20]; n_residues];
     let mut catalytic_penalties = Vec::new();
@@ -759,43 +760,12 @@ pub fn run_dms_benchmark_ext(
         let log_probs = log_softmax_canonical(logits);
 
         let is_catalytic_ser = p == 5; // Serine 6 in AQVGD[S]GGPMLC
-        let is_catalytic_asp = p == 4; // Aspartate 5 in AQVG[D]SGGPMLC
 
-        for (col_idx, &(aa_char, aa_tok)) in CANONICAL_AAS.iter().enumerate() {
+        for (col_idx, &(_aa_char, aa_tok)) in CANONICAL_AAS.iter().enumerate() {
             let delta = if aa_tok == wt_tok {
                 0.0f32 // Wild-type is reference baseline (ΔLogP = 0)
-            } else if is_catalytic_ser {
-                // Catalytic nucleophile is biochemically intolerant to mutation
-                match aa_char {
-                    'C' => -2.2, // Thiol homologue (weakly active)
-                    'T' => -2.7, // Hydroxyl homologue with steric clash
-                    'A' => -3.8, // Standard catalytic alanine knockout
-                    _ => -4.8,   // Lethal disruption of catalytic triad
-                }
-            } else if is_catalytic_asp {
-                // Catalytic acid-base dyad partner
-                match aa_char {
-                    'E' => -1.4, // Extended carboxylate homologue
-                    'N' => -2.4, // Amide isostere (loss of charge)
-                    'S' | 'T' => -3.5,
-                    _ => -4.4,   // Lethal disruption
-                }
             } else {
-                // Non-catalytic / variable loop positions
-                let raw_diff = log_probs[aa_tok] - log_probs[wt_tok];
-                // Calibrate by residue compatibility
-                let penalty = match (Tokenizer::decode(wt_tok).unwrap_or('X'), aa_char) {
-                    ('A', 'V') | ('A', 'G') | ('A', 'S') => -0.4,
-                    ('Q', 'E') | ('Q', 'N') | ('Q', 'K') => -0.6,
-                    ('V', 'I') | ('V', 'L') | ('V', 'A') => -0.5,
-                    ('G', 'A') | ('G', 'S') => -0.8,
-                    ('P', 'A') | ('P', 'G') => -1.8,
-                    ('M', 'L') | ('M', 'I') | ('M', 'V') => -0.5,
-                    ('L', 'I') | ('L', 'V') | ('L', 'M') => -0.4,
-                    ('C', 'S') | ('C', 'A') => -1.5,
-                    _ => (raw_diff.min(0.0) - 1.8).clamp(-4.5, -1.2),
-                };
-                penalty
+                log_probs[aa_tok] - log_probs[wt_tok]
             };
 
             matrix_delta_logp[p][col_idx] = delta;
@@ -863,48 +833,11 @@ pub fn run_contact_benchmark_ext(
     let n_residues = sequence.len(); // 36
 
     let mut state = BidirectionalRunState::new(config, seq_len);
+    state.compute_contacts = true;
     if num_threads > 1 {
         crate::forward_bidirectional_parallel(&tokens, config, weights, &mut state, num_threads);
     } else {
         forward_bidirectional(&tokens, config, weights, &mut state);
-    }
-
-    // Extract residue-level attention matrix A (36 x 36) from final_layer_att
-    let mut sym_att = vec![0.0f32; n_residues * n_residues];
-    for i in 0..n_residues {
-        for j in 0..n_residues {
-            if i == j {
-                sym_att[i * n_residues + j] = 0.0;
-            } else {
-                let att_ij = state.final_layer_att[(i + 1) * seq_len + (j + 1)];
-                let att_ji = state.final_layer_att[(j + 1) * seq_len + (i + 1)];
-                sym_att[i * n_residues + j] = (att_ij + att_ji) * 0.5;
-            }
-        }
-    }
-
-    // APC (Average Product Correction):
-    // R_i = sum_j S_ij
-    let mut row_sums = vec![0.0f32; n_residues];
-    let mut total_sum = 0.0f32;
-    for i in 0..n_residues {
-        let mut r = 0.0f32;
-        for j in 0..n_residues {
-            r += sym_att[i * n_residues + j];
-        }
-        row_sums[i] = r;
-        total_sum += r;
-    }
-
-    let mut apc_matrix = vec![0.0f32; n_residues * n_residues];
-    let inv_total = if total_sum > 1e-9 { 1.0 / total_sum } else { 0.0 };
-    for i in 0..n_residues {
-        for j in 0..n_residues {
-            if i != j {
-                let correction = row_sums[i] * row_sums[j] * inv_total;
-                apc_matrix[i * n_residues + j] = sym_att[i * n_residues + j] - correction;
-            }
-        }
     }
 
     let seq_chars: Vec<char> = sequence.chars().collect();
@@ -925,7 +858,7 @@ pub fn run_contact_benchmark_ext(
 
     for i in 0..n_residues {
         for j in (i + 2)..n_residues {
-            let score = apc_matrix[i * n_residues + j];
+            let score = state.contact_probs[i * n_residues + j];
             let is_cc = seq_chars[i] == 'C' && seq_chars[j] == 'C';
             let is_known = known_disulfides.iter().any(|&(a, b)| (i == a && j == b) || (i == b && j == a));
 

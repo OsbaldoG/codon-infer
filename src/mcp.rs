@@ -2,8 +2,8 @@ use std::io::{self, BufRead, Write};
 use crate::{
     active_simd_backend, compute_pipeline_contacts, compute_pipeline_inpaint,
     contacts_to_json_string, dms_to_json_string, generate_sequence, inpaint_to_json_string,
-    parse_fasta_file, parse_raw_sequence, run_pipeline_dms, EsmConfig, EsmWeights, FastaRecord,
-    RunState, TerminalTheme,
+    parse_fasta_file, parse_raw_sequence, run_pipeline_dms_with_mode, DmsScoringMode, EsmConfig,
+    EsmWeights, FastaRecord, ModelWeightsRef, RunState, TerminalTheme,
 };
 
 /// Escapes special characters for JSON string values (including quotes, backslashes, and control characters).
@@ -172,9 +172,9 @@ pub fn wrap_tool_content(id_raw: &str, text: &str) -> String {
     wrap_jsonrpc_result(id_raw, &payload)
 }
 
-/// Returns the MCP tools/list definition schema exposing version 1.5.0 multi-scale capabilities (8M to 3B).
+/// Returns the MCP tools/list definition schema exposing version 1.7.0 multi-scale capabilities (8M to 3B).
 pub fn get_tools_list_json() -> &'static str {
-    r#"{"tools":[{"name":"generate_protein","description":"Autoregressive de novo protein sequence generation and motif extension via ESM-2 (supports 8M, 35M, 150M, 650M, 3B)","inputSchema":{"type":"object","properties":{"prompt":{"type":"string","description":"Seed amino acid sequence (e.g. 'M', 'MCMPCF')"},"sequence":{"type":"string","description":"Alias for prompt"},"temperature":{"type":"number","description":"Sampling temperature (0.0 = greedy argmax, >0.0 = stochastic, default: 0.7)"},"max_tokens":{"type":"integer","description":"Maximum new amino acid residues to generate"},"seed":{"type":"integer","description":"Optional PRNG seed"}}}},{"name":"codon_infer_inpaint","description":"Bidirectional masked sequence infilling & active-site motif reconstruction using ESM-2 (8M to 3B; use '*' or '<mask_1>' for masked positions)","inputSchema":{"type":"object","properties":{"sequence":{"type":"string","description":"Protein sequence containing masked positions '*' (e.g. 'MCMPC*TTDHQMARKCDD')"},"fasta_path":{"type":"string","description":"Optional path to local FASTA file containing masked sequence"}}}},{"name":"codon_infer_dms","description":"In silico Deep Mutational Scanning (DMS) via sliding window bidirectional evaluation to detect catalytic residues and mutational intolerance (ΔLogP) across multi-scale ESM-2 models (8M to 3B)","inputSchema":{"type":"object","properties":{"sequence":{"type":"string","description":"Protein amino acid sequence to scan"},"fasta_path":{"type":"string","description":"Path to local FASTA file (alternative to sequence)"},"window":{"type":"integer","description":"Sliding window context size (default: 128)"},"stride":{"type":"integer","description":"Sliding window stride step size (default: 64)"}}}},{"name":"codon_infer_contacts","description":"Zero-shot 3D structural contact map prediction and disulfide bridge detection via ESM-2 attention APC correction (8M to 3B)","inputSchema":{"type":"object","properties":{"sequence":{"type":"string","description":"Protein amino acid sequence"},"fasta_path":{"type":"string","description":"Path to local FASTA file (alternative to sequence)"},"min_separation":{"type":"integer","description":"Minimum linear sequence distance |i - j| (default: 6)"},"top_contacts":{"type":"integer","description":"Number of top epistatic contact pairs to return (default: 30)"}}}}]}"#
+    r#"{"tools":[{"name":"generate_protein","description":"Autoregressive de novo protein sequence generation and motif extension via ESM-2 (supports 8M, 35M, 150M, 650M, 3B)","inputSchema":{"type":"object","properties":{"prompt":{"type":"string","description":"Seed amino acid sequence (e.g. 'M', 'MCMPCF')"},"sequence":{"type":"string","description":"Alias for prompt"},"temperature":{"type":"number","description":"Sampling temperature (0.0 = greedy argmax, >0.0 = stochastic, default: 0.7)"},"max_tokens":{"type":"integer","description":"Maximum new amino acid residues to generate"},"seed":{"type":"integer","description":"Optional PRNG seed"}}}},{"name":"codon_infer_inpaint","description":"Bidirectional masked sequence infilling & active-site motif reconstruction using ESM-2 (8M to 3B; use '*' or '<mask_1>' for masked positions)","inputSchema":{"type":"object","properties":{"sequence":{"type":"string","description":"Protein sequence containing masked positions '*' (e.g. 'MCMPC*TTDHQMARKCDD')"},"fasta_path":{"type":"string","description":"Optional path to local FASTA file containing masked sequence"}}}},{"name":"codon_infer_dms","description":"In silico Deep Mutational Scanning (DMS) via canonical Masked Marginal or 1-Pass Wildtype Marginal evaluation (ΔLogP) across multi-scale ESM-2 models (8M to 3B)","inputSchema":{"type":"object","properties":{"sequence":{"type":"string","description":"Protein amino acid sequence to scan"},"fasta_path":{"type":"string","description":"Path to local FASTA file (alternative to sequence)"},"mode":{"type":"string","description":"Scoring mode: 'masked' (canonical L-pass) or 'wt' (fast 1-pass wildtype marginal)"},"window":{"type":"integer","description":"Sliding window context size (default: 128)"},"stride":{"type":"integer","description":"Sliding window stride step size (default: 64)"}}}},{"name":"codon_infer_contacts","description":"Zero-shot 3D structural contact map prediction and disulfide bridge detection via official ESM-2 Multi-Layer Contact Head (APC + Logistic Regression, 8M to 3B)","inputSchema":{"type":"object","properties":{"sequence":{"type":"string","description":"Protein amino acid sequence"},"fasta_path":{"type":"string","description":"Path to local FASTA file (alternative to sequence)"},"min_separation":{"type":"integer","description":"Minimum linear sequence distance |i - j| (default: 6)"},"top_contacts":{"type":"integer","description":"Number of top epistatic contact pairs to return (default: 30)"}}}}]}"#
 }
 
 /// Dispatches a single JSON-RPC message against the ESM-2 runtime and returns the formatted response.
@@ -289,9 +289,22 @@ pub fn handle_jsonrpc_message(
 
                     let window = extract_json_int(msg, "window").unwrap_or(128);
                     let stride = extract_json_int(msg, "stride").unwrap_or(64);
+                    let dms_mode = match extract_json_str(msg, "mode") {
+                        Some("wt") | Some("fast") | Some("wildtype") => DmsScoringMode::WildtypeMarginal,
+                        _ => DmsScoringMode::MaskedMarginal,
+                    };
                     let quiet_theme = TerminalTheme::no_color();
 
-                    let dms_res = run_pipeline_dms(&record, window, stride, config, weights, &quiet_theme);
+                    let dms_res = run_pipeline_dms_with_mode(
+                        &record,
+                        window,
+                        stride,
+                        config,
+                        ModelWeightsRef::Fp32(weights),
+                        1,
+                        &quiet_theme,
+                        dms_mode,
+                    );
                     let inner_json = dms_to_json_string(
                         &dms_res.protein_id,
                         &dms_res.sequence,
