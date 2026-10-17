@@ -2,7 +2,7 @@ use std::io::{self, Write};
 use std::time::Instant;
 use codon_infer::{
     active_simd_backend, export_contacts_csv, export_contacts_json,
-    export_dms_csv, export_dms_json, export_ca_pdb, export_fold_tsv, export_fold_json,
+    export_dms_csv, export_dms_json, export_inpaint_json, export_ca_pdb, export_fold_tsv, export_fold_json,
     generate_sequence_parallel, generate_sequence_q8, generate_sequence_q4,
     parse_fasta_file, parse_raw_sequence, render_dms_heatmap,
     run_pipeline_contacts_parallel, run_pipeline_dms_with_mode,
@@ -60,7 +60,7 @@ fn print_help(theme: &TerminalTheme) {
     println!("    --export-pdb <PATH>      Export reconstructed 3D C_alpha coordinates to PDB (contacts, fold)");
     println!("    --export-tsv <PATH>      Export 3D coordinates table to TSV (fold)");
     println!("    --export-csv <PATH>      Export rectangular analysis matrix to CSV (dms, contacts)");
-    println!("    --export-json <PATH>     Export structured metrics report to JSON (dms, contacts, fold, benchmark)");
+    println!("    --export-json <PATH>     Export structured metrics report to JSON (dms, contacts, inpaint, fold, benchmark)");
     println!("\nSUBCOMMAND EXAMPLES:");
     println!("    codon-infer generate --sequence \"M\" --temperature 0.7 --max-tokens 50 --threads 4");
     println!("    codon-infer generate --sequence \"M\" --model esm2_650m_q4_0.bin --threads 4");
@@ -450,6 +450,7 @@ fn main() -> io::Result<()> {
         "inpaint" => {
             let mut fasta_path: Option<String> = None;
             let mut sequence_arg: Option<String> = None;
+            let mut export_json: Option<String> = None;
             let mut num_threads = global_threads.unwrap_or(default_threads);
             let mut quant_mode = global_quantize;
 
@@ -460,6 +461,9 @@ fn main() -> io::Result<()> {
                     i += 2;
                 } else if (args[i] == "--sequence" || args[i] == "-s") && i + 1 < args.len() {
                     sequence_arg = Some(args[i + 1].clone());
+                    i += 2;
+                } else if args[i] == "--export-json" && i + 1 < args.len() {
+                    export_json = Some(args[i + 1].clone());
                     i += 2;
                 } else if (args[i] == "--threads" || args[i] == "-t") && i + 1 < args.len() {
                     if let Ok(t) = args[i + 1].parse::<usize>() { num_threads = t.max(1); }
@@ -494,7 +498,17 @@ fn main() -> io::Result<()> {
             let record = load_input_record(fasta_path.as_deref(), sequence_arg.as_deref(), "masked_protein")?;
             let (config, loaded_weights) = load_model_weights(&model_path, quant_mode)?;
 
-            run_pipeline_inpaint_parallel(&record, &config, loaded_weights.as_ref(), num_threads, &theme);
+            let inpaint_res = run_pipeline_inpaint_parallel(&record, &config, loaded_weights.as_ref(), num_threads, &theme);
+            if let Some(ref json_path) = export_json {
+                export_inpaint_json(
+                    json_path,
+                    &inpaint_res.protein_id,
+                    &inpaint_res.original_sequence,
+                    &inpaint_res.reconstructed_sequence,
+                    &inpaint_res.sites,
+                )?;
+                println!("  [EXPORT] Inpainting reconstruction JSON saved to '{}'.", json_path);
+            }
             Ok(())
         }
 

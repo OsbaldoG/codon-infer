@@ -72,7 +72,7 @@ case "${TARGET,,}" in
         ;;
     3b-fp32|3b-q8)
         echo "==> Notice: Due to GitHub's 2.0 GiB release asset limit, full FP32/Q8 checkpoints (>2.0 GiB) are not hosted on GitHub Releases."
-        echo "    Use esm2_3b_q4_0.bin (1.68 GiB, hosted in v1.6.0) or export locally with scripts/export_weights.py."
+        echo "    Use esm2_3b_q4_0.bin (1.68 GiB, hosted in ${WEIGHTS_TAG}) or export locally with scripts/export_weights.py."
         ;;
     all)
         download_file "esm2_8m_weights.bin"
@@ -81,7 +81,7 @@ case "${TARGET,,}" in
         download_file "esm2_650m_q8_0.bin"
         download_file "esm2_650m_q4_0.bin"
         download_file "esm2_3b_q4_0.bin"
-        echo "==> Note: All release v1.6.0 models downloaded successfully."
+        echo "==> Note: All release ${WEIGHTS_TAG} models downloaded successfully."
         ;;
     -h|--help|help)
         show_help 0

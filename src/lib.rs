@@ -31,7 +31,7 @@ pub use ui::TerminalTheme;
 pub use fasta::{FastaRecord, parse_fasta_file, parse_raw_sequence};
 pub use export::{
     DmsPositionRow, export_dms_csv, export_dms_json, export_contacts_csv, export_contacts_json,
-    dms_to_json_string, contacts_to_json_string, inpaint_to_json_string,
+    dms_to_json_string, contacts_to_json_string, inpaint_to_json_string, export_inpaint_json,
     aa1_to_aa3, coords_to_pdb_string, export_ca_pdb, export_fold_tsv, fold_to_json_string, export_fold_json,
 };
 pub use pipeline::{

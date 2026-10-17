@@ -45,8 +45,49 @@ fn find_unescaped_quote(s: &str) -> Option<usize> {
     None
 }
 
-/// Extracts a string value from a JSON snippet given a key, respecting escaped quotes (`\"`).
-pub fn extract_json_str<'a>(json: &'a str, key: &str) -> Option<&'a str> {
+/// Unescapes a JSON string slice (converting `\"`, `\\`, `\/`, `\b`, `\f`, `\n`, `\r`, `\t`, and `\uXXXX`).
+pub fn unescape_json_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('"') => out.push('"'),
+                Some('\\') => out.push('\\'),
+                Some('/') => out.push('/'),
+                Some('b') => out.push('\x08'),
+                Some('f') => out.push('\x0c'),
+                Some('n') => out.push('\n'),
+                Some('r') => out.push('\r'),
+                Some('t') => out.push('\t'),
+                Some('u') => {
+                    let mut hex = String::with_capacity(4);
+                    for _ in 0..4 {
+                        if let Some(hc) = chars.next() {
+                            hex.push(hc);
+                        }
+                    }
+                    if let Ok(code) = u32::from_str_radix(&hex, 16) {
+                        if let Some(decoded) = char::from_u32(code) {
+                            out.push(decoded);
+                        }
+                    }
+                }
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Extracts and unescapes a string value from a JSON snippet given a key, respecting escaped quotes (`\"`).
+pub fn extract_json_str(json: &str, key: &str) -> Option<String> {
     let mut pattern = String::with_capacity(key.len() + 2);
     pattern.push('"');
     pattern.push_str(key);
@@ -62,7 +103,7 @@ pub fn extract_json_str<'a>(json: &'a str, key: &str) -> Option<&'a str> {
     }
     let content = &after_colon[1..];
     let end_quote = find_unescaped_quote(content)?;
-    Some(&content[..end_quote])
+    Some(unescape_json_str(&content[..end_quote]))
 }
 
 /// Extracts a raw token (number, boolean, null, or string) from a JSON snippet given a key.
@@ -125,7 +166,7 @@ pub fn extract_json_f32(json: &str, key: &str) -> Option<f32> {
 }
 
 /// Extracts tool name from a tools/call request.
-pub fn extract_tool_name(json: &str) -> Option<&str> {
+pub fn extract_tool_name(json: &str) -> Option<String> {
     if let Some(params_pos) = json.find("\"params\"") {
         extract_json_str(&json[params_pos..], "name")
     } else {
@@ -136,7 +177,7 @@ pub fn extract_tool_name(json: &str) -> Option<&str> {
 /// Resolves an input protein record from JSON arguments (either via 'fasta_path' or 'sequence'/'prompt').
 pub fn resolve_mcp_record(json: &str, default_id: &str) -> io::Result<FastaRecord> {
     if let Some(fasta_path) = extract_json_str(json, "fasta_path").or_else(|| extract_json_str(json, "fasta")) {
-        let records = parse_fasta_file(fasta_path)?;
+        let records = parse_fasta_file(&fasta_path)?;
         if let Some(first) = records.into_iter().next() {
             return Ok(first);
         } else {
@@ -147,7 +188,7 @@ pub fn resolve_mcp_record(json: &str, default_id: &str) -> io::Result<FastaRecor
         }
     }
     if let Some(seq) = extract_json_str(json, "sequence").or_else(|| extract_json_str(json, "prompt")) {
-        let rec = parse_raw_sequence(seq, default_id);
+        let rec = parse_raw_sequence(&seq, default_id);
         if rec.sequence.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -217,7 +258,7 @@ pub fn handle_jsonrpc_message(
         return None;
     }
 
-    let response = match method {
+    let response = match method.as_str() {
         "initialize" => {
             let mut res = String::from(
                 r#"{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"codon-infer","version":""#,
@@ -235,19 +276,19 @@ pub fn handle_jsonrpc_message(
                     return Some(wrap_jsonrpc_error(id_raw, -32603, "Model weights not loaded"));
                 }
             };
-            let tool_name = extract_tool_name(msg).unwrap_or("generate_protein");
+            let tool_name = extract_tool_name(msg).unwrap_or_else(|| "generate_protein".to_string());
 
-            match tool_name {
+            match tool_name.as_str() {
                 "generate_protein" | "codon_infer_generate" => {
                     let prompt = extract_json_str(msg, "prompt")
                         .or_else(|| extract_json_str(msg, "sequence"))
-                        .unwrap_or("M");
+                        .unwrap_or_else(|| "M".to_string());
                     let temperature = extract_json_f32(msg, "temperature").unwrap_or(0.7);
                     let max_tokens = extract_json_int(msg, "max_tokens");
                     let seed = extract_json_int(msg, "seed").map(|s| s as u64).unwrap_or(42);
 
                     let metrics = generate_sequence(
-                        prompt,
+                        &prompt,
                         temperature,
                         max_tokens,
                         seed,
@@ -312,7 +353,7 @@ pub fn handle_jsonrpc_message(
 
                     let window = extract_json_int(msg, "window").unwrap_or(128);
                     let stride = extract_json_int(msg, "stride").unwrap_or(64);
-                    let dms_mode = match extract_json_str(msg, "mode") {
+                    let dms_mode = match extract_json_str(msg, "mode").as_deref() {
                         Some("wt") | Some("fast") | Some("wildtype") => DmsScoringMode::WildtypeMarginal,
                         _ => DmsScoringMode::MaskedMarginal,
                     };
@@ -394,7 +435,7 @@ pub fn handle_jsonrpc_message(
 
                     let pdb_string = coords_to_pdb_string(&fold_res.sequence, &fold_res.protein_id, &fold_res.coords);
 
-                    if let Some(path) = export_pdb_path {
+                    if let Some(ref path) = export_pdb_path {
                         if let Err(e) = std::fs::write(path, &pdb_string) {
                             return Some(wrap_jsonrpc_error(
                                 id_raw,
@@ -482,9 +523,9 @@ mod tests {
     fn test_mcp_json_parser_and_formatter() {
         let req = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"codon_infer_inpaint","arguments":{"sequence":"MCMPC*TTD","window":128,"top_l":1.5}}}"#;
         assert_eq!(extract_json_raw_value(req, "id"), Some("1"));
-        assert_eq!(extract_json_str(req, "method"), Some("tools/call"));
-        assert_eq!(extract_tool_name(req), Some("codon_infer_inpaint"));
-        assert_eq!(extract_json_str(req, "sequence"), Some("MCMPC*TTD"));
+        assert_eq!(extract_json_str(req, "method").as_deref(), Some("tools/call"));
+        assert_eq!(extract_tool_name(req).as_deref(), Some("codon_infer_inpaint"));
+        assert_eq!(extract_json_str(req, "sequence").as_deref(), Some("MCMPC*TTD"));
         assert_eq!(extract_json_int(req, "window"), Some(128));
         assert_eq!(extract_json_f32(req, "top_l"), Some(1.5));
 
@@ -492,9 +533,10 @@ mod tests {
         assert!(wrapped.contains(r#"result":{"ok":true}"#));
 
         let escaped_req = r#"{"id":"req\"42","fasta_path":"path\\to\\file\"quoted\".fasta"}"#;
-        assert_eq!(extract_json_str(escaped_req, "id"), Some(r#"req\"42"#));
-        assert_eq!(extract_json_str(escaped_req, "fasta_path"), Some(r#"path\\to\\file\"quoted\".fasta"#));
+        assert_eq!(extract_json_str(escaped_req, "id").as_deref(), Some("req\"42"));
+        assert_eq!(extract_json_str(escaped_req, "fasta_path").as_deref(), Some("path\\to\\file\"quoted\".fasta"));
         assert_eq!(escape_json_str("a\"b\\c\nd\x01"), "a\\\"b\\\\c\\nd\\u0001");
+        assert_eq!(unescape_json_str("a\\\"b\\\\c\\nd\\u0001"), "a\"b\\c\nd\x01");
     }
 
     #[test]

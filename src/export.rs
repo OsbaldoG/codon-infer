@@ -235,6 +235,21 @@ pub fn inpaint_to_json_string(
     out
 }
 
+/// Exports inpainting motif reconstruction results to a JSON file.
+pub fn export_inpaint_json(
+    path: &str,
+    protein_id: &str,
+    original_sequence: &str,
+    reconstructed_sequence: &str,
+    sites: &[crate::pipeline::InpaintSite],
+) -> io::Result<()> {
+    let mut file = File::create(path)?;
+    let json = inpaint_to_json_string(protein_id, original_sequence, reconstructed_sequence, sites);
+    file.write_all(json.as_bytes())?;
+    file.flush()?;
+    Ok(())
+}
+
 /// Converts standard single-letter amino acid code to three-letter IUPAC representation.
 pub fn aa1_to_aa3(aa: char) -> &'static str {
     match aa.to_ascii_uppercase() {

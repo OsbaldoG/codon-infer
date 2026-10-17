@@ -6,7 +6,7 @@
 
 [![Rust](https://img.shields.io/badge/rust-edición_2024-orange.svg)](https://www.rust-lang.org/)
 [![Version](https://img.shields.io/badge/versión-1.8.0-blue.svg)](https://github.com/OsbaldoG/codon-infer/releases/tag/v1.8.0)
-[![Tests](https://img.shields.io/badge/tests-56%20pasados%2C%200%20fallidos%2C%201%20ignorado-brightgreen.svg)](#3-ejecución-de-la-suite-de-pruebas)
+[![Tests](https://img.shields.io/badge/tests-57%20ejecutados%3A%2056%20pasados%2C%200%20fallidos%2C%201%20ignorado-brightgreen.svg)](#3-ejecución-de-la-suite-de-pruebas)
 [![Dependencies](https://img.shields.io/badge/dependencias-0%20(std%20puro)-brightgreen.svg)](Cargo.toml)
 [![License](https://img.shields.io/badge/licencia-MIT-blue.svg)](LICENSE)
 [![Model](https://img.shields.io/badge/modelo-ESM--2%20(8M%20a%203B)-blueviolet.svg)](https://github.com/facebookresearch/esm)
@@ -318,7 +318,7 @@ Evaluación empírica en `test_peptidase.fasta` (41 tokens) frente a los tensore
 | | **Q4_0** | **`1,801,205,956 B` (1.68 GiB)** | **6.30×** | **0.994156** | **0.999422** | **0.006447** | **100.0% (41/41)** | **19,368.89 ms** | **2.12 tok/s** | **1,752.57 MiB** |
 
 > [!NOTE]
-> **Notas de Fidelidad, Tiled GEMM y Generación de Referencias (`docs/benchmarks_v1.6.0.md` y `docs/SPEC_CI1_BIO1_STRUCT1_V1_7_0.md`):**
+> **Notas de Fidelidad, Tiled GEMM y Generación de Referencias (`docs/benchmarks_v1.6.0.md` y `docs/Q4_0_SPEC.md`):**
 > 1. **Paridad Exacta con HuggingFace:** En todos los modelos FP32 (`8M` a `650M`), `codon-infer` reproduce los `hidden_states` capa a capa y los `logits` finales de HuggingFace `facebook/esm2_*` con similitud de coseno ≥ 0.999999 y **100.0% de coincidencia Top-1**. Los archivos de referencia `.npz` (`scripts/ref_*.npz`) pueden generarse localmente con `python3 scripts/generate_ref_8m.py` o `scripts/colab_export_esm2.ipynb` (las pruebas de regresión omiten automáticamente los archivos `.npz` opcionales si no están presentes en un clon limpio).
 > 2. **ESM-2 3B en RAM Convencional:** El cuantizador por streaming (`12.55 MiB` Peak RSS) comprime los 10.58 GiB de `esm2_3b_weights.bin` a un binario `Q4_0` de `1.68 GiB` (`1,801,205,956 B`) que carga en **545 ms** y se ejecuta en **1,752.57 MiB Peak RSS** con **0.999422 de coseno de logits** y **100.0% de coincidencia Top-1** frente a HuggingFace `esm2_t36_3B_UR50D`.
 > 3. **Línea Base GEMV Monotoken vs. Motor Tiled GEMM Multi-Token (`CI-1`):** Las latencias de la tabla anterior corresponden a la línea base GEMV monotoken previa al tiling (`docs/benchmarks_v1.6.0.md`). Con el motor **Multi-Token Tiled GEMM (`CI-1`)** de v1.7.0/v1.8.0 (`M_r = 4`), las pasadas bidireccionales alcanzan una aceleración adicional de **3.76× en FP32** y **2.41×–3.44× en Q8_0/Q4_0** manteniendo paridad matemática exacta ($\cos = 1.00000000$).
@@ -453,7 +453,7 @@ Valide las primitivas numéricas, la paridad de vectorización SIMD, el parser F
 ```bash
 cargo test --release
 ```
-Salida esperada:
+Salida esperada (**57 tests ejecutados: 56 pasados, 0 fallidos, 1 ignorado**):
 ```text
 running 57 tests
 test benchmark::tests::test_benchmark_report_to_json_validity ... ok

@@ -4,7 +4,7 @@ fn main() -> std::io::Result<()> {
 
     let mut i = 1;
     while i < args.len() {
-        if args[i] == "--model" && i + 1 < args.len() {
+        if (args[i] == "--model" || args[i] == "-m") && i + 1 < args.len() {
             model_arg = Some(args[i + 1].clone());
             i += 2;
         } else {
