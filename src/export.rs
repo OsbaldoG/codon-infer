@@ -358,6 +358,17 @@ pub fn fold_to_json_string(
     out.push_str(&format!("  \"solve_ms\": {:.2},\n", result.solve_ms));
     out.push_str(&format!("  \"total_ms\": {:.2},\n", result.forward_ms + result.solve_ms));
 
+    if let Some(ref m) = result.sidechain_metrics {
+        out.push_str("  \"sidechain_packing\": {\n");
+        out.push_str(&format!("    \"initial_clashscore\": {:.2},\n", m.initial_clashscore));
+        out.push_str(&format!("    \"final_clashscore\": {:.2},\n", m.final_clashscore));
+        out.push_str(&format!("    \"clash_reduction_pct\": {:.2},\n", m.clash_reduction_pct));
+        out.push_str(&format!("    \"pruned_states\": {},\n", m.pruned_states));
+        out.push_str(&format!("    \"total_atoms\": {},\n", m.total_atoms));
+        out.push_str(&format!("    \"pack_time_ms\": {:.2}\n", m.pack_time_ms));
+        out.push_str("  },\n");
+    }
+
     // Coordinates array
     out.push_str("  \"coordinates\": [\n");
     for (i, (ch, pt)) in result.sequence.chars().zip(result.coords.iter()).enumerate() {
@@ -386,7 +397,11 @@ pub fn export_fold_json(
     path: &str,
     result: &crate::pipeline::FoldPipelineResult,
 ) -> io::Result<()> {
-    let pdb_content = coords_to_pdb_string(&result.sequence, &result.protein_id, &result.coords);
+    let pdb_content = if let Some(ref allatom) = result.allatom_residues {
+        coords_to_allatom_pdb_string(&result.protein_id, allatom)
+    } else {
+        coords_to_pdb_string(&result.sequence, &result.protein_id, &result.coords)
+    };
     let json = fold_to_json_string(result, &pdb_content);
     let mut file = File::create(path)?;
     file.write_all(json.as_bytes())?;
@@ -481,6 +496,8 @@ impl Vec3 {
     pub fn sub(self, o: Self) -> Self { Vec3([self.0[0] - o.0[0], self.0[1] - o.0[1], self.0[2] - o.0[2]]) }
     #[inline(always)]
     pub fn scale(self, s: f64) -> Self { Vec3([self.0[0] * s, self.0[1] * s, self.0[2] * s]) }
+    #[inline(always)]
+    pub fn dist(self, o: Self) -> f64 { self.sub(o).norm() }
 }
 
 /// Converts standard three-letter IUPAC representation to single-letter amino acid code.
@@ -495,7 +512,40 @@ pub fn aa3_to_aa1(res3: &str) -> char {
     }
 }
 
-/// Represents a fully reconstructed amino acid residue with all backbone heavy atoms (N, CA, C, O) and C_beta.
+/// Heavy atom within a sidechain residue beyond C_beta (STRUCT-4).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SideChainAtom {
+    pub name: [u8; 4],
+    pub pos: [f64; 3],
+    pub element: u8, // b'C', b'N', b'O', b'S'
+}
+
+impl Default for SideChainAtom {
+    fn default() -> Self {
+        Self {
+            name: [b' '; 4],
+            pos: [0.0; 3],
+            element: b'C',
+        }
+    }
+}
+
+impl SideChainAtom {
+    pub fn new(name: &str, pos: [f64; 3], element: u8) -> Self {
+        let mut b = [b' '; 4];
+        let bytes = name.as_bytes();
+        let len = bytes.len().min(4);
+        b[..len].copy_from_slice(&bytes[..len]);
+        Self { name: b, pos, element }
+    }
+
+    pub fn name_str(&self) -> &str {
+        std::str::from_utf8(&self.name).unwrap_or("XXXX").trim()
+    }
+}
+
+/// Represents a fully reconstructed amino acid residue with all backbone heavy atoms (N, CA, C, O),
+/// C_beta, and full sidechain heavy atoms (STRUCT-3/4).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ReconstructedResidue {
     pub res_name: [u8; 3],
@@ -505,6 +555,8 @@ pub struct ReconstructedResidue {
     pub c: [f64; 3],
     pub o: [f64; 3],
     pub cb: Option<[f64; 3]>,
+    pub sidechain_len: u8,
+    pub sidechain_atoms: [SideChainAtom; 10],
 }
 
 impl Default for ReconstructedResidue {
@@ -517,7 +569,862 @@ impl Default for ReconstructedResidue {
             c: [0.0; 3],
             o: [0.0; 3],
             cb: None,
+            sidechain_len: 0,
+            sidechain_atoms: [SideChainAtom::default(); 10],
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct RotamerAngles {
+    pub chi1: f64, // radians
+    pub chi2: f64, // radians
+    pub chi3: f64, // radians
+    pub chi4: f64, // radians
+    pub prob: f64, // intrinsic probability [0.0, 1.0]
+}
+
+pub fn get_rotamer_candidates(res_name: &str) -> &'static [RotamerAngles] {
+    match res_name {
+        "VAL" => &[
+            RotamerAngles { chi1: 3.14159, chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.75 }, // trans (180°)
+            RotamerAngles { chi1: -1.0472, chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.15 }, // gauche- (-60°)
+            RotamerAngles { chi1: 1.0472,  chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.10 }, // gauche+ (+60°)
+        ],
+        "LEU" => &[
+            RotamerAngles { chi1: -1.1345, chi2: 3.0543, chi3: 0.0, chi4: 0.0, prob: 0.58 }, // g-, t
+            RotamerAngles { chi1: -1.1345, chi2: 1.1345, chi3: 0.0, chi4: 0.0, prob: 0.15 }, // g-, g+
+            RotamerAngles { chi1: 3.0543,  chi2: 1.1345, chi3: 0.0, chi4: 0.0, prob: 0.13 }, // t, g+
+            RotamerAngles { chi1: 3.0543,  chi2: 3.0543, chi3: 0.0, chi4: 0.0, prob: 0.08 }, // t, t
+            RotamerAngles { chi1: 1.1345,  chi2: 1.1345, chi3: 0.0, chi4: 0.0, prob: 0.04 }, // g+, g+
+            RotamerAngles { chi1: 1.1345,  chi2: 3.0543, chi3: 0.0, chi4: 0.0, prob: 0.02 }, // g+, t
+        ],
+        "ILE" => &[
+            RotamerAngles { chi1: -1.0472, chi2: 2.9670, chi3: 0.0, chi4: 0.0, prob: 0.60 }, // g-, t
+            RotamerAngles { chi1: 2.9670,  chi2: 2.9670, chi3: 0.0, chi4: 0.0, prob: 0.16 }, // t, t
+            RotamerAngles { chi1: -1.0472, chi2: -1.0472,chi3: 0.0, chi4: 0.0, prob: 0.12 }, // g-, g-
+            RotamerAngles { chi1: 2.9670,  chi2: -1.0472,chi3: 0.0, chi4: 0.0, prob: 0.06 }, // t, g-
+            RotamerAngles { chi1: 1.0472,  chi2: 2.9670, chi3: 0.0, chi4: 0.0, prob: 0.04 }, // g+, t
+            RotamerAngles { chi1: 1.0472,  chi2: -1.0472,chi3: 0.0, chi4: 0.0, prob: 0.02 }, // g+, g-
+        ],
+        "SER" => &[
+            RotamerAngles { chi1: -1.0472, chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.45 },
+            RotamerAngles { chi1: 3.14159, chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.35 },
+            RotamerAngles { chi1: 1.0472,  chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.20 },
+        ],
+        "THR" => &[
+            RotamerAngles { chi1: -1.0472, chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.48 },
+            RotamerAngles { chi1: 3.14159, chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.45 },
+            RotamerAngles { chi1: 1.0472,  chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.07 },
+        ],
+        "CYS" => &[
+            RotamerAngles { chi1: -1.0472, chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.50 },
+            RotamerAngles { chi1: 3.14159, chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.35 },
+            RotamerAngles { chi1: 1.0472,  chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.15 },
+        ],
+        "MET" => &[
+            RotamerAngles { chi1: -1.1345, chi2: 3.14159, chi3: 3.14159, chi4: 0.0, prob: 0.40 },
+            RotamerAngles { chi1: -1.1345, chi2: -1.1345, chi3: 3.14159, chi4: 0.0, prob: 0.20 },
+            RotamerAngles { chi1: 3.14159, chi2: 3.14159, chi3: 3.14159, chi4: 0.0, prob: 0.15 },
+            RotamerAngles { chi1: 3.14159, chi2: -1.1345, chi3: 3.14159, chi4: 0.0, prob: 0.10 },
+            RotamerAngles { chi1: -1.1345, chi2: 1.1345,  chi3: 3.14159, chi4: 0.0, prob: 0.08 },
+            RotamerAngles { chi1: 1.1345,  chi2: 3.14159, chi3: 3.14159, chi4: 0.0, prob: 0.07 },
+        ],
+        "ASP" => &[
+            RotamerAngles { chi1: -1.1345, chi2: -0.5236, chi3: 0.0, chi4: 0.0, prob: 0.35 },
+            RotamerAngles { chi1: -1.1345, chi2: 0.5236,  chi3: 0.0, chi4: 0.0, prob: 0.30 },
+            RotamerAngles { chi1: 3.14159, chi2: -0.5236, chi3: 0.0, chi4: 0.0, prob: 0.15 },
+            RotamerAngles { chi1: 3.14159, chi2: 0.5236,  chi3: 0.0, chi4: 0.0, prob: 0.10 },
+            RotamerAngles { chi1: 1.1345,  chi2: -0.5236, chi3: 0.0, chi4: 0.0, prob: 0.05 },
+            RotamerAngles { chi1: 1.1345,  chi2: 0.5236,  chi3: 0.0, chi4: 0.0, prob: 0.05 },
+        ],
+        "ASN" => &[
+            RotamerAngles { chi1: -1.1345, chi2: -0.3491, chi3: 0.0, chi4: 0.0, prob: 0.35 },
+            RotamerAngles { chi1: -1.1345, chi2: 0.3491,  chi3: 0.0, chi4: 0.0, prob: 0.30 },
+            RotamerAngles { chi1: 3.14159, chi2: -0.3491, chi3: 0.0, chi4: 0.0, prob: 0.15 },
+            RotamerAngles { chi1: 3.14159, chi2: 0.3491,  chi3: 0.0, chi4: 0.0, prob: 0.10 },
+            RotamerAngles { chi1: 1.1345,  chi2: -0.3491, chi3: 0.0, chi4: 0.0, prob: 0.05 },
+            RotamerAngles { chi1: 1.1345,  chi2: 0.3491,  chi3: 0.0, chi4: 0.0, prob: 0.05 },
+        ],
+        "GLU" => &[
+            RotamerAngles { chi1: -1.1345, chi2: 3.14159, chi3: 0.0, chi4: 0.0, prob: 0.35 },
+            RotamerAngles { chi1: -1.1345, chi2: -1.1345, chi3: 0.0, chi4: 0.0, prob: 0.25 },
+            RotamerAngles { chi1: 3.14159, chi2: 3.14159, chi3: 0.0, chi4: 0.0, prob: 0.15 },
+            RotamerAngles { chi1: 3.14159, chi2: -1.1345, chi3: 0.0, chi4: 0.0, prob: 0.10 },
+            RotamerAngles { chi1: -1.1345, chi2: 1.1345,  chi3: 0.0, chi4: 0.0, prob: 0.08 },
+            RotamerAngles { chi1: 1.1345,  chi2: 3.14159, chi3: 0.0, chi4: 0.0, prob: 0.07 },
+        ],
+        "GLN" => &[
+            RotamerAngles { chi1: -1.1345, chi2: 3.14159, chi3: 0.0, chi4: 0.0, prob: 0.35 },
+            RotamerAngles { chi1: -1.1345, chi2: -1.1345, chi3: 0.0, chi4: 0.0, prob: 0.25 },
+            RotamerAngles { chi1: 3.14159, chi2: 3.14159, chi3: 0.0, chi4: 0.0, prob: 0.15 },
+            RotamerAngles { chi1: 3.14159, chi2: -1.1345, chi3: 0.0, chi4: 0.0, prob: 0.10 },
+            RotamerAngles { chi1: -1.1345, chi2: 1.1345,  chi3: 0.0, chi4: 0.0, prob: 0.08 },
+            RotamerAngles { chi1: 1.1345,  chi2: 3.14159, chi3: 0.0, chi4: 0.0, prob: 0.07 },
+        ],
+        "LYS" => &[
+            RotamerAngles { chi1: -1.1345, chi2: 3.14159, chi3: 3.14159, chi4: 3.14159, prob: 0.40 },
+            RotamerAngles { chi1: -1.1345, chi2: -1.1345, chi3: 3.14159, chi4: 3.14159, prob: 0.20 },
+            RotamerAngles { chi1: 3.14159, chi2: 3.14159, chi3: 3.14159, chi4: 3.14159, prob: 0.15 },
+            RotamerAngles { chi1: 3.14159, chi2: -1.1345, chi3: 3.14159, chi4: 3.14159, prob: 0.10 },
+            RotamerAngles { chi1: -1.1345, chi2: 1.1345,  chi3: 3.14159, chi4: 3.14159, prob: 0.08 },
+            RotamerAngles { chi1: 1.1345,  chi2: 3.14159, chi3: 3.14159, chi4: 3.14159, prob: 0.07 },
+        ],
+        "ARG" => &[
+            RotamerAngles { chi1: -1.1345, chi2: 3.14159, chi3: 3.14159, chi4: 3.14159, prob: 0.40 },
+            RotamerAngles { chi1: -1.1345, chi2: -1.1345, chi3: 3.14159, chi4: 3.14159, prob: 0.20 },
+            RotamerAngles { chi1: 3.14159, chi2: 3.14159, chi3: 3.14159, chi4: 3.14159, prob: 0.15 },
+            RotamerAngles { chi1: 3.14159, chi2: -1.1345, chi3: 3.14159, chi4: 3.14159, prob: 0.10 },
+            RotamerAngles { chi1: -1.1345, chi2: 1.1345,  chi3: 3.14159, chi4: 3.14159, prob: 0.08 },
+            RotamerAngles { chi1: 1.1345,  chi2: 3.14159, chi3: 3.14159, chi4: 3.14159, prob: 0.07 },
+        ],
+        "PHE" => &[
+            RotamerAngles { chi1: -1.1345, chi2: 1.3963, chi3: 0.0, chi4: 0.0, prob: 0.45 },
+            RotamerAngles { chi1: -1.1345, chi2: 1.7453, chi3: 0.0, chi4: 0.0, prob: 0.25 },
+            RotamerAngles { chi1: 3.14159, chi2: 1.3963, chi3: 0.0, chi4: 0.0, prob: 0.15 },
+            RotamerAngles { chi1: 3.14159, chi2: 1.7453, chi3: 0.0, chi4: 0.0, prob: 0.10 },
+            RotamerAngles { chi1: 1.1345,  chi2: 1.3963, chi3: 0.0, chi4: 0.0, prob: 0.03 },
+            RotamerAngles { chi1: 1.1345,  chi2: 1.7453, chi3: 0.0, chi4: 0.0, prob: 0.02 },
+        ],
+        "TYR" => &[
+            RotamerAngles { chi1: -1.1345, chi2: 1.3963, chi3: 0.0, chi4: 0.0, prob: 0.45 },
+            RotamerAngles { chi1: -1.1345, chi2: 1.7453, chi3: 0.0, chi4: 0.0, prob: 0.25 },
+            RotamerAngles { chi1: 3.14159, chi2: 1.3963, chi3: 0.0, chi4: 0.0, prob: 0.15 },
+            RotamerAngles { chi1: 3.14159, chi2: 1.7453, chi3: 0.0, chi4: 0.0, prob: 0.10 },
+            RotamerAngles { chi1: 1.1345,  chi2: 1.3963, chi3: 0.0, chi4: 0.0, prob: 0.03 },
+            RotamerAngles { chi1: 1.1345,  chi2: 1.7453, chi3: 0.0, chi4: 0.0, prob: 0.02 },
+        ],
+        "TRP" => &[
+            RotamerAngles { chi1: -1.1345, chi2: -1.5708, chi3: 0.0, chi4: 0.0, prob: 0.45 },
+            RotamerAngles { chi1: -1.1345, chi2: 1.5708,  chi3: 0.0, chi4: 0.0, prob: 0.25 },
+            RotamerAngles { chi1: 3.14159, chi2: -1.5708, chi3: 0.0, chi4: 0.0, prob: 0.15 },
+            RotamerAngles { chi1: 3.14159, chi2: 1.5708,  chi3: 0.0, chi4: 0.0, prob: 0.10 },
+            RotamerAngles { chi1: 1.1345,  chi2: -1.5708, chi3: 0.0, chi4: 0.0, prob: 0.03 },
+            RotamerAngles { chi1: 1.1345,  chi2: 1.5708,  chi3: 0.0, chi4: 0.0, prob: 0.02 },
+        ],
+        "HIS" => &[
+            RotamerAngles { chi1: -1.1345, chi2: -1.3090, chi3: 0.0, chi4: 0.0, prob: 0.40 },
+            RotamerAngles { chi1: -1.1345, chi2: 1.3090,  chi3: 0.0, chi4: 0.0, prob: 0.30 },
+            RotamerAngles { chi1: 3.14159, chi2: -1.3090, chi3: 0.0, chi4: 0.0, prob: 0.15 },
+            RotamerAngles { chi1: 3.14159, chi2: 1.3090,  chi3: 0.0, chi4: 0.0, prob: 0.10 },
+            RotamerAngles { chi1: 1.1345,  chi2: -1.3090, chi3: 0.0, chi4: 0.0, prob: 0.03 },
+            RotamerAngles { chi1: 1.1345,  chi2: 1.3090,  chi3: 0.0, chi4: 0.0, prob: 0.02 },
+        ],
+        "PRO" => &[
+            RotamerAngles { chi1: -0.4363, chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.65 }, // Cgamma-endo
+            RotamerAngles { chi1: 0.4363,  chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.35 }, // Cgamma-exo
+        ],
+        _ => &[],
+    }
+}
+
+pub fn nerf_place_atom(a: Vec3, b: Vec3, c: Vec3, l: f64, theta: f64, chi: f64) -> Vec3 {
+    let bc = c.sub(b).normalize();
+    let ab = b.sub(a).normalize();
+    let mut n = ab.cross(bc);
+    if n.norm() < 1e-8 {
+        n = Vec3::new(1.0, 0.0, 0.0).cross(bc);
+        if n.norm() < 1e-8 {
+            n = Vec3::new(0.0, 1.0, 0.0).cross(bc);
+        }
+    }
+    let n = n.normalize();
+    let n_perp = n.cross(bc);
+
+    let d_vec = bc.scale(-theta.cos())
+        .add(n_perp.scale(theta.sin() * chi.cos()))
+        .add(n.scale(theta.sin() * chi.sin()))
+        .scale(l);
+    c.add(d_vec)
+}
+
+const L_CC: f64 = 1.53;
+const L_CO: f64 = 1.42;
+const L_CS: f64 = 1.81;
+const L_CN: f64 = 1.48;
+const L_RING: f64 = 1.39;
+
+const T_TETRA: f64 = 1.91986; // 110.0° in radians
+const T_PLANAR: f64 = 2.09440; // 120.0° in radians
+
+pub fn build_sidechain_atoms_into(
+    res_name: &str,
+    n_pos: Vec3,
+    ca_pos: Vec3,
+    cb_pos: Vec3,
+    rot: &RotamerAngles,
+    out: &mut [SideChainAtom; 10],
+) -> u8 {
+    let chi1 = rot.chi1;
+    let chi2 = rot.chi2;
+    let chi3 = rot.chi3;
+    let chi4 = rot.chi4;
+    let mut len = 0usize;
+
+    let mut push_atom = |name: &str, pos: Vec3, elem: u8| {
+        if len < 10 {
+            out[len] = SideChainAtom::new(name, pos.to_array(), elem);
+            len += 1;
+        }
+    };
+
+    match res_name {
+        "VAL" => {
+            let cg1 = nerf_place_atom(n_pos, ca_pos, cb_pos, L_CC, T_TETRA, chi1);
+            let cg2 = nerf_place_atom(n_pos, ca_pos, cb_pos, L_CC, T_TETRA, chi1 + 2.0944);
+            push_atom("CG1", cg1, b'C');
+            push_atom("CG2", cg2, b'C');
+        }
+        "LEU" => {
+            let cg = nerf_place_atom(n_pos, ca_pos, cb_pos, L_CC, T_TETRA, chi1);
+            let cd1 = nerf_place_atom(ca_pos, cb_pos, cg, L_CC, T_TETRA, chi2);
+            let cd2 = nerf_place_atom(ca_pos, cb_pos, cg, L_CC, T_TETRA, chi2 + 2.0944);
+            push_atom("CG", cg, b'C');
+            push_atom("CD1", cd1, b'C');
+            push_atom("CD2", cd2, b'C');
+        }
+        "ILE" => {
+            let cg1 = nerf_place_atom(n_pos, ca_pos, cb_pos, L_CC, T_TETRA, chi1);
+            let cg2 = nerf_place_atom(n_pos, ca_pos, cb_pos, L_CC, T_TETRA, chi1 + 2.0944);
+            let cd1 = nerf_place_atom(ca_pos, cb_pos, cg1, L_CC, T_TETRA, chi2);
+            push_atom("CG1", cg1, b'C');
+            push_atom("CG2", cg2, b'C');
+            push_atom("CD1", cd1, b'C');
+        }
+        "SER" => {
+            let og = nerf_place_atom(n_pos, ca_pos, cb_pos, L_CO, T_TETRA, chi1);
+            push_atom("OG", og, b'O');
+        }
+        "THR" => {
+            let og1 = nerf_place_atom(n_pos, ca_pos, cb_pos, L_CO, T_TETRA, chi1);
+            let cg2 = nerf_place_atom(n_pos, ca_pos, cb_pos, L_CC, T_TETRA, chi1 + 2.0944);
+            push_atom("OG1", og1, b'O');
+            push_atom("CG2", cg2, b'C');
+        }
+        "CYS" => {
+            let sg = nerf_place_atom(n_pos, ca_pos, cb_pos, L_CS, T_TETRA, chi1);
+            push_atom("SG", sg, b'S');
+        }
+        "MET" => {
+            let cg = nerf_place_atom(n_pos, ca_pos, cb_pos, L_CC, T_TETRA, chi1);
+            let sd = nerf_place_atom(ca_pos, cb_pos, cg, L_CS, T_TETRA, chi2);
+            let ce = nerf_place_atom(cb_pos, cg, sd, L_CS, 1.7628, chi3);
+            push_atom("CG", cg, b'C');
+            push_atom("SD", sd, b'S');
+            push_atom("CE", ce, b'C');
+        }
+        "ASP" => {
+            let cg = nerf_place_atom(n_pos, ca_pos, cb_pos, L_CC, T_TETRA, chi1);
+            let od1 = nerf_place_atom(ca_pos, cb_pos, cg, 1.25, T_PLANAR, chi2);
+            let od2 = nerf_place_atom(ca_pos, cb_pos, cg, 1.25, T_PLANAR, chi2 + 3.14159);
+            push_atom("CG", cg, b'C');
+            push_atom("OD1", od1, b'O');
+            push_atom("OD2", od2, b'O');
+        }
+        "ASN" => {
+            let cg = nerf_place_atom(n_pos, ca_pos, cb_pos, L_CC, T_TETRA, chi1);
+            let od1 = nerf_place_atom(ca_pos, cb_pos, cg, 1.24, T_PLANAR, chi2);
+            let nd2 = nerf_place_atom(ca_pos, cb_pos, cg, 1.33, T_PLANAR, chi2 + 3.14159);
+            push_atom("CG", cg, b'C');
+            push_atom("OD1", od1, b'O');
+            push_atom("ND2", nd2, b'N');
+        }
+        "GLU" => {
+            let cg = nerf_place_atom(n_pos, ca_pos, cb_pos, L_CC, T_TETRA, chi1);
+            let cd = nerf_place_atom(ca_pos, cb_pos, cg, L_CC, T_TETRA, chi2);
+            let oe1 = nerf_place_atom(cb_pos, cg, cd, 1.25, T_PLANAR, chi3);
+            let oe2 = nerf_place_atom(cb_pos, cg, cd, 1.25, T_PLANAR, chi3 + 3.14159);
+            push_atom("CG", cg, b'C');
+            push_atom("CD", cd, b'C');
+            push_atom("OE1", oe1, b'O');
+            push_atom("OE2", oe2, b'O');
+        }
+        "GLN" => {
+            let cg = nerf_place_atom(n_pos, ca_pos, cb_pos, L_CC, T_TETRA, chi1);
+            let cd = nerf_place_atom(ca_pos, cb_pos, cg, L_CC, T_TETRA, chi2);
+            let oe1 = nerf_place_atom(cb_pos, cg, cd, 1.24, T_PLANAR, chi3);
+            let ne2 = nerf_place_atom(cb_pos, cg, cd, 1.33, T_PLANAR, chi3 + 3.14159);
+            push_atom("CG", cg, b'C');
+            push_atom("CD", cd, b'C');
+            push_atom("OE1", oe1, b'O');
+            push_atom("NE2", ne2, b'N');
+        }
+        "LYS" => {
+            let cg = nerf_place_atom(n_pos, ca_pos, cb_pos, L_CC, T_TETRA, chi1);
+            let cd = nerf_place_atom(ca_pos, cb_pos, cg, L_CC, T_TETRA, chi2);
+            let ce = nerf_place_atom(cb_pos, cg, cd, L_CC, T_TETRA, chi3);
+            let nz = nerf_place_atom(cg, cd, ce, L_CN, T_TETRA, chi4);
+            push_atom("CG", cg, b'C');
+            push_atom("CD", cd, b'C');
+            push_atom("CE", ce, b'C');
+            push_atom("NZ", nz, b'N');
+        }
+        "ARG" => {
+            let cg = nerf_place_atom(n_pos, ca_pos, cb_pos, L_CC, T_TETRA, chi1);
+            let cd = nerf_place_atom(ca_pos, cb_pos, cg, L_CC, T_TETRA, chi2);
+            let ne = nerf_place_atom(cb_pos, cg, cd, L_CN, T_TETRA, chi3);
+            let cz = nerf_place_atom(cg, cd, ne, 1.33, T_PLANAR, chi4);
+            let nh1 = nerf_place_atom(cd, ne, cz, 1.33, T_PLANAR, 0.0);
+            let nh2 = nerf_place_atom(cd, ne, cz, 1.33, T_PLANAR, 3.14159);
+            push_atom("CG", cg, b'C');
+            push_atom("CD", cd, b'C');
+            push_atom("NE", ne, b'N');
+            push_atom("CZ", cz, b'C');
+            push_atom("NH1", nh1, b'N');
+            push_atom("NH2", nh2, b'N');
+        }
+        "PHE" => {
+            let cg = nerf_place_atom(n_pos, ca_pos, cb_pos, L_CC, T_TETRA, chi1);
+            let cd1 = nerf_place_atom(ca_pos, cb_pos, cg, L_RING, T_PLANAR, chi2);
+            let cd2 = nerf_place_atom(ca_pos, cb_pos, cg, L_RING, T_PLANAR, chi2 + 3.14159);
+            let ce1 = nerf_place_atom(cb_pos, cg, cd1, L_RING, T_PLANAR, 3.14159);
+            let ce2 = nerf_place_atom(cb_pos, cg, cd2, L_RING, T_PLANAR, 3.14159);
+            let cz = nerf_place_atom(cg, cd1, ce1, L_RING, T_PLANAR, 0.0);
+            push_atom("CG", cg, b'C');
+            push_atom("CD1", cd1, b'C');
+            push_atom("CD2", cd2, b'C');
+            push_atom("CE1", ce1, b'C');
+            push_atom("CE2", ce2, b'C');
+            push_atom("CZ", cz, b'C');
+        }
+        "TYR" => {
+            let cg = nerf_place_atom(n_pos, ca_pos, cb_pos, L_CC, T_TETRA, chi1);
+            let cd1 = nerf_place_atom(ca_pos, cb_pos, cg, L_RING, T_PLANAR, chi2);
+            let cd2 = nerf_place_atom(ca_pos, cb_pos, cg, L_RING, T_PLANAR, chi2 + 3.14159);
+            let ce1 = nerf_place_atom(cb_pos, cg, cd1, L_RING, T_PLANAR, 3.14159);
+            let ce2 = nerf_place_atom(cb_pos, cg, cd2, L_RING, T_PLANAR, 3.14159);
+            let cz = nerf_place_atom(cg, cd1, ce1, L_RING, T_PLANAR, 0.0);
+            let oh = nerf_place_atom(cd1, ce1, cz, 1.36, T_PLANAR, 3.14159);
+            push_atom("CG", cg, b'C');
+            push_atom("CD1", cd1, b'C');
+            push_atom("CD2", cd2, b'C');
+            push_atom("CE1", ce1, b'C');
+            push_atom("CE2", ce2, b'C');
+            push_atom("CZ", cz, b'C');
+            push_atom("OH", oh, b'O');
+        }
+        "TRP" => {
+            let cg = nerf_place_atom(n_pos, ca_pos, cb_pos, L_CC, T_TETRA, chi1);
+            let cd1 = nerf_place_atom(ca_pos, cb_pos, cg, 1.37, 2.21, chi2);
+            let cd2 = nerf_place_atom(ca_pos, cb_pos, cg, 1.44, 2.21, chi2 + 3.14159);
+            let ne1 = nerf_place_atom(cb_pos, cg, cd1, 1.38, 1.88, 0.0);
+            let ce2 = nerf_place_atom(cg, cd1, ne1, 1.38, 1.92, 0.0);
+            let ce3 = nerf_place_atom(cg, cd2, ce2, 1.40, T_PLANAR, 3.14159);
+            let cz2 = nerf_place_atom(cd2, ce2, ne1, 1.40, T_PLANAR, 3.14159);
+            let cz3 = nerf_place_atom(cd2, ce3, cz2, 1.40, T_PLANAR, 0.0);
+            let ch2 = nerf_place_atom(ce3, cz3, cz2, 1.40, T_PLANAR, 0.0);
+            push_atom("CG", cg, b'C');
+            push_atom("CD1", cd1, b'C');
+            push_atom("CD2", cd2, b'C');
+            push_atom("NE1", ne1, b'N');
+            push_atom("CE2", ce2, b'C');
+            push_atom("CE3", ce3, b'C');
+            push_atom("CZ2", cz2, b'C');
+            push_atom("CZ3", cz3, b'C');
+            push_atom("CH2", ch2, b'C');
+        }
+        "HIS" => {
+            let cg = nerf_place_atom(n_pos, ca_pos, cb_pos, L_CC, T_TETRA, chi1);
+            let nd1 = nerf_place_atom(ca_pos, cb_pos, cg, 1.38, 2.14, chi2);
+            let cd2 = nerf_place_atom(ca_pos, cb_pos, cg, 1.36, 2.14, chi2 + 3.14159);
+            let ce1 = nerf_place_atom(cb_pos, cg, nd1, 1.32, 1.90, 0.0);
+            let ne2 = nerf_place_atom(cg, nd1, ce1, 1.38, 1.95, 0.0);
+            push_atom("CG", cg, b'C');
+            push_atom("ND1", nd1, b'N');
+            push_atom("CD2", cd2, b'C');
+            push_atom("CE1", ce1, b'C');
+            push_atom("NE2", ne2, b'N');
+        }
+        "PRO" => {
+            let cg = nerf_place_atom(n_pos, ca_pos, cb_pos, L_CC, 1.80, chi1);
+            let cd = nerf_place_atom(ca_pos, cb_pos, cg, L_CC, 1.80, -0.4);
+            push_atom("CG", cg, b'C');
+            push_atom("CD", cd, b'C');
+        }
+        _ => {}
+    }
+
+    len as u8
+}
+
+#[inline(always)]
+pub fn vdw_radius(element: u8) -> f64 {
+    match element {
+        b'C' => 1.70,
+        b'N' => 1.55,
+        b'O' => 1.52,
+        b'S' => 1.80,
+        _ => 1.70,
+    }
+}
+
+#[inline(always)]
+pub fn soft_core_steric(dist: f64, elem_a: u8, elem_b: u8, alpha_soft: f64, w_clash: f64) -> f64 {
+    let r_ab = vdw_radius(elem_a) + vdw_radius(elem_b);
+    let r_cut = alpha_soft * r_ab;
+    if dist < r_cut {
+        let pen = 1.0 - (dist / r_cut);
+        w_clash * pen * pen
+    } else {
+        0.0
+    }
+}
+
+pub fn is_bonded_residue_atoms(res_i: i32, name_i: &str, res_j: i32, name_j: &str) -> bool {
+    let diff = (res_i - res_j).abs();
+    if diff == 0 {
+        if (name_i == "N" && (name_j == "CA" || name_j == "C" || name_j == "CB")) ||
+           (name_j == "N" && (name_i == "CA" || name_i == "C" || name_i == "CB")) {
+            return true;
+        }
+        if (name_i == "CA" && (name_j == "C" || name_j == "O" || name_j == "CB" || name_j.starts_with("CG") || name_j.starts_with("OG") || name_j.starts_with("SG"))) ||
+           (name_j == "CA" && (name_i == "C" || name_i == "O" || name_i == "CB" || name_i.starts_with("CG") || name_i.starts_with("OG") || name_i.starts_with("SG"))) {
+            return true;
+        }
+        if (name_i == "C" && (name_j == "O" || name_j == "CB")) ||
+           (name_j == "C" && (name_i == "O" || name_i == "CB")) {
+            return true;
+        }
+        if (name_i == "CB" && (name_j.starts_with("CG") || name_j.starts_with("OG") || name_j.starts_with("SG") || name_j.starts_with("CD") || name_j.starts_with("OD") || name_j.starts_with("SD"))) ||
+           (name_j == "CB" && (name_i.starts_with("CG") || name_i.starts_with("OG") || name_i.starts_with("SG") || name_i.starts_with("CD") || name_i.starts_with("OD") || name_i.starts_with("SD"))) {
+            return true;
+        }
+        if (name_i.starts_with("CG") && (name_j.starts_with("CD") || name_j.starts_with("OD") || name_j.starts_with("SD") || name_j.starts_with("ND") || name_j.starts_with("CE") || name_j.starts_with("OE") || name_j.starts_with("NE"))) ||
+           (name_j == "CG" && (name_i.starts_with("CD") || name_i.starts_with("OD") || name_i.starts_with("SD") || name_i.starts_with("ND") || name_i.starts_with("CE") || name_i.starts_with("OE") || name_i.starts_with("NE"))) {
+            return true;
+        }
+        if (name_i.starts_with("CD") && (name_j.starts_with("CE") || name_j.starts_with("OE") || name_j.starts_with("NE") || name_j.starts_with("CZ") || name_j.starts_with("NZ"))) ||
+           (name_j == "CD" && (name_i.starts_with("CE") || name_i.starts_with("OE") || name_i.starts_with("NE") || name_i.starts_with("CZ") || name_i.starts_with("NZ"))) {
+            return true;
+        }
+        if (name_i.starts_with("CE") && (name_j.starts_with("CZ") || name_j.starts_with("NZ") || name_j.starts_with("NH") || name_j.starts_with("OH") || name_j.starts_with("CH"))) ||
+           (name_j == "CE" && (name_i.starts_with("CZ") || name_i.starts_with("NZ") || name_i.starts_with("NH") || name_i.starts_with("OH") || name_i.starts_with("CH"))) {
+            return true;
+        }
+        if (name_i.starts_with("CG") && name_j.starts_with("CG")) ||
+           (name_i.starts_with("CD") && name_j.starts_with("CD")) ||
+           (name_i.starts_with("OD") && name_j.starts_with("OD")) ||
+           (name_i.starts_with("OE") && name_j.starts_with("OE")) ||
+           (name_i.starts_with("NH") && name_j.starts_with("NH")) {
+            return true;
+        }
+    } else if diff == 1 {
+        let (first_name, second_name) = if res_i < res_j { (name_i, name_j) } else { (name_j, name_i) };
+        if (first_name == "C" && (second_name == "N" || second_name == "CA")) ||
+           (first_name == "O" && second_name == "N") ||
+           (first_name == "CA" && second_name == "N") {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn compute_protein_clashscore(residues: &[ReconstructedResidue]) -> (usize, f64) {
+    let mut total_atoms = 0;
+    for r in residues {
+        total_atoms += 4;
+        if r.cb.is_some() { total_atoms += 1; }
+        total_atoms += r.sidechain_len as usize;
+    }
+    if total_atoms == 0 { return (0, 0.0); }
+
+    let mut clashes = 0;
+    let n = residues.len();
+    for i in 0..n {
+        let r_i = &residues[i];
+        let mut atoms_i: [Option<([f64; 3], &str)>; 15] = [None; 15];
+        let mut c_i = 0;
+        atoms_i[c_i] = Some((r_i.n, "N")); c_i += 1;
+        atoms_i[c_i] = Some((r_i.ca, "CA")); c_i += 1;
+        atoms_i[c_i] = Some((r_i.c, "C")); c_i += 1;
+        atoms_i[c_i] = Some((r_i.o, "O")); c_i += 1;
+        if let Some(cb) = r_i.cb {
+            atoms_i[c_i] = Some((cb, "CB")); c_i += 1;
+        }
+        for k in 0..r_i.sidechain_len as usize {
+            atoms_i[c_i] = Some((r_i.sidechain_atoms[k].pos, r_i.sidechain_atoms[k].name_str())); c_i += 1;
+        }
+
+        for a in 0..c_i {
+            let (pos_a, name_a) = atoms_i[a].unwrap();
+            for b in (a + 1)..c_i {
+                let (pos_b, name_b) = atoms_i[b].unwrap();
+                if is_bonded_residue_atoms(r_i.res_seq, name_a, r_i.res_seq, name_b) {
+                    continue;
+                }
+                let d_sq = (pos_a[0] - pos_b[0]).powi(2) + (pos_a[1] - pos_b[1]).powi(2) + (pos_a[2] - pos_b[2]).powi(2);
+                if d_sq < 4.0 {
+                    clashes += 1;
+                }
+            }
+        }
+
+        for j in (i + 1)..n {
+            let r_j = &residues[j];
+            let d_ca_sq = (r_i.ca[0] - r_j.ca[0]).powi(2) + (r_i.ca[1] - r_j.ca[1]).powi(2) + (r_i.ca[2] - r_j.ca[2]).powi(2);
+            if d_ca_sq > 256.0 {
+                continue;
+            }
+
+            let mut atoms_j: [Option<([f64; 3], &str)>; 15] = [None; 15];
+            let mut c_j = 0;
+            atoms_j[c_j] = Some((r_j.n, "N")); c_j += 1;
+            atoms_j[c_j] = Some((r_j.ca, "CA")); c_j += 1;
+            atoms_j[c_j] = Some((r_j.c, "C")); c_j += 1;
+            atoms_j[c_j] = Some((r_j.o, "O")); c_j += 1;
+            if let Some(cb) = r_j.cb {
+                atoms_j[c_j] = Some((cb, "CB")); c_j += 1;
+            }
+            for k in 0..r_j.sidechain_len as usize {
+                atoms_j[c_j] = Some((r_j.sidechain_atoms[k].pos, r_j.sidechain_atoms[k].name_str())); c_j += 1;
+            }
+
+            for a in 0..c_i {
+                let (pos_a, name_a) = atoms_i[a].unwrap();
+                for b in 0..c_j {
+                    let (pos_b, name_b) = atoms_j[b].unwrap();
+                    if is_bonded_residue_atoms(r_i.res_seq, name_a, r_j.res_seq, name_b) {
+                        continue;
+                    }
+                    let d_sq = (pos_a[0] - pos_b[0]).powi(2) + (pos_a[1] - pos_b[1]).powi(2) + (pos_a[2] - pos_b[2]).powi(2);
+                    if d_sq < 4.0 {
+                        clashes += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    let score = (clashes as f64 / total_atoms as f64) * 1000.0;
+    (clashes, score)
+}
+
+pub const MAX_ROTAMERS: usize = 9;
+pub const MAX_SC_ATOMS: usize = 10;
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SidechainPackingMetrics {
+    pub initial_clashscore: f64,
+    pub final_clashscore: f64,
+    pub clash_reduction_pct: f64,
+    pub pruned_states: usize,
+    pub total_atoms: usize,
+    pub pack_time_ms: f64,
+}
+
+pub struct RotamerWorkspace {
+    pub max_len: usize,
+    pub cand_atoms: Vec<[[SideChainAtom; MAX_SC_ATOMS]; MAX_ROTAMERS]>,
+    pub cand_lens: Vec<[u8; MAX_ROTAMERS]>,
+    pub self_energies: Vec<[f64; MAX_ROTAMERS]>,
+    pub active_mask: Vec<[bool; MAX_ROTAMERS]>,
+    pub n_rotamers: Vec<u8>,
+    pub current_rotamer: Vec<u8>,
+    pub neighbor_pairs: Vec<(usize, usize)>,
+    pub pair_offsets: Vec<u32>,
+    pub pair_energies: Vec<f64>,
+}
+
+impl RotamerWorkspace {
+    pub fn new(max_len: usize) -> Self {
+        Self {
+            max_len,
+            cand_atoms: vec![[[SideChainAtom::default(); MAX_SC_ATOMS]; MAX_ROTAMERS]; max_len],
+            cand_lens: vec![[0u8; MAX_ROTAMERS]; max_len],
+            self_energies: vec![[0.0f64; MAX_ROTAMERS]; max_len],
+            active_mask: vec![[true; MAX_ROTAMERS]; max_len],
+            n_rotamers: vec![0u8; max_len],
+            current_rotamer: vec![0u8; max_len],
+            neighbor_pairs: Vec::with_capacity(max_len * 32),
+            pair_offsets: vec![u32::MAX; max_len * max_len],
+            pair_energies: Vec::with_capacity(max_len * 32 * 81),
+        }
+    }
+
+    pub fn ensure_capacity(&mut self, len: usize) {
+        if len > self.max_len {
+            self.max_len = len;
+            self.cand_atoms.resize(len, [[SideChainAtom::default(); MAX_SC_ATOMS]; MAX_ROTAMERS]);
+            self.cand_lens.resize(len, [0u8; MAX_ROTAMERS]);
+            self.self_energies.resize(len, [0.0f64; MAX_ROTAMERS]);
+            self.active_mask.resize(len, [true; MAX_ROTAMERS]);
+            self.n_rotamers.resize(len, 0u8);
+            self.current_rotamer.resize(len, 0u8);
+            self.pair_offsets.resize(len * len, u32::MAX);
+        }
+    }
+}
+
+pub fn pack_sidechains(
+    residues: &mut [ReconstructedResidue],
+    ws: &mut RotamerWorkspace,
+    alpha_soft: f64,
+    w_clash: f64,
+    w_rot: f64,
+) -> SidechainPackingMetrics {
+    let timer = std::time::Instant::now();
+    let n = residues.len();
+    if n == 0 {
+        return SidechainPackingMetrics::default();
+    }
+    ws.ensure_capacity(n);
+
+    for &(i, j) in &ws.neighbor_pairs {
+        ws.pair_offsets[i * ws.max_len + j] = u32::MAX;
+        ws.pair_offsets[j * ws.max_len + i] = u32::MAX;
+    }
+    ws.neighbor_pairs.clear();
+    ws.pair_energies.clear();
+
+    for i in 0..n {
+        let res_name = std::str::from_utf8(&residues[i].res_name).unwrap_or("UNK").trim();
+        let rots = get_rotamer_candidates(res_name);
+        let n_rots = rots.len().min(MAX_ROTAMERS);
+        ws.n_rotamers[i] = n_rots as u8;
+
+        let n_pos = Vec3::from_array(residues[i].n);
+        let ca_pos = Vec3::from_array(residues[i].ca);
+        let cb_pos = Vec3::from_array(residues[i].cb.unwrap_or(residues[i].ca));
+
+        for r in 0..n_rots {
+            let mut cand_buf = [SideChainAtom::default(); MAX_SC_ATOMS];
+            let sc_len = build_sidechain_atoms_into(res_name, n_pos, ca_pos, cb_pos, &rots[r], &mut cand_buf);
+            ws.cand_atoms[i][r] = cand_buf;
+            ws.cand_lens[i][r] = sc_len;
+            ws.active_mask[i][r] = true;
+
+            let e_prob = -w_rot * (rots[r].prob + 1e-6).ln();
+
+            let mut e_bb_clash = 0.0;
+            for j in 0..n {
+                let d_ca = ca_pos.dist(Vec3::from_array(residues[j].ca));
+                if d_ca > 15.0 {
+                    continue;
+                }
+                let bb_atoms: [([f64; 3], u8, &str); 5] = [
+                    (residues[j].n, b'N', "N"),
+                    (residues[j].ca, b'C', "CA"),
+                    (residues[j].c, b'C', "C"),
+                    (residues[j].o, b'O', "O"),
+                    (residues[j].cb.unwrap_or(residues[j].ca), b'C', "CB"),
+                ];
+
+                for a_idx in 0..sc_len as usize {
+                    let a = &cand_buf[a_idx];
+                    let a_pos = Vec3::from_array(a.pos);
+                    let a_name = a.name_str();
+
+                    for &(b_pos, b_elem, b_name) in &bb_atoms {
+                        if is_bonded_residue_atoms(residues[i].res_seq, a_name, residues[j].res_seq, b_name) {
+                            continue;
+                        }
+                        let d = a_pos.dist(Vec3::from_array(b_pos));
+                        e_bb_clash += soft_core_steric(d, a.element, b_elem, alpha_soft, w_clash);
+                    }
+                }
+            }
+            ws.self_energies[i][r] = e_prob + e_bb_clash;
+        }
+    }
+
+    for i in 0..n {
+        let n_rots = ws.n_rotamers[i] as usize;
+        if n_rots > 0 {
+            residues[i].sidechain_len = ws.cand_lens[i][0];
+            residues[i].sidechain_atoms = ws.cand_atoms[i][0];
+        } else {
+            residues[i].sidechain_len = 0;
+        }
+    }
+    let (_init_raw, initial_clashscore) = compute_protein_clashscore(residues);
+
+    for i in 0..n {
+        let cb_i = Vec3::from_array(residues[i].cb.unwrap_or(residues[i].ca));
+        let n_rots_i = ws.n_rotamers[i] as usize;
+        if n_rots_i == 0 { continue; }
+
+        for j in (i + 1)..n {
+            let n_rots_j = ws.n_rotamers[j] as usize;
+            if n_rots_j == 0 { continue; }
+
+            let cb_j = Vec3::from_array(residues[j].cb.unwrap_or(residues[j].ca));
+            if cb_i.dist(cb_j) < 9.0 {
+                let offset = ws.pair_energies.len() as u32;
+                ws.neighbor_pairs.push((i, j));
+                ws.pair_offsets[i * ws.max_len + j] = offset;
+                ws.pair_offsets[j * ws.max_len + i] = offset | (1 << 31);
+
+                for r_i in 0..MAX_ROTAMERS {
+                    for r_j in 0..MAX_ROTAMERS {
+                        if r_i < n_rots_i && r_j < n_rots_j {
+                            let len_i = ws.cand_lens[i][r_i] as usize;
+                            let len_j = ws.cand_lens[j][r_j] as usize;
+                            let mut e_pair = 0.0;
+
+                            for a_k in 0..len_i {
+                                let a = &ws.cand_atoms[i][r_i][a_k];
+                                let pos_a = Vec3::from_array(a.pos);
+                                let name_a = a.name_str();
+
+                                for b_k in 0..len_j {
+                                    let b = &ws.cand_atoms[j][r_j][b_k];
+                                    let name_b = b.name_str();
+                                    if is_bonded_residue_atoms(residues[i].res_seq, name_a, residues[j].res_seq, name_b) {
+                                        continue;
+                                    }
+                                    let d = pos_a.dist(Vec3::from_array(b.pos));
+                                    e_pair += soft_core_steric(d, a.element, b.element, alpha_soft, w_clash);
+                                }
+                            }
+                            ws.pair_energies.push(e_pair);
+                        } else {
+                            ws.pair_energies.push(0.0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let max_len = ws.max_len;
+    let get_pair_e = |offsets: &[u32], energies: &[f64], i: usize, r_i: usize, j: usize, r_j: usize| -> f64 {
+        let entry = offsets[i * max_len + j];
+        if entry != u32::MAX {
+            let is_transposed = (entry & (1 << 31)) != 0;
+            let base = (entry & !(1 << 31)) as usize;
+            if is_transposed {
+                energies[base + r_j * MAX_ROTAMERS + r_i]
+            } else {
+                energies[base + r_i * MAX_ROTAMERS + r_j]
+            }
+        } else {
+            0.0
+        }
+    };
+
+    let mut pruned_states = 0;
+    for _pass in 0..2 {
+        for i in 0..n {
+            let n_rots = ws.n_rotamers[i] as usize;
+            if n_rots <= 1 { continue; }
+
+            for r in 0..n_rots {
+                if !ws.active_mask[i][r] { continue; }
+
+                for t in 0..n_rots {
+                    if r == t || !ws.active_mask[i][t] { continue; }
+
+                    let mut sum_min_diff = 0.0;
+                    for j in 0..n {
+                        if i == j || ws.n_rotamers[j] == 0 { continue; }
+                        if ws.pair_offsets[i * max_len + j] == u32::MAX { continue; }
+
+                        let mut min_diff = f64::INFINITY;
+                        let n_rots_j = ws.n_rotamers[j] as usize;
+                        for s in 0..n_rots_j {
+                            if !ws.active_mask[j][s] { continue; }
+                            let diff = get_pair_e(&ws.pair_offsets, &ws.pair_energies, i, r, j, s)
+                                     - get_pair_e(&ws.pair_offsets, &ws.pair_energies, i, t, j, s);
+                            if diff < min_diff {
+                                min_diff = diff;
+                            }
+                        }
+                        if min_diff < f64::INFINITY {
+                            sum_min_diff += min_diff;
+                        }
+                    }
+
+                    let total_diff = ws.self_energies[i][r] - ws.self_energies[i][t] + sum_min_diff;
+                    if total_diff > 1e-4 {
+                        ws.active_mask[i][r] = false;
+                        pruned_states += 1;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    for i in 0..n {
+        let n_rots = ws.n_rotamers[i] as usize;
+        if n_rots == 0 {
+            ws.current_rotamer[i] = 0;
+            continue;
+        }
+        let mut best_r = 0;
+        let mut min_e = f64::INFINITY;
+        for r in 0..n_rots {
+            if ws.active_mask[i][r] && ws.self_energies[i][r] < min_e {
+                min_e = ws.self_energies[i][r];
+                best_r = r;
+            }
+        }
+        ws.current_rotamer[i] = best_r as u8;
+    }
+
+    for _sweep in 0..5 {
+        let mut changed = false;
+        for i in 0..n {
+            let n_rots = ws.n_rotamers[i] as usize;
+            if n_rots <= 1 { continue; }
+
+            let mut best_r = ws.current_rotamer[i] as usize;
+            let mut min_total_e = f64::INFINITY;
+
+            for r in 0..n_rots {
+                if !ws.active_mask[i][r] { continue; }
+                let mut e_total = ws.self_energies[i][r];
+                for j in 0..n {
+                    if i == j || ws.n_rotamers[j] == 0 { continue; }
+                    let cur_j = ws.current_rotamer[j] as usize;
+                    e_total += get_pair_e(&ws.pair_offsets, &ws.pair_energies, i, r, j, cur_j);
+                }
+                if e_total < min_total_e {
+                    min_total_e = e_total;
+                    best_r = r;
+                }
+            }
+
+            if best_r != ws.current_rotamer[i] as usize {
+                ws.current_rotamer[i] = best_r as u8;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let mut total_atoms = 0;
+    for i in 0..n {
+        total_atoms += 4;
+        if residues[i].cb.is_some() { total_atoms += 1; }
+
+        let n_rots = ws.n_rotamers[i] as usize;
+        if n_rots > 0 {
+            let chosen = ws.current_rotamer[i] as usize;
+            residues[i].sidechain_len = ws.cand_lens[i][chosen];
+            residues[i].sidechain_atoms = ws.cand_atoms[i][chosen];
+            total_atoms += residues[i].sidechain_len as usize;
+        } else {
+            residues[i].sidechain_len = 0;
+        }
+    }
+
+    let (_final_raw, final_clashscore) = compute_protein_clashscore(residues);
+    let clash_reduction_pct = if initial_clashscore > 0.0 {
+        ((initial_clashscore - final_clashscore) / initial_clashscore) * 100.0
+    } else {
+        0.0
+    };
+
+    SidechainPackingMetrics {
+        initial_clashscore,
+        final_clashscore,
+        clash_reduction_pct,
+        pruned_states,
+        total_atoms,
+        pack_time_ms: timer.elapsed().as_secs_f64() * 1000.0,
     }
 }
 
@@ -534,6 +1441,7 @@ pub struct AllAtomWorkspace {
     pub n_preds: Vec<Vec3>,
     pub grad: Vec<f64>,
     pub out_residues: Vec<ReconstructedResidue>,
+    pub rotamer_ws: RotamerWorkspace,
 }
 
 impl AllAtomWorkspace {
@@ -550,6 +1458,7 @@ impl AllAtomWorkspace {
             n_preds: vec![Vec3::zero(); max_len],
             grad: vec![0.0; max_len],
             out_residues: vec![ReconstructedResidue::default(); max_len],
+            rotamer_ws: RotamerWorkspace::new(max_len),
         }
     }
 }
@@ -575,13 +1484,15 @@ impl Default for KinematicBackboneSolver {
 
 impl KinematicBackboneSolver {
     /// Zero-allocation kinematic reconstruction writing directly into pre-allocated `AllAtomWorkspace`.
+    /// When `pack_sidechains_flag` is true, performs rotamer optimization via NeRF + DEE + ICM (STRUCT-4).
     pub fn reconstruct_into(
         &self,
         ca_coords: &[[f64; 3]],
         res_names: &[[u8; 3]],
         res_seqs: &[i32],
         ws: &mut AllAtomWorkspace,
-    ) {
+        pack_sidechains_flag: bool,
+    ) -> Option<SidechainPackingMetrics> {
         let n = ca_coords.len();
         assert!(n >= 3 && n <= ws.cas.len(), "Invalid sequence length for workspace capacity");
         let num_bonds = n - 1;
@@ -779,51 +1690,101 @@ impl KinematicBackboneSolver {
                 c: c_atom.to_array(),
                 o: o_atom.to_array(),
                 cb,
+                sidechain_len: 0,
+                sidechain_atoms: [SideChainAtom::default(); 10],
             };
+        }
+
+        if pack_sidechains_flag {
+            Some(pack_sidechains(
+                &mut ws.out_residues[0..n],
+                &mut ws.rotamer_ws,
+                0.82,
+                10.0,
+                1.0,
+            ))
+        } else {
+            None
         }
     }
 }
 
-/// Generates a Protein Data Bank (.pdb) string containing full all-atom backbone (N, CA, C, O) and C_beta atoms.
+/// Helper function to format PDB atom names into the 6-character field (Cols 12-17: space + 4-char name + space).
+fn format_pdb_atom_name_field(name: &str) -> String {
+    let inner = match name.len() {
+        1 => format!(" {}  ", name),
+        2 => format!(" {} ", name),
+        3 => format!(" {}", name),
+        _ => format!("{:4}", name),
+    };
+    format!(" {} ", inner)
+}
+
+/// Generates a Protein Data Bank (.pdb) string containing full all-atom backbone (N, CA, C, O) and C_beta atoms,
+/// plus rotameric sidechain atoms when present (STRUCT-3/4).
 pub fn coords_to_allatom_pdb_string(
     protein_id: &str,
     residues: &[ReconstructedResidue],
 ) -> String {
-    let mut out = String::with_capacity(residues.len() * 400 + 256);
+    let mut out = String::with_capacity(residues.len() * 600 + 256);
     out.push_str(&format!("HEADER    CODON-INFER STRUCT-3 ALL-ATOM RECONSTRUCTION {}\n", protein_id));
-    out.push_str("TITLE     ALL-ATOM BACKBONE + CB SOLVED VIA PAULING-COREY KINEMATIC SOLVER\n");
+    let has_sidechains = residues.iter().any(|r| r.sidechain_len > 0);
+    let title = if has_sidechains {
+        "ALL-ATOM BACKBONE + ROTAMERIC SIDECHAINS (STRUCT-4 / NERF + DEE + ICM)"
+    } else {
+        "ALL-ATOM BACKBONE + CB SOLVED VIA PAULING-COREY KINEMATIC SOLVER"
+    };
+    out.push_str(&format!("TITLE     {}\n", title));
 
     let mut atom_idx = 1;
     for res in residues {
         let name_str = std::str::from_utf8(&res.res_name).unwrap_or("UNK");
+        // N
         out.push_str(&format!(
-            "ATOM  {:5}  N   {:3} A{:4}    {:8.3}{:8.3}{:8.3}  1.00 50.00           N\n",
-            atom_idx, name_str, res.res_seq, res.n[0], res.n[1], res.n[2]
+            "ATOM  {:5}{}{:3} A{:4}    {:8.3}{:8.3}{:8.3}  1.00 50.00           N\n",
+            atom_idx, format_pdb_atom_name_field("N"), name_str, res.res_seq, res.n[0], res.n[1], res.n[2]
         ));
         atom_idx += 1;
 
+        // CA
         out.push_str(&format!(
-            "ATOM  {:5}  CA  {:3} A{:4}    {:8.3}{:8.3}{:8.3}  1.00 50.00           C\n",
-            atom_idx, name_str, res.res_seq, res.ca[0], res.ca[1], res.ca[2]
+            "ATOM  {:5}{}{:3} A{:4}    {:8.3}{:8.3}{:8.3}  1.00 50.00           C\n",
+            atom_idx, format_pdb_atom_name_field("CA"), name_str, res.res_seq, res.ca[0], res.ca[1], res.ca[2]
         ));
         atom_idx += 1;
 
+        // C
         out.push_str(&format!(
-            "ATOM  {:5}  C   {:3} A{:4}    {:8.3}{:8.3}{:8.3}  1.00 50.00           C\n",
-            atom_idx, name_str, res.res_seq, res.c[0], res.c[1], res.c[2]
+            "ATOM  {:5}{}{:3} A{:4}    {:8.3}{:8.3}{:8.3}  1.00 50.00           C\n",
+            atom_idx, format_pdb_atom_name_field("C"), name_str, res.res_seq, res.c[0], res.c[1], res.c[2]
         ));
         atom_idx += 1;
 
+        // O
         out.push_str(&format!(
-            "ATOM  {:5}  O   {:3} A{:4}    {:8.3}{:8.3}{:8.3}  1.00 50.00           O\n",
-            atom_idx, name_str, res.res_seq, res.o[0], res.o[1], res.o[2]
+            "ATOM  {:5}{}{:3} A{:4}    {:8.3}{:8.3}{:8.3}  1.00 50.00           O\n",
+            atom_idx, format_pdb_atom_name_field("O"), name_str, res.res_seq, res.o[0], res.o[1], res.o[2]
         ));
         atom_idx += 1;
 
+        // CB
         if let Some(cb) = res.cb {
             out.push_str(&format!(
-                "ATOM  {:5}  CB  {:3} A{:4}    {:8.3}{:8.3}{:8.3}  1.00 50.00           C\n",
-                atom_idx, name_str, res.res_seq, cb[0], cb[1], cb[2]
+                "ATOM  {:5}{}{:3} A{:4}    {:8.3}{:8.3}{:8.3}  1.00 50.00           C\n",
+                atom_idx, format_pdb_atom_name_field("CB"), name_str, res.res_seq, cb[0], cb[1], cb[2]
+            ));
+            atom_idx += 1;
+        }
+
+        // Sidechain heavy atoms beyond CB (STRUCT-4)
+        for k in 0..res.sidechain_len as usize {
+            let sc_atom = &res.sidechain_atoms[k];
+            let sc_name = sc_atom.name_str();
+            let elem_char = (sc_atom.element as char).to_ascii_uppercase();
+            out.push_str(&format!(
+                "ATOM  {:5}{}{:3} A{:4}    {:8.3}{:8.3}{:8.3}  1.00 50.00          {:>2}\n",
+                atom_idx, format_pdb_atom_name_field(sc_name), name_str, res.res_seq,
+                sc_atom.pos[0], sc_atom.pos[1], sc_atom.pos[2], elem_char
             ));
             atom_idx += 1;
         }
@@ -910,6 +1871,8 @@ pub fn parse_pdb_atoms(path: &str) -> io::Result<Vec<ReconstructedResidue>> {
                 c,
                 o,
                 cb,
+                sidechain_len: 0,
+                sidechain_atoms: [SideChainAtom::default(); 10],
             })
         })
         .collect();
@@ -1019,7 +1982,7 @@ mod tests {
         let res_seqs = [1, 2, 3, 4];
         let mut ws = AllAtomWorkspace::new(10);
         let solver = KinematicBackboneSolver::default();
-        solver.reconstruct_into(&ca_coords, &res_names, &res_seqs, &mut ws);
+        solver.reconstruct_into(&ca_coords, &res_names, &res_seqs, &mut ws, false);
 
         assert_eq!(ws.out_residues.len(), 10);
         let r0 = &ws.out_residues[0];
@@ -1038,6 +2001,51 @@ mod tests {
         assert!(pdb_str.contains("ATOM      3  C   MET A   1"));
         assert!(pdb_str.contains("ATOM      4  O   MET A   1"));
         assert!(pdb_str.contains("ATOM      5  CB  MET A   1"));
+        assert!(pdb_str.ends_with("END\n"));
+    }
+
+    #[test]
+    fn test_allatom_with_sidechain_packing() {
+        let ca_coords = [
+            [0.0, 0.0, 0.0],
+            [3.8, 0.0, 0.0],
+            [6.0, 3.1, 0.0],
+            [9.0, 4.0, 2.0],
+        ];
+        let res_names = [*b"MET", *b"LEU", *b"GLY", *b"CYS"];
+        let res_seqs = [1, 2, 3, 4];
+        let mut ws = AllAtomWorkspace::new(10);
+        let solver = KinematicBackboneSolver::default();
+        let metrics = solver.reconstruct_into(&ca_coords, &res_names, &res_seqs, &mut ws, true);
+
+        assert!(metrics.is_some());
+        let m = metrics.unwrap();
+        assert!(m.total_atoms > 15);
+
+        // MET (res 0) has CB + 3 sidechain atoms (CG, SD, CE)
+        assert_eq!(ws.out_residues[0].sidechain_len, 3);
+        assert_eq!(ws.out_residues[0].sidechain_atoms[0].name_str(), "CG");
+        assert_eq!(ws.out_residues[0].sidechain_atoms[1].name_str(), "SD");
+        assert_eq!(ws.out_residues[0].sidechain_atoms[2].name_str(), "CE");
+
+        // LEU (res 1) has CB + 3 sidechain atoms (CG, CD1, CD2)
+        assert_eq!(ws.out_residues[1].sidechain_len, 3);
+        assert_eq!(ws.out_residues[1].sidechain_atoms[0].name_str(), "CG");
+        assert_eq!(ws.out_residues[1].sidechain_atoms[1].name_str(), "CD1");
+        assert_eq!(ws.out_residues[1].sidechain_atoms[2].name_str(), "CD2");
+
+        // GLY (res 2) has 0 sidechain atoms
+        assert_eq!(ws.out_residues[2].sidechain_len, 0);
+
+        // CYS (res 3) has CB + 1 sidechain atom (SG)
+        assert_eq!(ws.out_residues[3].sidechain_len, 1);
+        assert_eq!(ws.out_residues[3].sidechain_atoms[0].name_str(), "SG");
+
+        let pdb_str = coords_to_allatom_pdb_string("test_packed", &ws.out_residues[0..4]);
+        assert!(pdb_str.contains("ALL-ATOM BACKBONE + ROTAMERIC SIDECHAINS"));
+        assert!(pdb_str.contains("ATOM      6  CG  MET A   1"));
+        assert!(pdb_str.contains("ATOM      7  SD  MET A   1"));
+        assert!(pdb_str.contains("ATOM      8  CE  MET A   1"));
         assert!(pdb_str.ends_with("END\n"));
     }
 }

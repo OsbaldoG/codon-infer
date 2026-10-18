@@ -63,7 +63,8 @@ fn print_help(theme: &TerminalTheme) {
     println!("    -s, --sequence <SEQ>     Input amino acid sequence (default 'M' in generate; required otherwise)");
     println!("    -f, --fasta <PATH>       Input FASTA file path (or '-' for stdin)");
     println!("    -p, --pdb <PATH>         Input 3D structure PDB file for inverse folding design");
-    println!("    --all-atom               Reconstruct full all-atom backbone (N, CA, C, O, CB) in fold PDB export");
+    println!("    --all-atom               Reconstruct full all-atom backbone + rotameric sidechains in fold PDB export (STRUCT-3/4)");
+    println!("    --no-sidechains          Disable sidechain packing (retain only N, CA, C, O, CB backbone in all-atom mode)");
     println!("    --blind                  Run sequence-blind inverse folding in design subcommand");
     println!("    --temperature <T>        Sampling temperature for design or generate (default: 0.1 for design)");
     println!("    --export-fasta <PATH>    Export designed sequences to FASTA (design)");
@@ -968,6 +969,7 @@ fn main() -> io::Result<()> {
             let mut export_tsv: Option<String> = None;
             let mut export_json: Option<String> = None;
             let mut all_atom = false;
+            let mut pack_sidechains = true;
             let mut num_threads = global_threads.unwrap_or(default_threads);
             let mut quant_mode = global_quantize;
 
@@ -980,6 +982,13 @@ fn main() -> io::Result<()> {
                     sequence_arg = Some(args[i + 1].clone());
                     i += 2;
                 } else if args[i] == "--all-atom" || args[i] == "--allatom" {
+                    all_atom = true;
+                    i += 1;
+                } else if args[i] == "--no-sidechains" || args[i] == "--no-sidechain" {
+                    pack_sidechains = false;
+                    i += 1;
+                } else if args[i] == "--pack-sidechains" || args[i] == "--pack-sidechain" {
+                    pack_sidechains = true;
                     all_atom = true;
                     i += 1;
                 } else if (args[i] == "--threads" || args[i] == "-t") && i + 1 < args.len() {
@@ -1036,6 +1045,7 @@ fn main() -> io::Result<()> {
                 num_threads,
                 export_pdb.as_deref(),
                 all_atom,
+                pack_sidechains,
                 &theme,
             );
 

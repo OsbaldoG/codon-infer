@@ -33,7 +33,8 @@ pub use export::{
     DmsPositionRow, export_dms_csv, export_dms_json, export_contacts_csv, export_contacts_json,
     dms_to_json_string, contacts_to_json_string, inpaint_to_json_string, export_inpaint_json,
     aa1_to_aa3, aa3_to_aa1, coords_to_pdb_string, export_ca_pdb, export_fold_tsv, fold_to_json_string, export_fold_json,
-    Vec3, ReconstructedResidue, AllAtomWorkspace, KinematicBackboneSolver,
+    Vec3, SideChainAtom, ReconstructedResidue, AllAtomWorkspace, KinematicBackboneSolver,
+    SidechainPackingMetrics, RotamerWorkspace, pack_sidechains, compute_protein_clashscore,
     coords_to_allatom_pdb_string, export_allatom_pdb, parse_pdb_atoms,
     design_to_json_string, export_design_json,
 };
@@ -45,7 +46,7 @@ pub use pipeline::{
     compute_pipeline_contacts, compute_pipeline_contacts_parallel,
     InpaintPipelineResult, InpaintSite, InpaintCandidate, ContactsPipelineResult,
     FoldPipelineResult, mds_spectral_init, helical_init, reconstruct_3d_ca,
-    compute_pipeline_fold_parallel, render_fold_summary, run_pipeline_fold_parallel,
+    compute_pipeline_fold_parallel, compute_pipeline_fold_parallel_opts, render_fold_summary, run_pipeline_fold_parallel,
     STANDARD_AMINO_ACIDS, PhysicoClass, get_token_id, calc_dihedral,
     Bio2Workspace, Bio2CoDesigner, DesignCandidate, DesignPositionSite, DesignPipelineResult,
     compute_pipeline_design_parallel, render_design_summary, run_pipeline_design_parallel,
@@ -8741,6 +8742,96 @@ mod tests_regression {
         println!("1CHL Q4_0 vs FP32 Fold Kabsch RMSD: {:.3} Å", best_rmsd_q4);
         println!("1CHL Q3_LUT vs FP32 Fold Kabsch RMSD: {:.3} Å", best_rmsd);
         assert!(best_rmsd < 5.5, "Q3_LUT fold Kabsch RMSD {:.3} Å must be < 5.5 Å", best_rmsd);
+    }
+
+    #[test]
+    fn test_struct4_sidechain_packing_and_biophysical_integrity() {
+        use crate::export::{
+            aa1_to_aa3, AllAtomWorkspace, KinematicBackboneSolver, coords_to_allatom_pdb_string,
+            parse_pdb_atoms,
+        };
+        use crate::pipeline::{Bio2Workspace, Bio2CoDesigner};
+
+        // 1. All 20 canonical amino acids
+        let seq = "ACDEFGHIKLMNPQRSTVWY";
+        let n = seq.len();
+        let mut ca_coords = Vec::with_capacity(n);
+        // Build ideal alpha-helix C-alpha coordinates: r=2.3 Å, pitch=1.5 Å, dphi=100° (1.745 rad)
+        for i in 0..n {
+            let phi = i as f64 * 100.0 * std::f64::consts::PI / 180.0;
+            let z = i as f64 * 1.5;
+            let x = 2.3 * phi.cos();
+            let y = 2.3 * phi.sin();
+            ca_coords.push([x, y, z]);
+        }
+
+        let mut res_names = Vec::with_capacity(n);
+        let mut res_seqs = Vec::with_capacity(n);
+        for (i, ch) in seq.chars().enumerate() {
+            let name3 = aa1_to_aa3(ch);
+            let mut b = [b' '; 3];
+            let src = name3.as_bytes();
+            for (idx, &byte) in src.iter().take(3).enumerate() {
+                b[idx] = byte;
+            }
+            res_names.push(b);
+            res_seqs.push((i + 1) as i32);
+        }
+
+        let mut ws = AllAtomWorkspace::new(n);
+        let solver = KinematicBackboneSolver::default();
+        let metrics = solver.reconstruct_into(&ca_coords, &res_names, &res_seqs, &mut ws, true);
+
+        assert!(metrics.is_some());
+        let m = metrics.unwrap();
+        println!(
+            "STRUCT-4 20-mer Helix Packing: Clashscore {:.1} -> {:.1} (-{:.1}%), Pruned {}, Time {:.2} ms, Total atoms {}",
+            m.initial_clashscore, m.final_clashscore, m.clash_reduction_pct, m.pruned_states, m.pack_time_ms, m.total_atoms
+        );
+        assert!(m.final_clashscore <= m.initial_clashscore, "Clashscore must not increase after DEE + ICM");
+
+        // 2. Validate covalent geometry within sidechains
+        let residues = &ws.out_residues[0..n];
+        for res in residues {
+            let res_name = std::str::from_utf8(&res.res_name).unwrap().trim();
+            if let Some(cb) = res.cb {
+                let d_ca_cb = ((res.ca[0] - cb[0]).powi(2) + (res.ca[1] - cb[1]).powi(2) + (res.ca[2] - cb[2]).powi(2)).sqrt();
+                assert!((d_ca_cb - 1.53).abs() < 0.05, "C_alpha - C_beta distance in {} must be ~1.53 Å (got {:.3} Å)", res_name, d_ca_cb);
+
+                if res.sidechain_len > 0 {
+                    let first_sc = &res.sidechain_atoms[0];
+                    let d_cb_sc1 = ((cb[0] - first_sc.pos[0]).powi(2) + (cb[1] - first_sc.pos[1]).powi(2) + (cb[2] - first_sc.pos[2]).powi(2)).sqrt();
+                    assert!(d_cb_sc1 > 1.30 && d_cb_sc1 < 1.90, "C_beta to first sidechain atom in {} must be covalent (got {:.3} Å)", res_name, d_cb_sc1);
+                }
+            } else {
+                assert_eq!(res_name, "GLY", "Only GLY can lack C_beta");
+            }
+        }
+
+        // 3. Export all-atom PDB and test roundtrip with parse_pdb_atoms & Bio2CoDesigner
+        let pdb_str = coords_to_allatom_pdb_string("TEST_20MER", residues);
+        let tmp_pdb_path = "target/test_struct4_allatom_roundtrip.pdb";
+        std::fs::write(tmp_pdb_path, &pdb_str).expect("Failed to write temporary test PDB");
+
+        let parsed_residues = parse_pdb_atoms(tmp_pdb_path).expect("parse_pdb_atoms failed on all-atom PDB");
+        assert_eq!(parsed_residues.len(), n, "Parsed residue count mismatch");
+
+        // Verify that parsed_residues has pure backbone (N, CA, C, O, CB) and sidechains are zeroed
+        for r in &parsed_residues {
+            assert_eq!(r.sidechain_len, 0, "parse_pdb_atoms must isolate backbone atoms from sidechains");
+            assert!(r.cb.is_some() || std::str::from_utf8(&r.res_name).unwrap().trim() == "GLY");
+        }
+
+        // Verify Bio2CoDesigner roundtrip compatibility: k-NN graph construction and scoring
+        let mut design_ws = Bio2Workspace::new(n);
+        let designer = Bio2CoDesigner::default();
+        designer.compute_geometric_potentials_into(&parsed_residues, true, &mut design_ws);
+        assert_eq!(design_ws.potentials.len(), n);
+        for p in &design_ws.potentials {
+            assert!(p.iter().all(|val| val.is_finite()));
+        }
+
+        let _ = std::fs::remove_file(tmp_pdb_path);
     }
 }
 

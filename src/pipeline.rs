@@ -779,6 +779,7 @@ pub struct FoldPipelineResult {
     pub solve_ms: f64,
     pub radius_of_gyration: f64,
     pub allatom_residues: Option<Vec<crate::export::ReconstructedResidue>>,
+    pub sidechain_metrics: Option<crate::export::SidechainPackingMetrics>,
 }
 
 struct RestraintPair {
@@ -1207,12 +1208,13 @@ pub fn reconstruct_3d_ca(probs: &[f32], n: usize) -> (Vec<[f64; 3]>, usize, f64)
     (best_coords, num_r, p_max)
 }
 
-/// Computes 3D protein folding reconstruction from sequence without printing to stdout.
-pub fn compute_pipeline_fold_parallel(
+/// Computes 3D protein folding reconstruction with explicit control over sidechain packing (STRUCT-4).
+pub fn compute_pipeline_fold_parallel_opts(
     record: &FastaRecord,
     config: &EsmConfig,
     weights: ModelWeightsRef,
     num_threads: usize,
+    pack_sidechains: bool,
 ) -> FoldPipelineResult {
     let seq = &record.sequence;
     let n = seq.len();
@@ -1267,7 +1269,7 @@ pub fn compute_pipeline_fold_parallel(
     let radius_of_gyration = (rg_sq / n as f64).sqrt();
 
     // If sequence length >= 3, compute full all-atom coordinates via KinematicBackboneSolver:
-    let allatom_residues = if n >= 3 {
+    let (allatom_residues, sidechain_metrics) = if n >= 3 {
         let mut ws = crate::export::AllAtomWorkspace::new(n);
         let mut res_names = Vec::with_capacity(n);
         let mut res_seqs = Vec::with_capacity(n);
@@ -1282,10 +1284,10 @@ pub fn compute_pipeline_fold_parallel(
             res_seqs.push((i + 1) as i32);
         }
         let solver = crate::export::KinematicBackboneSolver::default();
-        solver.reconstruct_into(&coords, &res_names, &res_seqs, &mut ws);
-        Some(ws.out_residues[0..n].to_vec())
+        let metrics = solver.reconstruct_into(&coords, &res_names, &res_seqs, &mut ws, pack_sidechains);
+        (Some(ws.out_residues[0..n].to_vec()), metrics)
     } else {
-        None
+        (None, None)
     };
 
     FoldPipelineResult {
@@ -1298,7 +1300,18 @@ pub fn compute_pipeline_fold_parallel(
         solve_ms,
         radius_of_gyration,
         allatom_residues,
+        sidechain_metrics,
     }
+}
+
+/// Computes 3D protein folding reconstruction from sequence without printing to stdout (defaults to sidechain packing).
+pub fn compute_pipeline_fold_parallel(
+    record: &FastaRecord,
+    config: &EsmConfig,
+    weights: ModelWeightsRef,
+    num_threads: usize,
+) -> FoldPipelineResult {
+    compute_pipeline_fold_parallel_opts(record, config, weights, num_threads, true)
 }
 
 /// Renders a summary table of the 3D folding result to stdout.
@@ -1320,8 +1333,24 @@ pub fn render_fold_summary(
     println!("  * 3D Geometric Solver Time:  {:.2} ms (Multi-start MDS + 450 gradient steps)", result.solve_ms);
     println!("  * Total End-to-End Latency:  {:.2} ms", result.forward_ms + result.solve_ms);
     if let Some(path) = export_pdb_path {
-        let mode_desc = if all_atom { "All-Atom Backbone + CB (N, CA, C, O, CB)" } else { "C-alpha Trace" };
+        let mode_desc = if all_atom {
+            if result.sidechain_metrics.is_some() {
+                "All-Atom Backbone + Rotameric Sidechains (STRUCT-4)"
+            } else {
+                "All-Atom Backbone + CB (N, CA, C, O, CB)"
+            }
+        } else {
+            "C-alpha Trace"
+        };
         println!("  * Exported PDB Structure:    \x1b[38;2;16;185;129m{}\x1b[0m ({})", path, mode_desc);
+    }
+    if let Some(ref m) = result.sidechain_metrics {
+        if all_atom {
+            println!(
+                "  * Sidechain Packing (DEE+ICM): Clashscore: {:.1} -> {:.1} (-{:.1}%), {} pruned rotamers in {:.2} ms ({} atoms)",
+                m.initial_clashscore, m.final_clashscore, m.clash_reduction_pct, m.pruned_states, m.pack_time_ms, m.total_atoms
+            );
+        }
     }
     println!();
 
@@ -1359,9 +1388,10 @@ pub fn run_pipeline_fold_parallel(
     num_threads: usize,
     export_pdb_path: Option<&str>,
     all_atom: bool,
+    pack_sidechains: bool,
     theme: &TerminalTheme,
 ) -> FoldPipelineResult {
-    let result = compute_pipeline_fold_parallel(record, config, weights, num_threads);
+    let result = compute_pipeline_fold_parallel_opts(record, config, weights, num_threads, pack_sidechains);
     if let Some(path) = export_pdb_path {
         let write_res = if all_atom && result.allatom_residues.is_some() {
             crate::export::export_allatom_pdb(path, &result.protein_id, result.allatom_residues.as_ref().unwrap())
