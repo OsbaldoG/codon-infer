@@ -202,6 +202,54 @@ Evaluated on dual-core Intel Sandy Bridge (Core i5-2520M @ 2.50 GHz, 2 physical 
 > **Multi-Token Tiled GEMM Acceleration (CI-1):**
 > In bidirectional forward pipelines (`dms`, `contacts`, and `fold`), the Tiled GEMM engine groups sequence tokens into $M_r = 4$ cache-blocked micro-kernels (`dot_row_batch_m4_avx2_fma`), eliminating per-token DRAM weight streaming. This accelerates sequence forward passes by up to **3.76× in FP32** and **2.41×–3.44× in quantized regimes (Q8_0/Q4_0)**, driving ESM-2 650M forward execution down to **2.3 s – 4.4 s** with exact numerical bit parity ($\cos = 1.00000000$).
 
+### 4. All-Atom Rotameric Packing & Clashscore Breakdown (STRUCT-6 Validation)
+
+Audited empirical metrics on Linux x86_64 across 6 experimental targets (Tsuboyama et al. 2023, PDB ground truth) comparing unoptimized rotamers against STRUCT-6 packing (reproducible with `cargo run --example diagnose_clash_sources --release`):
+
+| Target / State | Description | Total Clashes | Clashscore | bb–bb (sc) | sc–bb (sc) | sc–sc (sc) | Covalent-like (<1.65 Å) |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **2RRU (Ground Truth)** | Mouse p62 / SQSTM1 UBA domain | **0** | **0.0** | 0 (0.0) | 0 (0.0) | 0 (0.0) | 0 |
+| 2RRU (v1.12.0 Reconstructed) | NeRF + DEE + ICM + H-Bonds | **3** | **9.6** | 0 (0.0) | 1 (3.2) | 2 (6.4) | 2 |
+| **2GP8 (Ground Truth)** | Bacteriophage P22 tail accessory factor | **0** | **0.0** | 0 (0.0) | 0 (0.0) | 0 (0.0) | 0 |
+| 2GP8 (v1.12.0 Reconstructed) | NeRF + DEE + ICM + H-Bonds | **0** | **0.0** | 0 (0.0) | 0 (0.0) | 0 (0.0) | 0 |
+| **2L2D (Ground Truth)** | Human OTU domain-containing protein 7A | **0** | **0.0** | 0 (0.0) | 0 (0.0) | 0 (0.0) | 0 |
+| 2L2D (v1.12.0 Reconstructed) | NeRF + DEE + ICM + H-Bonds | **4** | **12.5** | 0 (0.0) | 1 (3.1) | 3 (9.3) | 2 |
+| **1AOY (Ground Truth)** | *E. coli* Arginine repressor C-terminal | **0** | **0.0** | 0 (0.0) | 0 (0.0) | 0 (0.0) | 0 |
+| 1AOY (v1.12.0 Reconstructed) | NeRF + DEE + ICM + H-Bonds | **1** | **1.8** | 0 (0.0) | 1 (1.8) | 0 (0.0) | 0 |
+| **1O6X (Ground Truth)** | Human Carboxypeptidase A2 pro-domain | **0** | **0.0** | 0 (0.0) | 0 (0.0) | 0 (0.0) | 0 |
+| 1O6X (v1.12.0 Reconstructed) | NeRF + DEE + ICM + H-Bonds | **10** | **17.5** | 0 (0.0) | 5 (8.7) | 5 (8.7) | 2 |
+| **3DKM (Ground Truth)** | Human HECTD1 E3 ubiquitin ligase | **2** | **3.5** | 0 (0.0) | 0 (0.0) | 2 (3.5) | 0 |
+| 3DKM (v1.12.0 Reconstructed) | NeRF + DEE + ICM + H-Bonds | **14** | **24.8** | 0 (0.0) | 5 (8.8) | 9 (15.9) | 8 |
+| **AVG EXPERIMENTAL CRYSTALS** | **Ground Truth Deposition** | **2** | **0.8** | **0 (0.0)** | **0 (0.0)** | **2 (0.8)** | **0** |
+| **AVG EXPERIMENTAL CRYSTALS** | **v1.12.0 Reconstructed** | **32** | **12.3** | **0 (0.0)** | **13 (5.0)** | **19 (7.3)** | **14** |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **CONTROL B: ESM-2 650M Backbone** | Fixed 5-atom backbone (no sidechains) | **26** | **15.5** | 26 (15.5) | 0 (0.0) | 0 (0.0) | 8 |
+| **CONTROL B: Initial Rotamers (r=0)**| Unoptimized Dunbrack candidate 0 | **566** | **214.3** | 26 (9.8) | 345 (130.6) | 195 (73.8) | 283 |
+| **CONTROL B: STRUCT-5 (v1.11.0)** | Ramachandran basins + graph exclusions | **196** | **74.2** | 26 (9.8) | 124 (47.0) | 46 (17.4) | 72 |
+| **CONTROL B: STRUCT-6 (v1.12.0)** | H-bonds + salt bridges + clash barrier | **194** | **73.5** | **26 (9.8)** | **120 (45.4)** | **48 (18.2)** | **61 (-78.4% vs init)** |
+
+> [!TIP]
+> **Reproducibility with zero dependencies:** Anyone cloning `codon-infer` from the XERJ Corpus Hub can immediately reproduce this exact benchmark table by running:
+> ```bash
+> cargo run --example diagnose_clash_sources --release
+> ```
+
+### 5. Structure-Guided Inverse Folding & Co-Design (BIO-2 / BIO-3 Benchmark)
+
+Audited performance of the 3D structure-conditioned sequence design engine ([`codon-infer design`](#h-3d-structure-guided-sequence-co-design--inverse-folding-design)) on native target backbones:
+
+| Benchmark Target | PDB ID | Residue Count | Exact Sequence Recovery | Physicochemical Conservation | 3D Potential Compute Time | End-to-End Latency |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Trp-cage Fold** | `2L2D` | 20 aa | **20.0%** (4 / 20) | **40.0%** (8 / 20) | **86.9 µs** (0 heap allocs) | **24.8 ms** (8M) / **415 ms** (650M) |
+| **OTU7A Ubiquitin Hydrolase** | `2L2D_full` | 42 aa | **19.0%** (8 / 42) | **35.7%** (15 / 42) | **297.5 µs** (0 heap allocs) | **1,633 ms** (8M) |
+| **ARGR Repressor** | `1AOY` | 78 aa | **21.8%** (17 / 78) | **41.0%** (32 / 78) | **492.1 µs** (0 heap allocs) | **2,450 ms** (8M) |
+
+* **Zero-Allocation 3D Potentials:** Evaluates coordination number ($B_i$), backbone $(\phi, \psi)$ dihedrals, and Lazaridis-Karplus desolvation directly into pre-allocated `Bio2Workspace` in **< 500 µs**.
+* **Reproducible Execution:**
+  ```bash
+  codon-infer design --pdb path/to/protein.pdb --export-fasta designed.fasta --export-json design.json
+  ```
+
 ---
 
 ## 🧬 Biological Exploration & Validation
@@ -491,13 +539,20 @@ Verify numerical primitives, SIMD vectorization parity, FASTA parser, and export
 ```bash
 cargo test --release
 ```
-Expected output (**57 tests executed: 56 passed, 0 failed, 1 ignored**):
+Expected output (**70 tests executed: 69 passed, 0 failed, 1 ignored**):
 ```text
-running 57 tests
+running 70 tests
 test benchmark::tests::test_benchmark_report_to_json_validity ... ok
 test benchmark::tests::test_discover_available_models ... ok
+test export::tests::test_allatom_kinematic_reconstruction ... ok
+test export::tests::test_allatom_with_sidechain_packing ... ok
 test export::tests::test_dms_row_and_csv_generation ... ok
+test export::tests::test_dynamic_bfactors_and_pdb_columns ... ok
 test export::tests::test_json_string_serializers ... ok
+test export::tests::test_struct5_ramachandran_basins_and_bbdep_rotamers ... ok
+test export::tests::test_struct6_chemical_flags_and_weights ... ok
+test export::tests::test_struct6_hbond_potential ... ok
+test export::tests::test_struct6_salt_bridge_potential ... ok
 test export::tests::test_pdb_and_tsv_export ... ok
 test fasta::tests::test_parse_multi_fasta_with_masks ... ok
 test fasta::tests::test_parse_raw_sequence_fallback ... ok
@@ -506,6 +561,7 @@ test mcp::tests::test_mcp_dispatch_with_weights_if_available ... ok
 test mcp::tests::test_mcp_json_parser_and_formatter ... ok
 test mcp::tests::test_mcp_resolve_record_fallback ... ok
 test mcp::tests::test_mcp_tools_list_schema ... ok
+test pipeline::tests::test_compute_plddt_scores ... ok
 test tests::test_attention_simd_parity_dk_16_24_32 ... ok
 test tests::test_attention_simd_parity_dk_64 ... ok
 test tests::test_bidirectional_logits_entropy ... ok
@@ -523,6 +579,7 @@ test tests::test_mask_token_encoding_and_decoding ... ok
 test tests::test_matmul_avx1_and_dispatch_parity ... ok
 test tests::test_matmul_fp32_parallel_parity ... ok
 test tests::test_matmul_q8_simd_parity ... ok
+test tests::test_q3_lut_quantization_roundtrip ... ok
 test tests::test_q8_0_quantization_roundtrip ... ok
 test tests::test_q8_weights_save_load_roundtrip ... ok
 test tests::test_simd_benchmark_parity_run ... ok
@@ -546,13 +603,16 @@ test tests_q4_simd::test_q4_edge_case_small_out_dim ... ok
 test tests_q4_simd::test_q4_edge_case_zero_blocks ... ok
 test tests_q4_simd::test_q4_parallel_vs_sequential_identity_threads ... ok
 test tests_q4_simd::test_q4_simd_parity_esm_dimensions ... ok
+test tests_regression::test_q3_lut_hybrid_regression_parity_and_rmsd ... ok
 test tests_regression::test_regression_esm2_fp32_all_scales_against_ref_npz ... ok
 test tests_regression::test_regression_quantized_q8_q4_against_ref_npz_including_3b ... ok
 test tests_regression::test_strict_fp32_loader_rejects_corrupted_size ... ok
+test tests_regression::test_struct4_sidechain_packing_and_biophysical_integrity ... ok
+test tests_regression::test_struct5_full_pipeline_bfactors_and_ramachandran ... ok
 test tests_regression::test_tiled_gemm_and_contact_head_v1_7_0 ... ok
 test benchmark::tests::test_multi_scale_simd_parity ... ok
 
-test result: ok. 56 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out
+test result: ok. 69 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out
 ```
 
 ### 4. Subcommands & Bioinformatic Pipelines
@@ -606,17 +666,20 @@ codon-infer contacts --model esm2_650m_q8_0.bin --threads 2 --fasta proteins.fas
 codon-infer contacts --model esm2_650m_q8_0.bin --threads 4 --sequence "MCMPCFTTDHQMARKCDD" --export-pdb contacts_backbone.pdb
 ```
 
-#### E. Native Q4_0 & Q8_0 Model Quantization (`quantize`)
-Convert FP32 checkpoint weights directly into native zero-copy `Q4_0` or `Q8_0` binaries on disk with universal `CODQ` headers:
+#### E. Native Q3_LUT, Q4_0 & Q8_0 Model Quantization (`quantize`)
+Convert FP32 checkpoint weights directly into native zero-copy `Q3_LUT` (3.50 bpw), `Q4_0` (4.0 bpw), or `Q8_0` binaries on disk with universal `CODQ` headers:
 ```bash
+# Quantize ESM-2 650M weights to Q3_LUT (sub-4-bit Lloyd-Max table, 3.50 bpw, L1d cache resident):
+codon-infer quantize q3_lut --model esm2_650m_weights.bin --output esm2_650m_q3_lut.bin
+
 # Quantize ESM-2 650M weights from FP32 (~2.60 GB) to Q4_0 (395.41 MiB / 414.62 MB, 6.28x smaller):
-codon-infer quantize --model esm2_650m_weights.bin --output esm2_650m_q4_0.bin --format q4_0
+codon-infer quantize q4_0 --model esm2_650m_weights.bin --output esm2_650m_q4_0.bin
 
-# Or rely on automatic format detection from output filename:
-codon-infer quantize --model esm2_650m_weights.bin --output esm2_650m_q4_0.bin
-codon-infer quantize --model esm2_650m_weights.bin --output esm2_650m_q8_0.bin
+# Quantize ESM-2 650M weights to Q8_0 (704.7 MB, 99.98% logit fidelity):
+codon-infer quantize q8_0 --model esm2_650m_weights.bin --output esm2_650m_q8_0.bin
 
-# Direct instant zero-copy inference using the resulting quantized binary (auto-detected via CODQ header):
+# Direct instant zero-copy inference using Q3_LUT, Q4_0, or Q8_0 (auto-detected via CODQ header):
+codon-infer fold --model esm2_650m_q3_lut.bin --q3 --sequence "NLYIQWLKDGGPSSGRPPPS" --all-atom --export-pdb fold_q3.pdb
 codon-infer generate --model esm2_650m_q4_0.bin --threads 4 --sequence "MCMPCFTTDHQMARKCDD"
 codon-infer dms --model esm2_650m_q4_0.bin --threads 4 --fasta target.fasta --window 128
 ```
@@ -646,17 +709,36 @@ Available suites:
 * `stress`: Dynamic context continuous inference cache-thrashing stability test with slice Q8 quantization.
 * `scaling`: Context length scaling (L = 32 → 256) memory and latency benchmark adapting to model depth.
 
-#### G. Zero-Trunk 3D Protein Folding (`fold`)
-Reconstruct ab initio 3D $C_\alpha$ backbone coordinates in standard `.pdb` or `.tsv` format in **15–35 ms** via Metric MDS and biophysical gradient optimization:
+#### G. Zero-Trunk 3D Protein Folding & All-Atom Reconstruction (`fold`)
+Reconstruct ab initio 3D $C_\alpha$ backbone coordinates in standard `.pdb` or `.tsv` format in **15–35 ms** via Metric MDS and biophysical gradient optimization (`STRUCT-2`), and optionally reconstruct full all-atom backbones and rotameric sidechains (`STRUCT-3/4/5/6`):
 ```bash
-# Rapid 3D backbone reconstruction from sequence with ESM-2 8M:
+# Rapid 3D C_alpha backbone reconstruction from sequence with ESM-2 8M:
 codon-infer fold --sequence "MCMPCFTTDHQMARKCDD" --export-pdb structure_8m.pdb
 
-# High-precision folding with ESM-2 650M Q4_0 and multi-threaded Tiled GEMM:
-codon-infer fold --model esm2_650m_q4_0.bin --threads 4 --sequence "NLYIQWLKDGGPSSGRPPPS" --export-pdb trpcage.pdb --export-tsv trpcage.tsv
+# Full All-Atom reconstruction (N, CA, C, O, CB backbone + NeRF sidechain packing + DEE + ICM + H-bonds):
+codon-infer fold --sequence "NLYIQWLKDGGPSSGRPPPS" --all-atom --export-pdb structure_allatom.pdb
+
+# High-precision All-Atom folding with ESM-2 650M Q4_0 and multi-threaded Tiled GEMM:
+codon-infer fold --model esm2_650m_q4_0.bin --threads 4 --sequence "NLYIQWLKDGGPSSGRPPPS" --all-atom --export-pdb trpcage_allatom.pdb --export-tsv trpcage.tsv
+
+# Kinematic backbone only (N, CA, C, O, CB) without sidechains:
+codon-infer fold --sequence "NLYIQWLKDGGPSSGRPPPS" --all-atom --no-sidechains --export-pdb backbone_only.pdb
 
 # Fold target protein sequence from multi-FASTA file:
-codon-infer fold --model esm2_650m_q4_0.bin --threads 4 --fasta target.fasta --export-pdb target_folded.pdb
+codon-infer fold --model esm2_650m_q4_0.bin --threads 4 --fasta target.fasta --all-atom --export-pdb target_folded.pdb
+```
+
+#### H. 3D Structure-Guided Sequence Co-Design & Inverse Folding (`design`)
+Design optimal amino acid sequences conditioned on 3D backbone atomic coordinates using 3D k-NN geometric graphs, Ramachandran sterics, and Lazaridis-Karplus desolvation potentials (`BIO-2` / `BIO-3`):
+```bash
+# Sequence co-design from an experimental or predicted PDB structure:
+codon-infer design --pdb structure.pdb --export-fasta designed.fasta --export-json design.json
+
+# Sequence-blind inverse folding (re-designing without seeing native residue identities):
+codon-infer design --pdb structure.pdb --blind --temperature 0.1 --export-fasta blind_designed.fasta
+
+# End-to-end: fold from sequence then co-design new compatible sequences:
+codon-infer design --sequence "MCMPCFTTDHQMARKCDD" --export-fasta redesigned.fasta
 ```
 
 ### 5. Model Context Protocol (MCP) Server
@@ -675,7 +757,8 @@ cargo run --release --bin codon-infer-mcp -- --model esm2_650m_q8_0.bin
 * `codon_infer_inpaint`: Reconstructs masked residues (`*`) returning top-5 amino acid candidates with probabilities and physicochemical classifications.
 * `codon_infer_dms`: Runs in silico saturation mutagenesis from raw sequence or FASTA path, returning critical catalytic sites (Δ log P ≤ -3.8) and mutational tolerances.
 * `codon_infer_contacts`: Computes epistatic contact pairs (APC) and identifies putative disulfide bridges (`Cys-Cys`).
-* `codon_infer_fold`: Reconstructs publication-grade 3D protein structure ($C_\alpha$ backbone coordinates in `.pdb` format) via Zero-Trunk MDS and biophysical gradient optimization.
+* `codon_infer_fold`: Reconstructs publication-grade 3D protein structure ($C_\alpha$ backbone coordinates or all-atom `.pdb` format via `all_atom: true`) via Zero-Trunk MDS, NeRF, and rotamer packing.
+* `codon_infer_design`: Zero-shot inverse folding & 3D structure-sequence co-design using ESM-2 logits combined with 3D structural geometric potential (`BIO-2`/`BIO-3`, supports PDB input or direct sequence folding).
 
 ---
 
@@ -686,29 +769,34 @@ cargo run --release --bin codon-infer-mcp -- --model esm2_650m_q8_0.bin
 | :--- | :--- | :--- |
 | `-h`, `--help` | Display help banner with subcommand guide | - |
 | `-V`, `--version` | Display version and active SIMD vector engine | - |
-| `-m`, `--model <PATH>` | Custom ESM-2 raw FP32/Q8_0/Q4_0 weights binary (or `all` for comparative benchmark) | `esm2_8m_weights.bin` |
+| `-m`, `--model <PATH>` | Custom ESM-2 raw FP32/Q8_0/Q4_0/Q3_LUT weights binary (or `all` for comparative benchmark) | `esm2_8m_weights.bin` |
 | `-t`, `--threads <N>` | Worker threads for parallel matrix-vector execution | Detected physical cores |
-| `--quantize <q4_0|q8_0|fp32>`, `--q4`, `--q8` | Execution quantization mode (`auto`, `fp32`, `q8_0`, `q4_0`). `--q4` / `--q8` are shortcuts | `auto` |
-| `--color <auto|always|never>` | Control ANSI TrueColor terminal styling | `auto` |
+| `--quantize <q3_lut\|q4_0\|q8_0\|fp32>`, `--q3`, `--q4`, `--q8` | Execution quantization mode (`auto`, `fp32`, `q8_0`, `q4_0`, `q3_lut`). `--q3`, `--q4`, `--q8` are shortcuts | `auto` |
+| `--color <auto\|always\|never>` | Control ANSI TrueColor terminal styling | `auto` |
 | `--no-color` | Strictly disable ANSI terminal escapes (NO_COLOR standard) | `false` |
 
 ### Pipeline Options
 | Option | Applicable Subcommands | Description | Default |
 | :--- | :--- | :--- | :--- |
-| `-s`, `--sequence <STR>` | `generate`, `inpaint`, `dms`, `contacts`, `fold` | Direct input amino acid sequence | `"M"` (`generate` only; required if `--fasta` is omitted in other subcommands) |
-| `-f`, `--fasta <PATH>` | `generate`, `inpaint`, `dms`, `contacts`, `fold` | Path to FASTA file (or `-` for stdin) | - |
+| `-s`, `--sequence <STR>` | `generate`, `inpaint`, `dms`, `contacts`, `fold`, `design` | Direct input amino acid sequence | `"M"` (`generate` only; required if `--fasta`/`--pdb` omitted) |
+| `-f`, `--fasta <PATH>` | `generate`, `inpaint`, `dms`, `contacts`, `fold`, `design` | Path to FASTA file (or `-` for stdin) | - |
+| `-p`, `--pdb <PATH>` | `design` | Path to local PDB file for 3D structure-conditioned inverse folding | - |
+| `--all-atom` | `fold` | Reconstruct full all-atom backbone + rotameric sidechains via NeRF + DEE + ICM (STRUCT-3/4/5/6) | `false` |
+| `--no-sidechains` | `fold` | Disable sidechain packing (retain only N, CA, C, O, CB backbone in all-atom mode) | `false` |
+| `--blind` | `design` | Sequence-blind inverse folding (evaluates geometric potentials without wildtype identities) | `false` |
+| `--export-fasta <PATH>` | `design` | Destination file path for designed sequence FASTA | - |
 | `--export-pdb <PATH>` | `contacts`, `fold` | Destination file path for standard `.pdb` atomic coordinates | - |
 | `--export-tsv <PATH>` | `fold` | Destination file path for tab-separated 3D coordinates table | - |
-| `--output <PATH>`, `-o` | `quantize` | Output path for quantized binary (`*_q4_0.bin` or `*_q8_0.bin`) | - |
-| `--format <q4_0|q8_0>`, `-f` | `quantize` | Target quantization format (optional if inferrable from output filename) | `q8_0` |
+| `--output <PATH>`, `-o` | `quantize` | Output path for quantized binary (`*_q3_lut.bin`, `*_q4_0.bin`, or `*_q8_0.bin`) | - |
+| `--format <q3_lut\|q4_0\|q8_0>`, `-f` | `quantize` | Target quantization format (optional if inferrable from output filename) | `q8_0` |
 | `--export-csv <PATH>`| `dms`, `contacts` | Destination path for rectangular matrix / table | - |
-| `--export-json <PATH>`| `dms`, `contacts`, `inpaint`, `fold`, `benchmark` | Destination path for structured JSON analysis / report | - |
+| `--export-json <PATH>`| `dms`, `contacts`, `inpaint`, `fold`, `design`, `benchmark` | Destination path for structured JSON analysis / report | - |
 | `--fast`, `--wt-marginal` | `dms` | Fast 1-Pass Wildtype Marginal scoring mode (accelerates up to 42×) | `false` |
 | `--window <USIZE>` | `dms` | Sliding window context size for long proteins | `128` |
 | `--stride <USIZE>` | `dms` | Sliding window stride step size | `64` |
 | `--min-separation <USIZE>` | `contacts` | Minimum sequence separation for epistatic contacts | `6` |
 | `--top-l <F32>` | `contacts` | Top L contact factor threshold (e.g., 1.0 = L contacts) | `1.0` |
-| `--temperature <F32>`| `generate` | Sampling temperature (0.0 = greedy argmax) | `0.7` |
+| `--temperature <F32>`| `generate`, `design` | Sampling temperature (0.0 = greedy argmax, default 0.1 for design) | `0.7` (`generate`) / `0.1` (`design`) |
 | `--max-tokens <USIZE>`| `generate` | Maximum new residues to generate | `1024` |
 | `--seed <U64>` | `generate` | Custom pseudo-random number generator seed | - |
 | `--suite <STR>` | `benchmark` | Benchmark suite (full, simd, mlm, dms, contacts, inpainting, stress, scaling) | `"full"` |
@@ -722,7 +810,7 @@ codon-infer/
 ├── .cargo/
 │   └── config.toml         # Native CPU optimization flags (-C target-cpu=native)
 ├── .gitignore              # Clean repository filter (build artifacts & backups ignored)
-├── Cargo.toml              # Zero-dependency specification (v1.8.0, edition 2024)
+├── Cargo.toml              # Zero-dependency specification (v1.12.0, edition 2024)
 ├── esm2_8m_weights.bin     # ESM-2 8M FP32 weights (7.52M parameters, ~30 MB)
 ├── scripts/
 │   ├── download_weights.sh # Fast GitHub Releases weights downloader
@@ -766,6 +854,12 @@ codon-infer/
 - [x] Canonical Deep Mutational Scanning (BIO-1) without heuristic clamps + 1-pass Wildtype Marginal (16,170 mut/s).
 - [x] Official Multi-Layer Contact Prediction Head (L × H APC + Logistic Regression) with streaming O(N²) memory.
 - [x] Zero-Trunk 3D Geometric Reconstruction (STRUCT-2) with Metric MDS + Biophysical Gradient Descent (PDB export).
+- [x] Pauling-Corey kinematic full-backbone reconstruction (STRUCT-3).
+- [x] All-atom sidechain rotamer packing via NeRF + DEE + ICM with soft-core LJ (STRUCT-4).
+- [x] Backbone-dependent Ramachandran dihedral macro-basins and dynamic pLDDT B-factors (STRUCT-5).
+- [x] Directional 10-12 hydrogen bonds and screened salt bridges with MolProbity steric barrier (STRUCT-6).
+- [x] Zero-allocation 3D structure-guided sequence co-design & inverse folding (BIO-2 / BIO-3).
+- [x] Hybrid Q3_LUT sub-4-bit quantization with L1d-cache resident matrix multiplication (CI-2).
 - [ ] ARM NEON SIMD kernels for Apple Silicon (M1/M2/M3/M4) and Raspberry Pi.
 
 ---

@@ -205,6 +205,54 @@ Evaluado en procesador de doble núcleo Intel Sandy Bridge (Core i5-2520M @ 2.50
 > **Aceleración con Motor Tiled GEMM Multi-Token (CI-1):**
 > En los pipelines forward de secuencias completas (`dms`, `contacts` y `fold`), el motor Tiled GEMM agrupa la evaluación de tokens en micro-kernels de $M_r = 4$ tokens bloqueados en caché (`dot_row_batch_m4_avx2_fma`), eliminando la relectura secuencial de matrices de pesos desde DRAM. Esto acelera las pasadas forward de secuencia completa hasta **3.76× en FP32** y **2.41×–3.44× en regímenes cuantizados (Q8_0/Q4_0)**, reduciendo el forward de ESM-2 650M a solo **2.3 s – 4.4 s** manteniendo paridad numérica bit a bit exacta ($\cos = 1.00000000$).
 
+### 4. Empaquetamiento All-Atom Rotamérico y Desglose de Choques (Validación STRUCT-6)
+
+Métricas empíricas auditadas en Linux x86_64 sobre 6 dianas cristalográficas experimentales (Tsuboyama et al. 2023, depósito PDB de referencia) comparando rotámeros iniciales sin optimizar frente al empaquetamiento STRUCT-6 (reproducible con `cargo run --example diagnose_clash_sources --release`):
+
+| Diana / Estado | Descripción | Choques Totales | Clashscore | bb–bb (sc) | sc–bb (sc) | sc–sc (sc) | Covalente (<1.65 Å) |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **2RRU (Referencia PDB)** | Dominio UBA de p62 / SQSTM1 murino | **0** | **0.0** | 0 (0.0) | 0 (0.0) | 0 (0.0) | 0 |
+| 2RRU (Reconstruido v1.12.0) | NeRF + DEE + ICM + Enlaces H | **3** | **9.6** | 0 (0.0) | 1 (3.2) | 2 (6.4) | 2 |
+| **2GP8 (Referencia PDB)** | Factor accesorio de cola fago P22 | **0** | **0.0** | 0 (0.0) | 0 (0.0) | 0 (0.0) | 0 |
+| 2GP8 (Reconstruido v1.12.0) | NeRF + DEE + ICM + Enlaces H | **0** | **0.0** | 0 (0.0) | 0 (0.0) | 0 (0.0) | 0 |
+| **2L2D (Referencia PDB)** | Proteína 7A con dominio OTU humana | **0** | **0.0** | 0 (0.0) | 0 (0.0) | 0 (0.0) | 0 |
+| 2L2D (Reconstruido v1.12.0) | NeRF + DEE + ICM + Enlaces H | **4** | **12.5** | 0 (0.0) | 1 (3.1) | 3 (9.3) | 2 |
+| **1AOY (Referencia PDB)** | Represor Arginina C-terminal *E. coli* | **0** | **0.0** | 0 (0.0) | 0 (0.0) | 0 (0.0) | 0 |
+| 1AOY (Reconstruido v1.12.0) | NeRF + DEE + ICM + Enlaces H | **1** | **1.8** | 0 (0.0) | 1 (1.8) | 0 (0.0) | 0 |
+| **1O6X (Referencia PDB)** | Pro-dominio Carboxipeptidasa A2 humana | **0** | **0.0** | 0 (0.0) | 0 (0.0) | 0 (0.0) | 0 |
+| 1O6X (Reconstruido v1.12.0) | NeRF + DEE + ICM + Enlaces H | **10** | **17.5** | 0 (0.0) | 5 (8.7) | 5 (8.7) | 2 |
+| **3DKM (Referencia PDB)** | Ubiquitina ligasa E3 HECTD1 humana | **2** | **3.5** | 0 (0.0) | 0 (0.0) | 2 (3.5) | 0 |
+| 3DKM (Reconstruido v1.12.0) | NeRF + DEE + ICM + Enlaces H | **14** | **24.8** | 0 (0.0) | 5 (8.8) | 9 (15.9) | 8 |
+| **MEDIA CRISTALES EXPERIMENTALES** | **Depósito Nativo de Referencia** | **2** | **0.8** | **0 (0.0)** | **0 (0.0)** | **2 (0.8)** | **0** |
+| **MEDIA CRISTALES EXPERIMENTALES** | **Reconstruido v1.12.0** | **32** | **12.3** | **0 (0.0)** | **13 (5.0)** | **19 (7.3)** | **14** |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **CONTROL B: Esqueleto ESM-2 650M** | Esqueleto de 5 átomos fijado (sin sc) | **26** | **15.5** | 26 (15.5) | 0 (0.0) | 0 (0.0) | 8 |
+| **CONTROL B: Rotámeros Iniciales (r=0)**| Candidato Dunbrack 0 no optimizado | **566** | **214.3** | 26 (9.8) | 345 (130.6) | 195 (73.8) | 283 |
+| **CONTROL B: STRUCT-5 (v1.11.0)** | Cuencas Ramachandran + exclusiones | **196** | **74.2** | 26 (9.8) | 124 (47.0) | 46 (17.4) | 72 |
+| **CONTROL B: STRUCT-6 (v1.12.0)** | Enlaces H + puentes salinos + barrera | **194** | **73.5** | **26 (9.8)** | **120 (45.4)** | **48 (18.2)** | **61 (-78.4% vs init)** |
+
+> [!TIP]
+> **Reproducibilidad con cero dependencias:** Cualquier investigador o desarrollador que clone `codon-infer` desde el XERJ Corpus Hub puede reproducir inmediatamente esta tabla exacta ejecutando:
+> ```bash
+> cargo run --example diagnose_clash_sources --release
+> ```
+
+### 5. Co-Diseño y Plegamiento Inverso Guiado por Estructura 3D (Benchmark BIO-2 / BIO-3)
+
+Rendimiento auditado del motor de codiseño de secuencias condicionado a estructuras 3D ([`codon-infer design`](#h-co-diseño-de-secuencias-y-plegamiento-inverso-guiado-por-estructura-3d-design)) sobre esqueletos nativos:
+
+| Diana de Evaluación | PDB ID | Residuos | Recuperación Exacta de Secuencia | Conservación Fisicoquímica | Tiempo Cómputo Potencial 3D | Latencia Extremo a Extremo |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Plegamiento Trp-cage** | `2L2D` | 20 aa | **20.0%** (4 / 20) | **40.0%** (8 / 20) | **86.9 µs** (0 heap allocs) | **24.8 ms** (8M) / **415 ms** (650M) |
+| **Hidrolasa de Ubiquitina OTU7A** | `2L2D_full` | 42 aa | **19.0%** (8 / 42) | **35.7%** (15 / 42) | **297.5 µs** (0 heap allocs) | **1,633 ms** (8M) |
+| **Represor ARGR** | `1AOY` | 78 aa | **21.8%** (17 / 78) | **41.0%** (32 / 78) | **492.1 µs** (0 heap allocs) | **2,450 ms** (8M) |
+
+* **Potenciales 3D de Cero Asignaciones:** Evalúa números de coordinación local ($B_i$), diedros del esqueleto $(\phi, \psi)$ y desolvatación de Lazaridis-Karplus directamente en `Bio2Workspace` preasignado en **< 500 µs**.
+* **Ejecución Reproducible:**
+  ```bash
+  codon-infer design --pdb ruta/a/proteina.pdb --export-fasta disenada.fasta --export-json diseno.json
+  ```
+
 ---
 
 ## 🧬 Exploración Biológica y Validación
@@ -494,13 +542,20 @@ Valide las primitivas numéricas, la paridad de vectorización SIMD, el parser F
 ```bash
 cargo test --release
 ```
-Salida esperada (**57 tests ejecutados: 56 pasados, 0 fallidos, 1 ignorado**):
+Salida esperada (**70 tests ejecutados: 69 pasados, 0 fallidos, 1 ignorado**):
 ```text
-running 57 tests
+running 70 tests
 test benchmark::tests::test_benchmark_report_to_json_validity ... ok
 test benchmark::tests::test_discover_available_models ... ok
+test export::tests::test_allatom_kinematic_reconstruction ... ok
+test export::tests::test_allatom_with_sidechain_packing ... ok
 test export::tests::test_dms_row_and_csv_generation ... ok
+test export::tests::test_dynamic_bfactors_and_pdb_columns ... ok
 test export::tests::test_json_string_serializers ... ok
+test export::tests::test_struct5_ramachandran_basins_and_bbdep_rotamers ... ok
+test export::tests::test_struct6_chemical_flags_and_weights ... ok
+test export::tests::test_struct6_hbond_potential ... ok
+test export::tests::test_struct6_salt_bridge_potential ... ok
 test export::tests::test_pdb_and_tsv_export ... ok
 test fasta::tests::test_parse_multi_fasta_with_masks ... ok
 test fasta::tests::test_parse_raw_sequence_fallback ... ok
@@ -509,6 +564,7 @@ test mcp::tests::test_mcp_dispatch_with_weights_if_available ... ok
 test mcp::tests::test_mcp_json_parser_and_formatter ... ok
 test mcp::tests::test_mcp_resolve_record_fallback ... ok
 test mcp::tests::test_mcp_tools_list_schema ... ok
+test pipeline::tests::test_compute_plddt_scores ... ok
 test tests::test_attention_simd_parity_dk_16_24_32 ... ok
 test tests::test_attention_simd_parity_dk_64 ... ok
 test tests::test_bidirectional_logits_entropy ... ok
@@ -526,6 +582,7 @@ test tests::test_mask_token_encoding_and_decoding ... ok
 test tests::test_matmul_avx1_and_dispatch_parity ... ok
 test tests::test_matmul_fp32_parallel_parity ... ok
 test tests::test_matmul_q8_simd_parity ... ok
+test tests::test_q3_lut_quantization_roundtrip ... ok
 test tests::test_q8_0_quantization_roundtrip ... ok
 test tests::test_q8_weights_save_load_roundtrip ... ok
 test tests::test_simd_benchmark_parity_run ... ok
@@ -549,13 +606,16 @@ test tests_q4_simd::test_q4_edge_case_small_out_dim ... ok
 test tests_q4_simd::test_q4_edge_case_zero_blocks ... ok
 test tests_q4_simd::test_q4_parallel_vs_sequential_identity_threads ... ok
 test tests_q4_simd::test_q4_simd_parity_esm_dimensions ... ok
+test tests_regression::test_q3_lut_hybrid_regression_parity_and_rmsd ... ok
 test tests_regression::test_regression_esm2_fp32_all_scales_against_ref_npz ... ok
 test tests_regression::test_regression_quantized_q8_q4_against_ref_npz_including_3b ... ok
 test tests_regression::test_strict_fp32_loader_rejects_corrupted_size ... ok
+test tests_regression::test_struct4_sidechain_packing_and_biophysical_integrity ... ok
+test tests_regression::test_struct5_full_pipeline_bfactors_and_ramachandran ... ok
 test tests_regression::test_tiled_gemm_and_contact_head_v1_7_0 ... ok
 test benchmark::tests::test_multi_scale_simd_parity ... ok
 
-test result: ok. 56 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out
+test result: ok. 69 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out
 ```
 
 ### 4. Subcomandos y Pipelines Bioinformáticos
@@ -609,11 +669,14 @@ codon-infer contacts --model esm2_650m_q8_0.bin --threads 2 --fasta proteins.fas
 codon-infer contacts --model esm2_650m_q8_0.bin --threads 4 --sequence "MCMPCFTTDHQMARKCDD" --export-pdb contacts_backbone.pdb
 ```
 
-#### E. Cuantización Nativa de Modelos a Q4_0 y Q8_0 (`quantize`)
-Convierte los pesos de puntos de control FP32 directamente en binarios zero-copy optimizados `Q4_0` o `Q8_0` en disco con cabeceras universales `CODQ`:
+#### E. Cuantización Nativa de Modelos a Q3_LUT, Q4_0 y Q8_0 (`quantize`)
+Convierte los pesos de puntos de control FP32 directamente en binarios zero-copy optimizados `Q3_LUT`, `Q4_0` o `Q8_0` en disco con cabeceras universales `CODQ` de 64 bytes:
 ```bash
 # Cuantizar pesos FP32 de ESM-2 650M (~2.60 GB) a binario directo Q4_0 (395.41 MiB / 414.62 MB, 6.28x menor):
 codon-infer quantize --model esm2_650m_weights.bin --output esm2_650m_q4_0.bin --format q4_0
+
+# Cuantizar ESM-2 650M al formato ultracompacto sub-4-bit Q3_LUT:
+codon-infer quantize --model esm2_650m_weights.bin --output esm2_650m_q3_lut.bin --format q3_lut
 
 # O utilizar autodetección automática del formato según el nombre del archivo de salida:
 codon-infer quantize --model esm2_650m_weights.bin --output esm2_650m_q4_0.bin
@@ -649,17 +712,36 @@ Suites disponibles:
 * `stress`: Prueba de estabilidad continua bajo sobrecarga de caché con cuantización dinámica de rebanadas Q8.
 * `scaling`: Benchmark de escalamiento de longitud de contexto (L = 32 → 256) adaptativo a la profundidad de capas del modelo.
 
-#### G. Reconstrucción y Plegamiento Proteico 3D Zero-Trunk (`fold`)
-Reconstruye coordenadas 3D $C_\alpha$ *ab initio* en formato estándar `.pdb` o `.tsv` en **15–35 ms** mediante MDS Métrico y optimización biofísica por gradiente:
+#### G. Reconstrucción y Plegamiento Proteico 3D Zero-Trunk y All-Atom (`fold`)
+Reconstruye coordenadas 3D $C_\alpha$ o coordenadas all-atom completas (esqueleto $N, C_\alpha, C, O, C_\beta$ y cadenas laterales empaquetadas $\chi_1 \dots \chi_4$) en formato estándar `.pdb` o `.tsv` mediante MDS Métrico, NeRF, acondicionamiento de Ramachandran y empaquetamiento rotamérico (`STRUCT-2` a `STRUCT-6`):
 ```bash
-# Reconstrucción 3D rápida del esqueleto desde secuencia con ESM-2 8M:
+# Reconstrucción 3D rápida del esqueleto C_alpha desde secuencia con ESM-2 8M:
 codon-infer fold --sequence "MCMPCFTTDHQMARKCDD" --export-pdb structure_8m.pdb
 
-# Plegamiento de alta precisión con ESM-2 650M Q4_0 y motor multihilo Tiled GEMM:
-codon-infer fold --model esm2_650m_q4_0.bin --threads 4 --sequence "NLYIQWLKDGGPSSGRPPPS" --export-pdb trpcage.pdb --export-tsv trpcage.tsv
+# Reconstrucción All-Atom completa (esqueleto N, CA, C, O, CB + empaquetamiento NeRF + DEE + ICM + enlaces H):
+codon-infer fold --sequence "NLYIQWLKDGGPSSGRPPPS" --all-atom --export-pdb structure_allatom.pdb
+
+# Plegamiento All-Atom de alta precisión con ESM-2 650M Q4_0 y motor multihilo Tiled GEMM:
+codon-infer fold --model esm2_650m_q4_0.bin --threads 4 --sequence "NLYIQWLKDGGPSSGRPPPS" --all-atom --export-pdb trpcage_allatom.pdb --export-tsv trpcage.tsv
+
+# Solo esqueleto cinemático (N, CA, C, O, CB) sin cadenas laterales:
+codon-infer fold --sequence "NLYIQWLKDGGPSSGRPPPS" --all-atom --no-sidechains --export-pdb backbone_only.pdb
 
 # Plegar secuencia de proteína diana desde archivo multi-FASTA:
-codon-infer fold --model esm2_650m_q4_0.bin --threads 4 --fasta target.fasta --export-pdb target_folded.pdb
+codon-infer fold --model esm2_650m_q4_0.bin --threads 4 --fasta target.fasta --all-atom --export-pdb target_folded.pdb
+```
+
+#### H. Co-Diseño de Secuencias y Plegamiento Inverso Guiado por Estructura 3D (`design`)
+Diseña secuencias de aminoácidos óptimas condicionadas a coordenadas atómicas del esqueleto 3D mediante grafos geométricos k-NN 3D, restricciones estéricas de Ramachandran y potenciales de desolvatación de Lazaridis-Karplus (`BIO-2` / `BIO-3`):
+```bash
+# Co-diseño de secuencia a partir de una estructura PDB experimental o predicha:
+codon-infer design --pdb structure.pdb --export-fasta designed.fasta --export-json design.json
+
+# Plegamiento inverso ciego (rediseño sin observar identidades de residuos nativos):
+codon-infer design --pdb structure.pdb --blind --temperature 0.1 --export-fasta blind_designed.fasta
+
+# De extremo a extremo: plegar desde secuencia y co-diseñar secuencias compatibles:
+codon-infer design --sequence "MCMPCFTTDHQMARKCDD" --export-fasta redesigned.fasta
 ```
 
 ### 5. Servidor Model Context Protocol (MCP)
@@ -678,7 +760,8 @@ cargo run --release --bin codon-infer-mcp -- --model esm2_650m_q8_0.bin
 * `codon_infer_inpaint`: Reconstruye residuos enmascarados (`*`) devolviendo los 5 candidatos principales con sus probabilidades y clasificación fisicoquímica.
 * `codon_infer_dms`: Ejecuta mutagénesis de saturación *in silico* desde una secuencia cruda o archivo FASTA, identificando posiciones catalíticas críticas (Δ log P ≤ -3.8) y tolerancias mutacionales.
 * `codon_infer_contacts`: Calcula pares de contacto epistáticos (APC) y detecta puentes disulfuro candidatos (`Cys-Cys`).
-* `codon_infer_fold`: Reconstruye el plegamiento proteico 3D de nivel publicación (coordenadas $C_\alpha$ en formato `.pdb`) mediante MDS Zero-Trunk y optimización por gradiente biofísico.
+* `codon_infer_fold`: Reconstruye el plegamiento proteico 3D de nivel publicación (coordenadas $C_\alpha$ o formato all-atom `.pdb` mediante `all_atom: true`) mediante MDS Zero-Trunk, NeRF y empaquetamiento rotamérico.
+* `codon_infer_design`: Plegamiento inverso zero-shot y co-diseño de estructura-secuencia 3D combinando logits ESM-2 con potencial geométrico estructural 3D (`BIO-2`/`BIO-3`, soporta entrada PDB o plegamiento directo desde secuencia).
 
 ---
 
@@ -689,29 +772,34 @@ cargo run --release --bin codon-infer-mcp -- --model esm2_650m_q8_0.bin
 | :--- | :--- | :--- |
 | `-h`, `--help` | Muestra el panel de ayuda con la guía de subcomandos | - |
 | `-V`, `--version` | Muestra la versión y el motor vectorial SIMD activo | - |
-| `-m`, `--model <RUTA>` | Ruta al binario personalizado de pesos ESM-2 en FP32, Q8_0 o Q4_0 (o `all` para benchmark comparativo) | `esm2_8m_weights.bin` |
+| `-m`, `--model <RUTA>` | Ruta al binario personalizado de pesos ESM-2 en FP32, Q8_0, Q4_0 o Q3_LUT (o `all` para benchmark comparativo) | `esm2_8m_weights.bin` |
 | `-t`, `--threads <N>` | Hilos de trabajo para la ejecución paralela matriz-vector | Núcleos físicos detectados |
-| `--quantize <q4_0|q8_0|fp32>`, `--q4`, `--q8` | Modo de cuantización en ejecución (`auto`, `fp32`, `q8_0`, `q4_0`). `--q4` / `--q8` son atajos | `auto` |
-| `--color <auto|always|never>` | Controla el estilizado de la terminal mediante ANSI TrueColor | `auto` |
+| `--quantize <q3_lut\|q4_0\|q8_0\|fp32>`, `--q3`, `--q4`, `--q8` | Modo de cuantización en ejecución (`auto`, `fp32`, `q8_0`, `q4_0`, `q3_lut`). `--q3`, `--q4`, `--q8` son atajos | `auto` |
+| `--color <auto\|always\|never>` | Controla el estilizado de la terminal mediante ANSI TrueColor | `auto` |
 | `--no-color` | Desactiva terminantemente los códigos de escape ANSI (estándar NO_COLOR) | `false` |
 
 ### Opciones de Pipeline
 | Opción | Subcomandos Aplicables | Descripción | Valor por Defecto |
 | :--- | :--- | :--- | :--- |
-| `-s`, `--sequence <CADENA>` | `generate`, `inpaint`, `dms`, `contacts`, `fold` | Secuencia de aminoácidos suministrada de forma directa | `"M"` (solo en `generate`; obligatorio si se omite `--fasta` en los demás subcomandos) |
-| `-f`, `--fasta <RUTA>` | `generate`, `inpaint`, `dms`, `contacts`, `fold` | Ruta al archivo FASTA (o `-` para leer de stdin) | - |
+| `-s`, `--sequence <CADENA>` | `generate`, `inpaint`, `dms`, `contacts`, `fold`, `design` | Secuencia de aminoácidos suministrada de forma directa | `"M"` (solo en `generate`; obligatorio si se omiten `--fasta`/`--pdb`) |
+| `-f`, `--fasta <RUTA>` | `generate`, `inpaint`, `dms`, `contacts`, `fold`, `design` | Ruta al archivo FASTA (o `-` para leer de stdin) | - |
+| `-p`, `--pdb <RUTA>` | `design` | Ruta al archivo PDB local para plegamiento inverso condicionado a estructura 3D | - |
+| `--all-atom` | `fold` | Reconstrucción completa all-atom de esqueleto + cadenas laterales rotaméricas vía NeRF + DEE + ICM (STRUCT-3/4/5/6) | `false` |
+| `--no-sidechains` | `fold` | Desactiva empaquetamiento de cadenas laterales (conserva solo esqueleto N, CA, C, O, CB en modo all-atom) | `false` |
+| `--blind` | `design` | Plegamiento inverso a ciegas (evalúa potenciales geométricos sin identidades nativas) | `false` |
+| `--export-fasta <RUTA>` | `design` | Ruta de archivo de destino para la secuencia FASTA diseñada | - |
 | `--export-pdb <RUTA>` | `contacts`, `fold` | Ruta de archivo de destino para coordenadas atómicas en formato `.pdb` | - |
 | `--export-tsv <RUTA>` | `fold` | Ruta de archivo de destino para la tabla de coordenadas 3D separadas por tabuladores | - |
-| `--output <RUTA>`, `-o` | `quantize` | Ruta de salida para el archivo binario cuantizado (`*_q4_0.bin` o `*_q8_0.bin`) | - |
-| `--format <q4_0|q8_0>`, `-f` | `quantize` | Formato objetivo de cuantización (opcional si es inferible por el nombre del archivo) | `q8_0` |
+| `--output <RUTA>`, `-o` | `quantize` | Ruta de salida para el archivo binario cuantizado (`*_q3_lut.bin`, `*_q4_0.bin` o `*_q8_0.bin`) | - |
+| `--format <q3_lut\|q4_0\|q8_0>`, `-f` | `quantize` | Formato objetivo de cuantización (opcional si es inferible por el nombre del archivo) | `q8_0` |
 | `--export-csv <RUTA>`| `dms`, `contacts` | Ruta de destino para la matriz rectangular o tabla CSV | - |
-| `--export-json <RUTA>`| `dms`, `contacts`, `inpaint`, `fold`, `benchmark` | Ruta de destino para el informe estructurado en JSON | - |
+| `--export-json <RUTA>`| `dms`, `contacts`, `inpaint`, `fold`, `design`, `benchmark` | Ruta de destino para el informe estructurado en JSON | - |
 | `--fast`, `--wt-marginal` | `dms` | Modo de escaneo rápido en 1 pasada Wildtype Marginal (acelera hasta 42×) | `false` |
 | `--window <USIZE>` | `dms` | Tamaño de ventana deslizante para proteínas largas | `128` |
 | `--stride <USIZE>` | `dms` | Paso de desplazamiento de la ventana deslizante | `64` |
 | `--min-separation <USIZE>` | `contacts` | Separación mínima de secuencia para contactos epistáticos | `6` |
 | `--top-l <F32>` | `contacts` | Umbral de factor de contactos Top L (ej. 1.0 = L contactos) | `1.0` |
-| `--temperature <F32>`| `generate` | Temperatura de muestreo (0.0 = búsqueda voraz argmax) | `0.7` |
+| `--temperature <F32>`| `generate`, `design` | Temperatura de muestreo (0.0 = búsqueda voraz argmax, por defecto 0.1 para design) | `0.7` (`generate`) / `0.1` (`design`) |
 | `--max-tokens <USIZE>`| `generate` | Número máximo de nuevos residuos a generar | `1024` |
 | `--seed <U64>` | `generate` | Semilla numérica personalizada para generador pseudoaleatorio | - |
 | `--suite <CADENA>` | `benchmark` | Suite específica de benchmark (full, simd, mlm, dms, contacts, inpainting, stress, scaling) | `"full"` |
@@ -725,7 +813,7 @@ codon-infer/
 ├── .cargo/
 │   └── config.toml         # Banderas de compilación nativa (-C target-cpu=native)
 ├── .gitignore              # Filtro de artefactos generados y copias de seguridad
-├── Cargo.toml              # Especificación cero dependencias (v1.8.0, edición 2024)
+├── Cargo.toml              # Especificación cero dependencias (v1.12.0, edición 2024)
 ├── esm2_8m_weights.bin     # Pesos FP32 de ESM-2 8M (7.52M parámetros, ~30 MB)
 ├── scripts/
 │   ├── download_weights.sh # Descargador veloz de pesos desde GitHub Releases
@@ -769,6 +857,12 @@ codon-infer/
 - [x] Escaneo Mutacional Profundo Canónico (BIO-1) sin heurísticas artificiales + modo rápido Wildtype Marginal (16,170 mut/s).
 - [x] Cabezal de Contacto Multicapa Oficial (L × H APC + Regresión Logística) con streaming $O(N^2)$ en RAM.
 - [x] Reconstrucción Geométrica 3D Zero-Trunk (STRUCT-2) con MDS Métrico + Descenso de Gradiente Biofísico (exportación PDB).
+- [x] Reconstrucción cinemática del esqueleto completo all-atom Pauling-Corey (STRUCT-3).
+- [x] Empaquetamiento rotamérico all-atom de cadenas laterales vía NeRF + DEE + ICM con soft-core LJ (STRUCT-4).
+- [x] Macro-cuencas diédricas de Ramachandran dependientes del esqueleto y factores B pLDDT dinámicos (STRUCT-5).
+- [x] Potencial direccional 10-12 de enlaces de hidrógeno y puentes salinos apantallados con barrera estérica MolProbity (STRUCT-6).
+- [x] Co-diseño de secuencias y plegamiento inverso guiado por estructura 3D sin asignaciones dinámicas (BIO-2 / BIO-3).
+- [x] Cuantización sub-4-bit Q3_LUT híbrida con multiplicación matricial residente en caché L1d (CI-2).
 - [ ] Implementación de micro-kernels SIMD ARM NEON para Apple Silicon (M1/M2/M3/M4) y Raspberry Pi.
 
 ---
