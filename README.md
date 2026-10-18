@@ -1,12 +1,12 @@
 # codon-infer 🧬⚡
 
-> **High-Performance, Zero-Allocation Multi-Scale ESM-2 Protein Language Model Inference Engine & Bioinformatic Pipeline in Pure Rust (v1.11.0).**
+> **High-Performance, Zero-Allocation Multi-Scale ESM-2 Protein Language Model Inference Engine & Bioinformatic Pipeline in Pure Rust (v1.12.0).**
 
 [🇪🇸 Read in Spanish (README_ES.md)](README_ES.md)
 
 [![Rust](https://img.shields.io/badge/rust-2024_edition-orange.svg)](https://www.rust-lang.org/)
-[![Version](https://img.shields.io/badge/version-1.11.0-blue.svg)](https://github.com/OsbaldoG/codon-infer/releases/tag/v1.11.0)
-[![Tests](https://img.shields.io/badge/tests-61%20executed%3A%2060%20passed%2C%200%20failed%2C%201%20ignored-brightgreen.svg)](#3-run-test-suite)
+[![Version](https://img.shields.io/badge/version-1.12.0-blue.svg)](https://github.com/OsbaldoG/codon-infer/releases/tag/v1.12.0)
+[![Tests](https://img.shields.io/badge/tests-70%20executed%3A%2069%20passed%2C%200%20failed%2C%201%20ignored-brightgreen.svg)](#3-run-test-suite)
 [![Dependencies](https://img.shields.io/badge/dependencies-0%20(pure%20std)-brightgreen.svg)](Cargo.toml)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Model](https://img.shields.io/badge/model-ESM--2%20(8M%20to%203B)-blueviolet.svg)](https://github.com/facebookresearch/esm)
@@ -20,16 +20,27 @@ By eliminating Python, PyTorch, C/CUDA runtimes, and external third-party crates
 
 ---
 
-## ⚡ Highlights (Version 1.11: Backbone-Dependent Rotamer Basins, Covalent Graph & Dynamic pLDDT)
+## ⚡ Highlights (Version 1.12: Directional H-Bonds, Screened Salt Bridges & MolProbity Barrier)
 
-> 💡 **Version Consolidation:** Version 1.11.0 builds upon the all-atom reconstruction suite (v1.9.0 Pauling-Corey kinematics `STRUCT-3`, v1.10.0 rotameric NeRF + DEE `STRUCT-4`) introducing local backbone-conditioned rotamer spaces, topological covalent exclusions, and dynamic residue confidence metrics (`STRUCT-5`).
+> 💡 **Version Consolidation:** Version 1.12.0 elevates the all-atom reconstruction suite (`STRUCT-4` NeRF + DEE, `STRUCT-5` backbone-dependent Ramachandran basins) with directional 10-12 hydrogen bonding, screened electrostatic salt bridges, and a strict MolProbity clash barrier (`STRUCT-6`).
 
+* **Directional 10–12 Hydrogen Bonding Potential (`STRUCT-6`):**
+  * Implements a Kortemme-Baker / Rosetta-style 10–12 Lennard-Jones attractive well ($r_0 = 2.80\text{ \AA}$, active in $[2.30, 3.40\text{ \AA}]$) coupled with $C^1$-continuous smoothstep boundary tapering.
+  * Analytical angular modulation $\cos^2(\theta)$ for backbone carbonyl acceptor geometry ($C=O \cdots D$) and backbone amide donor geometry ($N-H \cdots A$).
+* **Screened Electrostatic Salt Bridges & Bidentate Normalization:**
+  * Screened Lorentzian/Debye-Hückel potential ($r_{\text{opt}} = 2.90\text{ \AA}$, $\sigma = 0.60\text{ \AA}$, active in $[2.30, 4.20\text{ \AA}]$) for ion pairing between basic (`LYS`, `ARG`) and acidic (`ASP`, `GLU`) groups.
+  * Formal charge fractional weighting (`charge_weight`) accurately dampens bidentate multi-atom salt bridges to experimental $\Delta\Delta G$ ranges ($-3.0\text{ kcal/mol}$).
+  * Like-charge electrostatic repulsion (+50% strength) preventing basic-basic and acidic-acidic unphysical clustering.
+* **Hard Steric Barrier at MolProbity Clash Threshold ($d < 2.0\text{ \AA}$):**
+  * Steep linear repulsion barrier ($+50.0 \times (1.0 - d / 2.0)$) that prevents attractive electrostatic and H-bond bonuses from overriding physical electron shell non-penetration.
+  * Control A native crystal clashscore drops to **12.3** (`1AOY` down to 1.8, `2GP8` to 0.0), Control B clashscore drops to **73.5**, with covalent-like clashes reduced by **15.3%** (72 $\to$ 61).
+* **Zero-Allocation Chemical Bitmasking (`SideChainAtom`):**
+  * Packs chemical classification bits (`chem_flag: u8`: donor, acceptor, cation, anion) directly into existing alignment padding bytes, maintaining the exact 32-byte struct size and zero-heap `Copy` semantics.
 * **Backbone-Dependent Rotamer Library (`STRUCT-5`):**
   * Classifies local $(\phi, \psi)$ backbone dihedral angles into 5 canonical Ramachandran macro-basins ($\alpha_R$, $\beta$, $\text{PPII}$, $\alpha_L$, $\text{General}$) via analytical dihedral functions without heap allocation.
-  * Prunes sterically forbidden rotamers a priori based on local backbone basins, reducing sidechain-backbone collisions (`sc-bb`) and cutting sidechain-sidechain clashes (`sc-sc`) by **76.4%** (195 $\to$ 46) on predicted ESM-2 650M traces.
-  * Ultra-compact flash/RODATA storage (< 25 KB), preserving sub-10 ms packing latencies.
+  * Prunes sterically forbidden rotamers a priori based on local backbone basins, cutting sidechain-sidechain clashes (`sc-sc`) by **76.4%** on predicted traces.
 * **Strict Topological Covalent & 1-3 Exclusions:**
-  * Full topological graph connectivity for complex sidechains and resonant rings (`MET` SD-CE, `ARG` NE-CZ/NH-CZ, `PRO` N-CD, `TYR` CZ-OH, `TRP` CE2-NE1/CH2-CZ, `HIS` CE1-ND1/NE2).
+  * Full topological graph connectivity for complex sidechains and resonant rings (`MET`, `ARG`, `PRO`, `TYR`, `TRP`, `HIS`).
   * Lowers experimental native crystal clashscore to **0.8** (MolProbity crystallographic validation standard, 0 clashes across 5 of 6 target crystals).
 * **Dynamic AlphaFold-Like pLDDT Confidence & B-Factor Export:**
   * Computes position-wise model confidence from top-5 non-local contact probabilities and Shannon entropy of ESM-2 logits: $\text{pLDDT}_i = 100.0 \times \bar{P}_i \times (1.0 - \text{EntropyNorm}_i)$.

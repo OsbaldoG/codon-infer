@@ -1,12 +1,12 @@
 # codon-infer 🧬⚡
 
-> **Motor de Inferencia y Pipeline Bioinformático para Modelos de Lenguaje de Proteínas ESM-2 Multi-Escala, de Alto Rendimiento y Cero Asignaciones en Rust Puro (v1.11.0).**
+> **Motor de Inferencia y Pipeline Bioinformático para Modelos de Lenguaje de Proteínas ESM-2 Multi-Escala, de Alto Rendimiento y Cero Asignaciones en Rust Puro (v1.12.0).**
 
 [🇬🇧 Read in English (README.md)](README.md)
 
 [![Rust](https://img.shields.io/badge/rust-edición_2024-orange.svg)](https://www.rust-lang.org/)
-[![Version](https://img.shields.io/badge/versión-1.11.0-blue.svg)](https://github.com/OsbaldoG/codon-infer/releases/tag/v1.11.0)
-[![Tests](https://img.shields.io/badge/tests-61%20ejecutados%3A%2060%20pasados%2C%200%20fallidos%2C%201%20ignorado-brightgreen.svg)](#3-ejecución-de-la-suite-de-pruebas)
+[![Version](https://img.shields.io/badge/versión-1.12.0-blue.svg)](https://github.com/OsbaldoG/codon-infer/releases/tag/v1.12.0)
+[![Tests](https://img.shields.io/badge/tests-70%20ejecutados%3A%2069%20pasados%2C%200%20fallidos%2C%201%20ignorado-brightgreen.svg)](#3-ejecución-de-la-suite-de-pruebas)
 [![Dependencies](https://img.shields.io/badge/dependencias-0%20(std%20puro)-brightgreen.svg)](Cargo.toml)
 [![License](https://img.shields.io/badge/licencia-MIT-blue.svg)](LICENSE)
 [![Model](https://img.shields.io/badge/modelo-ESM--2%20(8M%20a%203B)-blueviolet.svg)](https://github.com/facebookresearch/esm)
@@ -22,10 +22,22 @@ Al prescindir por completo de los ecosistemas de Python, PyTorch, C/CUDA y crate
 
 ---
 
-## ⚡ Aspectos Destacados (Versión 1.11: Cuencas Rotaméricas de Ramachandran, Grafo Covalente y pLDDT Dinámico)
+## ⚡ Aspectos Destacados (Versión 1.12: Enlaces de Hidrógeno Direccionales, Puentes Salinos y Barrera MolProbity)
 
-> 💡 **Consolidación de Versión:** La versión 1.11.0 culmina la suite de reconstrucción all-atom (v1.9.0 cinemática de Pauling-Corey `STRUCT-3`, v1.10.0 rotámeros NeRF + DEE `STRUCT-4`) incorporando espacios rotaméricos condicionados al esqueleto local, exclusiones covalentes topológicas y factores de confianza pLDDT dinámicos (`STRUCT-5`).
+> 💡 **Consolidación de Versión:** La versión 1.12.0 eleva la suite de reconstrucción all-atom (`STRUCT-4` NeRF + DEE, `STRUCT-5` cuencas de Ramachandran dependientes del esqueleto) con potencial direccional 10-12 de enlaces de hidrógeno, puentes salinos electrostáticos apantallados y una estricta barrera de colisión MolProbity (`STRUCT-6`).
 
+* **Potencial Direccional 10–12 de Enlaces de Hidrógeno (`STRUCT-6`):**
+  * Pozo de atracción 10–12 estilo Kortemme-Baker / Rosetta ($r_0 = 2.80\text{ \AA}$, activo en $[2.30, 3.40\text{ \AA}]$) con atenuación de frontera polinomial suave (*smoothstep* $C^1$).
+  * Modulación angular analítica $\cos^2(\theta)$ para geometría de aceptor carbonilo en esqueleto ($C=O \cdots D$) y donador amida ($N-H \cdots A$).
+* **Puentes Salinos Electrostáticos Apantallados y Normalización Bidentada:**
+  * Potencial apantallado de Debye-Hückel / lorentziano ($r_{\text{opt}} = 2.90\text{ \AA}$, $\sigma = 0.60\text{ \AA}$, activo en $[2.30, 4.20\text{ \AA}]$) para apareamiento iónico entre residuos básicos (`LYS`, `ARG`) y ácidos (`ASP`, `GLU`).
+  * Ponderación fraccional de carga formal (`charge_weight`) que calibra los puentes salinos bidentados multiatómicos exactamente a la escala termodinámica experimental ($-3.0\text{ kcal/mol}$).
+  * Repulsión electrostática entre cargas del mismo signo (+50% de intensidad), impidiendo agrupamientos anómalos catión-catión o anión-anión.
+* **Barrera Estérica Estricta en el Umbral MolProbity ($d < 2.0\text{ \AA}$):**
+  * Rampa repulsiva lineal pronunciada ($+50.0 \times (1.0 - d / 2.0)$) que garantiza la imposibilidad de que las atracciones electrostáticas o puentes H compensen la interpenetración de nubes electrónicas.
+  * El clashscore en cristales nativos (Control A) cae a **12.3** (`1AOY` desciende a 1.8, `2GP8` a 0.0), y el clashscore en Control B cae a **73.5**, reduciendo los choques de tipo covalente en un **15.3%** (72 $\to$ 61).
+* **Clasificación Química Bitmask Cero Asignaciones (`SideChainAtom`):**
+  * Empaqueta los bits de interacción química (`chem_flag: u8`: donador, aceptor, catión, anión) directamente en los bytes de *padding* de alineación, preservando la estructura de 32 bytes y la semántica `Copy` en el *stack*.
 * **Biblioteca Rotamérica Dependiente del Esqueleto (`STRUCT-5`):**
   * Clasifica los ángulos diedros locales $(\phi, \psi)$ del esqueleto en 5 macro-cuencas canónicas de Ramachandran ($\alpha_R, \beta, \text{PPII}, \alpha_L, \text{General}$) mediante funciones diédricas analíticas sin tocar el heap.
   * Poda *a priori* rotámeros estéricamente prohibidos según la cuenca local, reduciendo los choques cadena lateral-esqueleto (`sc-bb`) y desplomando los choques cadena-cadena (`sc-sc`) en un **76.4%** (de 195 a 46) sobre trazas predichas de ESM-2 650M.
