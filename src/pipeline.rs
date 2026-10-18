@@ -778,6 +778,7 @@ pub struct FoldPipelineResult {
     pub forward_ms: f64,
     pub solve_ms: f64,
     pub radius_of_gyration: f64,
+    pub plddt: Vec<f64>,
     pub allatom_residues: Option<Vec<crate::export::ReconstructedResidue>>,
     pub sidechain_metrics: Option<crate::export::SidechainPackingMetrics>,
 }
@@ -1208,7 +1209,82 @@ pub fn reconstruct_3d_ca(probs: &[f32], n: usize) -> (Vec<[f64; 3]>, usize, f64)
     (best_coords, num_r, p_max)
 }
 
-/// Computes 3D protein folding reconstruction with explicit control over sidechain packing (STRUCT-4).
+/// Computes AlphaFold-like residue confidence proxy (pLDDT in [0, 100])
+/// from top-k contact probabilities and Shannon entropy of ESM-2 logits (STRUCT-5).
+pub fn compute_plddt_scores(
+    contact_probs: &[f32],
+    logits: &[f32],
+    n: usize,
+    vocab_size: usize,
+) -> Vec<f64> {
+    if n == 0 {
+        return Vec::new();
+    }
+    if contact_probs.len() < n * n {
+        return vec![50.0; n];
+    }
+
+    let mut plddt = Vec::with_capacity(n);
+    let ln_20 = 2.995732273553991f64; // ln(20)
+
+    for i in 0..n {
+        // 1. Top-k non-local contact probability
+        // Use fixed stack buffer for top-5 candidates without heap allocation
+        let mut top_k = [0.0f64; 5];
+        let mut count = 0usize;
+
+        for j in 0..n {
+            let sep = if i >= j { i - j } else { j - i };
+            let min_sep = if n > 6 { 3 } else { 1 };
+            if sep >= min_sep {
+                let p = contact_probs[i * n + j] as f64;
+                count += 1;
+                if p > top_k[4] {
+                    top_k[4] = p;
+                    let mut k = 4;
+                    while k > 0 && top_k[k] > top_k[k - 1] {
+                        top_k.swap(k, k - 1);
+                        k -= 1;
+                    }
+                }
+            }
+        }
+
+        let k_used = count.min(5);
+        let p_bar = if k_used > 0 {
+            let sum: f64 = top_k[0..k_used].iter().sum();
+            sum / k_used as f64
+        } else {
+            0.5
+        };
+
+        // 2. Shannon entropy over canonical amino acids (indices 4..=23)
+        let tok_pos = i + 1; // 1-indexed (token 0 is <cls>)
+        let mut norm_entropy = 0.5f64;
+        if (tok_pos + 1) * vocab_size <= logits.len() {
+            let pos_logits = &logits[tok_pos * vocab_size..(tok_pos + 1) * vocab_size];
+            let log_probs = log_softmax_canonical(pos_logits);
+            let mut entropy = 0.0f64;
+            for aa_idx in 4..=23 {
+                let lp = log_probs[aa_idx] as f64;
+                let p = lp.exp();
+                if p > 1e-12 {
+                    entropy -= p * lp;
+                }
+            }
+            norm_entropy = (entropy / ln_20).clamp(0.0, 1.0);
+        }
+
+        // 3. AlphaFold-like confidence metric:
+        // pLDDT_i = 100.0 * p_bar * (1.0 - norm_entropy)
+        let score = (100.0 * p_bar * (1.0 - norm_entropy)).clamp(0.0, 100.0);
+        plddt.push(score);
+    }
+
+    plddt
+}
+
+/// Computes 3D protein folding reconstruction with explicit control over sidechain packing (STRUCT-4/5).
 pub fn compute_pipeline_fold_parallel_opts(
     record: &FastaRecord,
     config: &EsmConfig,
@@ -1268,6 +1344,9 @@ pub fn compute_pipeline_fold_parallel_opts(
     }
     let radius_of_gyration = (rg_sq / n as f64).sqrt();
 
+    // Compute dynamic residue confidence scores (pLDDT / B-factors)
+    let plddt = compute_plddt_scores(&state.contact_probs, &state.logits, n, config.vocab_size);
+
     // If sequence length >= 3, compute full all-atom coordinates via KinematicBackboneSolver:
     let (allatom_residues, sidechain_metrics) = if n >= 3 {
         let mut ws = crate::export::AllAtomWorkspace::new(n);
@@ -1284,7 +1363,14 @@ pub fn compute_pipeline_fold_parallel_opts(
             res_seqs.push((i + 1) as i32);
         }
         let solver = crate::export::KinematicBackboneSolver::default();
-        let metrics = solver.reconstruct_into(&coords, &res_names, &res_seqs, &mut ws, pack_sidechains);
+        let metrics = solver.reconstruct_into_with_bfactors(
+            &coords,
+            &res_names,
+            &res_seqs,
+            Some(&plddt),
+            &mut ws,
+            pack_sidechains,
+        );
         (Some(ws.out_residues[0..n].to_vec()), metrics)
     } else {
         (None, None)
@@ -1299,6 +1385,7 @@ pub fn compute_pipeline_fold_parallel_opts(
         forward_ms,
         solve_ms,
         radius_of_gyration,
+        plddt,
         allatom_residues,
         sidechain_metrics,
     }
@@ -1328,6 +1415,12 @@ pub fn render_fold_summary(
     println!("  * Sequence Length:           {} residues", result.sequence.len());
     println!("  * Sequence:                  {}", format_sequence(&result.sequence, theme));
     println!("  * Active Tertiary Restraints:{} contacts (peak contact prob: {:.4})", result.num_restraints, result.p_max);
+    let mean_plddt = if !result.plddt.is_empty() {
+        result.plddt.iter().sum::<f64>() / result.plddt.len() as f64
+    } else {
+        50.0
+    };
+    println!("  * Mean Model Confidence:     pLDDT {:.1} / 100.0", mean_plddt);
     println!("  * Radius of Gyration (Rg):   {:.2} Å", result.radius_of_gyration);
     println!("  * Forward Attention Time:    {:.2} ms", result.forward_ms);
     println!("  * 3D Geometric Solver Time:  {:.2} ms (Multi-start MDS + 450 gradient steps)", result.solve_ms);
@@ -1335,7 +1428,7 @@ pub fn render_fold_summary(
     if let Some(path) = export_pdb_path {
         let mode_desc = if all_atom {
             if result.sidechain_metrics.is_some() {
-                "All-Atom Backbone + Rotameric Sidechains (STRUCT-4)"
+                "All-Atom Backbone + Rotameric Sidechains (STRUCT-4/5)"
             } else {
                 "All-Atom Backbone + CB (N, CA, C, O, CB)"
             }
@@ -1354,30 +1447,32 @@ pub fn render_fold_summary(
     }
     println!();
 
-    println!("┌───────┬────────────┬───────────┬──────────────┬──────────────┬──────────────┐");
-    println!("│ Index │ Amino Acid │ Three-Let │    X (Å)     │    Y (Å)     │    Z (Å)     │");
-    println!("├───────┼────────────┼───────────┼──────────────┼──────────────┼──────────────┤");
+    println!("┌───────┬────────────┬───────────┬──────────────┬──────────────┬──────────────┬─────────┐");
+    println!("│ Index │ Amino Acid │ Three-Let │    X (Å)     │    Y (Å)     │    Z (Å)     │  pLDDT  │");
+    println!("├───────┼────────────┼───────────┼──────────────┼──────────────┼──────────────┼─────────┤");
 
     let display_n = result.coords.len().min(12);
     for (i, (ch, pt)) in result.sequence.chars().zip(result.coords.iter()).take(display_n).enumerate() {
         let res_colored = format_aa(ch, theme);
+        let plddt_val = result.plddt.get(i).copied().unwrap_or(50.0);
         println!(
-            "│  {:>3}  │     {}      │    {}    │  {:>10.3}  │  {:>10.3}  │  {:>10.3}  │",
+            "│  {:>3}  │     {}      │    {}    │  {:>10.3}  │  {:>10.3}  │  {:>10.3}  │  {:>5.1}  │",
             i + 1,
             res_colored,
             crate::export::aa1_to_aa3(ch),
             pt[0],
             pt[1],
-            pt[2]
+            pt[2],
+            plddt_val
         );
     }
     if result.coords.len() > display_n {
         println!(
-            "│  ...  │    ...     │    ...    │  ... [{} residues omitted from preview] ...  │",
+            "│  ...  │    ...     │    ...    │  ... [{} residues omitted from preview] ...             │",
             result.coords.len() - display_n
         );
     }
-    println!("└───────┴────────────┴───────────┴──────────────┴──────────────┴──────────────┘\n");
+    println!("└───────┴────────────┴───────────┴──────────────┴──────────────┴──────────────┴─────────┘\n");
 }
 
 /// Executes 3D protein folding pipeline and optionally writes the PDB file to disk.
@@ -1397,7 +1492,7 @@ pub fn run_pipeline_fold_parallel(
             crate::export::export_allatom_pdb(path, &result.protein_id, result.allatom_residues.as_ref().unwrap())
                 .map(|_| ())
         } else {
-            crate::export::export_ca_pdb(path, &result.sequence, &result.protein_id, &result.coords)
+            crate::export::export_ca_pdb_with_bfactors(path, &result.sequence, &result.protein_id, &result.coords, Some(&result.plddt))
                 .map(|_| ())
         };
         if let Err(e) = write_res {
@@ -1929,6 +2024,61 @@ pub fn run_pipeline_design_parallel(
     );
     render_design_summary(&result, 25, theme);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_compute_plddt_scores() {
+        // 1. Empty sequence
+        assert!(compute_plddt_scores(&[], &[], 0, 33).is_empty());
+
+        // 2. Mismatched length fallback
+        let fallback = compute_plddt_scores(&[0.1; 4], &[], 4, 33);
+        assert_eq!(fallback.len(), 4);
+        assert_eq!(fallback, vec![50.0; 4]);
+
+        // 3. Synthetic 8-residue test with distinct high-confidence vs low-confidence profiles
+        let n = 8;
+        let vocab_size = 33;
+        let seq_len = n + 2; // with <cls> and <eos>
+        let mut contact_probs = vec![0.02f32; n * n];
+        let mut logits = vec![0.0f32; seq_len * vocab_size];
+
+        // Residue 0 (tok_pos = 1): high contacts to non-local partners + sharp single-AA logit
+        for j in 3..n {
+            contact_probs[0 * n + j] = 0.95;
+            contact_probs[j * n + 0] = 0.95;
+        }
+        let tok1 = 1;
+        logits[tok1 * vocab_size + 4] = 30.0; // Very sharp preference for Ala (near-zero entropy)
+
+        // Residue 7 (tok_pos = 8): low contacts + uniform canonical logits (max entropy)
+        for j in 0..5 {
+            contact_probs[7 * n + j] = 0.01;
+            contact_probs[j * n + 7] = 0.01;
+        }
+        let tok8 = 8;
+        for aa_idx in 4..=23 {
+            logits[tok8 * vocab_size + aa_idx] = 1.0; // uniform logits
+        }
+
+        let plddt = compute_plddt_scores(&contact_probs, &logits, n, vocab_size);
+        assert_eq!(plddt.len(), n);
+
+        // Core ordered residue 0 must have high confidence
+        assert!(plddt[0] > 70.0, "Expected pLDDT[0] > 70.0, got {:.2}", plddt[0]);
+
+        // Disordered / loose residue 7 must have low confidence
+        assert!(plddt[7] < 20.0, "Expected pLDDT[7] < 20.0, got {:.2}", plddt[7]);
+
+        // All residues must be bounded in [0.0, 100.0]
+        for (i, &score) in plddt.iter().enumerate() {
+            assert!(score >= 0.0 && score <= 100.0, "Residue {} score out of bounds: {:.2}", i, score);
+        }
+    }
 }
 
 

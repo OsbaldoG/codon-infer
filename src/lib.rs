@@ -32,9 +32,12 @@ pub use fasta::{FastaRecord, parse_fasta_file, parse_raw_sequence};
 pub use export::{
     DmsPositionRow, export_dms_csv, export_dms_json, export_contacts_csv, export_contacts_json,
     dms_to_json_string, contacts_to_json_string, inpaint_to_json_string, export_inpaint_json,
-    aa1_to_aa3, aa3_to_aa1, coords_to_pdb_string, export_ca_pdb, export_fold_tsv, fold_to_json_string, export_fold_json,
+    aa1_to_aa3, aa3_to_aa1, coords_to_pdb_string, coords_to_pdb_string_with_bfactors,
+    export_ca_pdb, export_ca_pdb_with_bfactors, export_fold_tsv, fold_to_json_string, export_fold_json,
     Vec3, SideChainAtom, ReconstructedResidue, AllAtomWorkspace, KinematicBackboneSolver,
     SidechainPackingMetrics, RotamerWorkspace, pack_sidechains, compute_protein_clashscore,
+    ClashBreakdown, compute_clash_breakdown,
+    RamachandranBasin, classify_ramachandran, calc_dihedral_deg,
     coords_to_allatom_pdb_string, export_allatom_pdb, parse_pdb_atoms,
     design_to_json_string, export_design_json,
 };
@@ -45,7 +48,7 @@ pub use pipeline::{
     render_dms_heatmap, compute_pipeline_inpaint, compute_pipeline_inpaint_parallel,
     compute_pipeline_contacts, compute_pipeline_contacts_parallel,
     InpaintPipelineResult, InpaintSite, InpaintCandidate, ContactsPipelineResult,
-    FoldPipelineResult, mds_spectral_init, helical_init, reconstruct_3d_ca,
+    FoldPipelineResult, mds_spectral_init, helical_init, reconstruct_3d_ca, compute_plddt_scores,
     compute_pipeline_fold_parallel, compute_pipeline_fold_parallel_opts, render_fold_summary, run_pipeline_fold_parallel,
     STANDARD_AMINO_ACIDS, PhysicoClass, get_token_id, calc_dihedral,
     Bio2Workspace, Bio2CoDesigner, DesignCandidate, DesignPositionSite, DesignPipelineResult,
@@ -8832,6 +8835,73 @@ mod tests_regression {
         }
 
         let _ = std::fs::remove_file(tmp_pdb_path);
+    }
+
+    #[test]
+    fn test_struct5_full_pipeline_bfactors_and_ramachandran() {
+        use crate::export::{
+            aa1_to_aa3, AllAtomWorkspace, KinematicBackboneSolver, coords_to_allatom_pdb_string,
+            parse_pdb_atoms,
+        };
+
+        let seq = "MKLVALFV";
+        let n = seq.len();
+        let mut ca_coords = Vec::with_capacity(n);
+        for i in 0..n {
+            let phi = i as f64 * 100.0 * std::f64::consts::PI / 180.0;
+            let z = i as f64 * 1.5;
+            let x = 2.3 * phi.cos();
+            let y = 2.3 * phi.sin();
+            ca_coords.push([x, y, z]);
+        }
+
+        let mut res_names = Vec::with_capacity(n);
+        let mut res_seqs = Vec::with_capacity(n);
+        let mut dynamic_bfactors = Vec::with_capacity(n);
+        for (i, ch) in seq.chars().enumerate() {
+            let name3 = aa1_to_aa3(ch);
+            let mut b = [b' '; 3];
+            let src = name3.as_bytes();
+            for (idx, &byte) in src.iter().take(3).enumerate() {
+                b[idx] = byte;
+            }
+            res_names.push(b);
+            res_seqs.push((i + 1) as i32);
+            dynamic_bfactors.push(70.0 + (i as f64 * 3.5));
+        }
+
+        let mut ws = AllAtomWorkspace::new(n);
+        let solver = KinematicBackboneSolver::default();
+        let metrics = solver.reconstruct_into_with_bfactors(
+            &ca_coords,
+            &res_names,
+            &res_seqs,
+            Some(&dynamic_bfactors),
+            &mut ws,
+            true,
+        );
+
+        assert!(metrics.is_some());
+        let residues = &ws.out_residues[0..n];
+
+        // Verify that B-factors match expected dynamic scores
+        for (i, res) in residues.iter().enumerate() {
+            assert_eq!(res.b_factor, dynamic_bfactors[i]);
+        }
+
+        // Export PDB and verify B-factor column alignment (cols 61-66)
+        let pdb_str = coords_to_allatom_pdb_string("TEST_STRUCT5", residues);
+        assert!(pdb_str.contains("  1.00 70.00"));
+        assert!(pdb_str.contains("  1.00 73.50"));
+
+        let tmp_pdb = "target/test_struct5_roundtrip.pdb";
+        std::fs::write(tmp_pdb, &pdb_str).expect("write pdb");
+        let parsed = parse_pdb_atoms(tmp_pdb).expect("parse pdb");
+        assert_eq!(parsed.len(), n);
+        for (i, p) in parsed.iter().enumerate() {
+            assert!((p.b_factor - dynamic_bfactors[i]).abs() < 0.01);
+        }
+        let _ = std::fs::remove_file(tmp_pdb);
     }
 }
 

@@ -277,11 +277,12 @@ pub fn aa1_to_aa3(aa: char) -> &'static str {
     }
 }
 
-/// Generates a standard Protein Data Bank (.pdb) string containing C_alpha backbone atoms.
-pub fn coords_to_pdb_string(
+/// Generates a standard Protein Data Bank (.pdb) string containing C_alpha backbone atoms with optional B-factors.
+pub fn coords_to_pdb_string_with_bfactors(
     sequence: &str,
     protein_id: &str,
     coords: &[[f64; 3]],
+    b_factors: Option<&[f64]>,
 ) -> String {
     let mut out = String::with_capacity(coords.len() * 82 + 256);
     out.push_str(&format!("HEADER    CODON-INFER STRUCT-2 3D RECONSTRUCTION {}\n", protein_id));
@@ -289,18 +290,44 @@ pub fn coords_to_pdb_string(
     for (i, (ch, pt)) in sequence.chars().zip(coords.iter()).enumerate() {
         let res_num = (i + 1) as i32;
         let res_name = aa1_to_aa3(ch);
+        let bf = b_factors.and_then(|b| b.get(i).copied()).unwrap_or(50.0);
         out.push_str(&format!(
-            "ATOM  {:5}  CA  {:3} A{:4}    {:8.3}{:8.3}{:8.3}  1.00 50.00           C\n",
+            "ATOM  {:5}  CA  {:3} A{:4}    {:8.3}{:8.3}{:8.3}  1.00{:6.2}           C\n",
             res_num,
             res_name,
             res_num,
             pt[0],
             pt[1],
-            pt[2]
+            pt[2],
+            bf
         ));
     }
     out.push_str("END\n");
     out
+}
+
+/// Generates a standard Protein Data Bank (.pdb) string containing C_alpha backbone atoms.
+pub fn coords_to_pdb_string(
+    sequence: &str,
+    protein_id: &str,
+    coords: &[[f64; 3]],
+) -> String {
+    coords_to_pdb_string_with_bfactors(sequence, protein_id, coords, None)
+}
+
+/// Exports reconstructed 3D C_alpha coordinates to standard Protein Data Bank (.pdb) format with optional B-factors.
+pub fn export_ca_pdb_with_bfactors(
+    path: &str,
+    sequence: &str,
+    protein_id: &str,
+    coords: &[[f64; 3]],
+    b_factors: Option<&[f64]>,
+) -> io::Result<String> {
+    let pdb_content = coords_to_pdb_string_with_bfactors(sequence, protein_id, coords, b_factors);
+    let mut file = File::create(path)?;
+    file.write_all(pdb_content.as_bytes())?;
+    file.flush()?;
+    Ok(pdb_content)
 }
 
 /// Exports reconstructed 3D C_alpha coordinates to standard Protein Data Bank (.pdb) format.
@@ -310,11 +337,7 @@ pub fn export_ca_pdb(
     protein_id: &str,
     coords: &[[f64; 3]],
 ) -> io::Result<String> {
-    let pdb_content = coords_to_pdb_string(sequence, protein_id, coords);
-    let mut file = File::create(path)?;
-    file.write_all(pdb_content.as_bytes())?;
-    file.flush()?;
-    Ok(pdb_content)
+    export_ca_pdb_with_bfactors(path, sequence, protein_id, coords, None)
 }
 
 /// Exports 3D coordinates to a tab-separated values (.tsv) file.
@@ -358,6 +381,13 @@ pub fn fold_to_json_string(
     out.push_str(&format!("  \"solve_ms\": {:.2},\n", result.solve_ms));
     out.push_str(&format!("  \"total_ms\": {:.2},\n", result.forward_ms + result.solve_ms));
 
+    let mean_plddt = if !result.plddt.is_empty() {
+        result.plddt.iter().sum::<f64>() / result.plddt.len() as f64
+    } else {
+        50.0
+    };
+    out.push_str(&format!("  \"mean_plddt\": {:.2},\n", mean_plddt));
+
     if let Some(ref m) = result.sidechain_metrics {
         out.push_str("  \"sidechain_packing\": {\n");
         out.push_str(&format!("    \"initial_clashscore\": {:.2},\n", m.initial_clashscore));
@@ -373,13 +403,15 @@ pub fn fold_to_json_string(
     out.push_str("  \"coordinates\": [\n");
     for (i, (ch, pt)) in result.sequence.chars().zip(result.coords.iter()).enumerate() {
         let comma = if i + 1 < result.coords.len() { "," } else { "" };
+        let plddt_val = result.plddt.get(i).copied().unwrap_or(50.0);
         out.push_str(&format!(
-            "    {{\"index\": {}, \"res\": \"{}\", \"x\": {:.3}, \"y\": {:.3}, \"z\": {:.3}}}{}\n",
+            "    {{\"index\": {}, \"res\": \"{}\", \"x\": {:.3}, \"y\": {:.3}, \"z\": {:.3}, \"plddt\": {:.2}}}{}\n",
             i + 1,
             ch,
             pt[0],
             pt[1],
             pt[2],
+            plddt_val,
             comma
         ));
     }
@@ -400,7 +432,7 @@ pub fn export_fold_json(
     let pdb_content = if let Some(ref allatom) = result.allatom_residues {
         coords_to_allatom_pdb_string(&result.protein_id, allatom)
     } else {
-        coords_to_pdb_string(&result.sequence, &result.protein_id, &result.coords)
+        coords_to_pdb_string_with_bfactors(&result.sequence, &result.protein_id, &result.coords, Some(&result.plddt))
     };
     let json = fold_to_json_string(result, &pdb_content);
     let mut file = File::create(path)?;
@@ -555,6 +587,7 @@ pub struct ReconstructedResidue {
     pub c: [f64; 3],
     pub o: [f64; 3],
     pub cb: Option<[f64; 3]>,
+    pub b_factor: f64,
     pub sidechain_len: u8,
     pub sidechain_atoms: [SideChainAtom; 10],
 }
@@ -569,10 +602,67 @@ impl Default for ReconstructedResidue {
             c: [0.0; 3],
             o: [0.0; 3],
             cb: None,
+            b_factor: 50.0,
             sidechain_len: 0,
             sidechain_atoms: [SideChainAtom::default(); 10],
         }
     }
+}
+
+/// Canonical Ramachandran macro-basins for backbone-dependent rotamer conditioning (STRUCT-5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RamachandranBasin {
+    /// Right-handed alpha-helix basin (φ ≈ -60°, ψ ≈ -45°)
+    Alpha,
+    /// Extended beta-strand / beta-sheet basin (φ ≈ -120°, ψ ≈ +135°)
+    Beta,
+    /// Polyproline-II left-handed extended basin (φ ≈ -65°, ψ ≈ +145°)
+    Ppii,
+    /// Left-handed alpha-helix / turn basin (φ ≈ +60°, ψ ≈ +40°)
+    AlphaL,
+    /// General / coil / transition conformational basin
+    General,
+}
+
+/// Classifies backbone dihedral angles (in degrees) into a canonical Ramachandran macro-basin.
+#[inline]
+pub fn classify_ramachandran(phi_deg: f64, psi_deg: f64) -> RamachandranBasin {
+    if phi_deg >= -120.0 && phi_deg <= -30.0 && psi_deg >= -80.0 && psi_deg <= -10.0 {
+        RamachandranBasin::Alpha
+    } else if phi_deg >= -180.0 && phi_deg <= -40.0 && (psi_deg >= 80.0 || psi_deg <= -150.0) {
+        if phi_deg >= -90.0 && phi_deg <= -40.0 && psi_deg >= 100.0 && psi_deg <= 180.0 {
+            RamachandranBasin::Ppii
+        } else {
+            RamachandranBasin::Beta
+        }
+    } else if phi_deg >= 30.0 && phi_deg <= 100.0 && psi_deg >= -20.0 && psi_deg <= 90.0 {
+        RamachandranBasin::AlphaL
+    } else {
+        RamachandranBasin::General
+    }
+}
+
+/// Analytical 4-point dihedral angle calculation returning degrees in [-180.0, 180.0].
+#[inline]
+pub fn calc_dihedral_deg(p0: [f64; 3], p1: [f64; 3], p2: [f64; 3], p3: [f64; 3]) -> f64 {
+    let b0 = Vec3::from_array(p0).sub(Vec3::from_array(p1));
+    let b1 = Vec3::from_array(p2).sub(Vec3::from_array(p1));
+    let b2 = Vec3::from_array(p3).sub(Vec3::from_array(p2));
+
+    let b1_u = b1.normalize();
+    let v = Vec3([
+        b0.0[0] - b1_u.0[0] * b0.dot(b1_u),
+        b0.0[1] - b1_u.0[1] * b0.dot(b1_u),
+        b0.0[2] - b1_u.0[2] * b0.dot(b1_u),
+    ]);
+    let w = Vec3([
+        b2.0[0] - b1_u.0[0] * b2.dot(b1_u),
+        b2.0[1] - b1_u.0[1] * b2.dot(b1_u),
+        b2.0[2] - b1_u.0[2] * b2.dot(b1_u),
+    ]);
+    let x = v.dot(w);
+    let y = b1_u.cross(v).dot(w);
+    y.atan2(x).to_degrees()
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -584,138 +674,395 @@ pub struct RotamerAngles {
     pub prob: f64, // intrinsic probability [0.0, 1.0]
 }
 
-pub fn get_rotamer_candidates(res_name: &str) -> &'static [RotamerAngles] {
+pub fn get_rotamer_candidates_bbdep(res_name: &str, basin: RamachandranBasin) -> &'static [RotamerAngles] {
     match res_name {
-        "VAL" => &[
-            RotamerAngles { chi1: 3.14159, chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.75 }, // trans (180°)
-            RotamerAngles { chi1: -1.0472, chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.15 }, // gauche- (-60°)
-            RotamerAngles { chi1: 1.0472,  chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.10 }, // gauche+ (+60°)
-        ],
-        "LEU" => &[
-            RotamerAngles { chi1: -1.1345, chi2: 3.0543, chi3: 0.0, chi4: 0.0, prob: 0.58 }, // g-, t
-            RotamerAngles { chi1: -1.1345, chi2: 1.1345, chi3: 0.0, chi4: 0.0, prob: 0.15 }, // g-, g+
-            RotamerAngles { chi1: 3.0543,  chi2: 1.1345, chi3: 0.0, chi4: 0.0, prob: 0.13 }, // t, g+
-            RotamerAngles { chi1: 3.0543,  chi2: 3.0543, chi3: 0.0, chi4: 0.0, prob: 0.08 }, // t, t
-            RotamerAngles { chi1: 1.1345,  chi2: 1.1345, chi3: 0.0, chi4: 0.0, prob: 0.04 }, // g+, g+
-            RotamerAngles { chi1: 1.1345,  chi2: 3.0543, chi3: 0.0, chi4: 0.0, prob: 0.02 }, // g+, t
-        ],
-        "ILE" => &[
-            RotamerAngles { chi1: -1.0472, chi2: 2.9670, chi3: 0.0, chi4: 0.0, prob: 0.60 }, // g-, t
-            RotamerAngles { chi1: 2.9670,  chi2: 2.9670, chi3: 0.0, chi4: 0.0, prob: 0.16 }, // t, t
-            RotamerAngles { chi1: -1.0472, chi2: -1.0472,chi3: 0.0, chi4: 0.0, prob: 0.12 }, // g-, g-
-            RotamerAngles { chi1: 2.9670,  chi2: -1.0472,chi3: 0.0, chi4: 0.0, prob: 0.06 }, // t, g-
-            RotamerAngles { chi1: 1.0472,  chi2: 2.9670, chi3: 0.0, chi4: 0.0, prob: 0.04 }, // g+, t
-            RotamerAngles { chi1: 1.0472,  chi2: -1.0472,chi3: 0.0, chi4: 0.0, prob: 0.02 }, // g+, g-
-        ],
-        "SER" => &[
-            RotamerAngles { chi1: -1.0472, chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.45 },
-            RotamerAngles { chi1: 3.14159, chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.35 },
-            RotamerAngles { chi1: 1.0472,  chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.20 },
-        ],
-        "THR" => &[
-            RotamerAngles { chi1: -1.0472, chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.48 },
-            RotamerAngles { chi1: 3.14159, chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.45 },
-            RotamerAngles { chi1: 1.0472,  chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.07 },
-        ],
-        "CYS" => &[
-            RotamerAngles { chi1: -1.0472, chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.50 },
-            RotamerAngles { chi1: 3.14159, chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.35 },
-            RotamerAngles { chi1: 1.0472,  chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.15 },
-        ],
-        "MET" => &[
-            RotamerAngles { chi1: -1.1345, chi2: 3.14159, chi3: 3.14159, chi4: 0.0, prob: 0.40 },
-            RotamerAngles { chi1: -1.1345, chi2: -1.1345, chi3: 3.14159, chi4: 0.0, prob: 0.20 },
-            RotamerAngles { chi1: 3.14159, chi2: 3.14159, chi3: 3.14159, chi4: 0.0, prob: 0.15 },
-            RotamerAngles { chi1: 3.14159, chi2: -1.1345, chi3: 3.14159, chi4: 0.0, prob: 0.10 },
-            RotamerAngles { chi1: -1.1345, chi2: 1.1345,  chi3: 3.14159, chi4: 0.0, prob: 0.08 },
-            RotamerAngles { chi1: 1.1345,  chi2: 3.14159, chi3: 3.14159, chi4: 0.0, prob: 0.07 },
-        ],
-        "ASP" => &[
-            RotamerAngles { chi1: -1.1345, chi2: -0.5236, chi3: 0.0, chi4: 0.0, prob: 0.35 },
-            RotamerAngles { chi1: -1.1345, chi2: 0.5236,  chi3: 0.0, chi4: 0.0, prob: 0.30 },
-            RotamerAngles { chi1: 3.14159, chi2: -0.5236, chi3: 0.0, chi4: 0.0, prob: 0.15 },
-            RotamerAngles { chi1: 3.14159, chi2: 0.5236,  chi3: 0.0, chi4: 0.0, prob: 0.10 },
-            RotamerAngles { chi1: 1.1345,  chi2: -0.5236, chi3: 0.0, chi4: 0.0, prob: 0.05 },
-            RotamerAngles { chi1: 1.1345,  chi2: 0.5236,  chi3: 0.0, chi4: 0.0, prob: 0.05 },
-        ],
-        "ASN" => &[
-            RotamerAngles { chi1: -1.1345, chi2: -0.3491, chi3: 0.0, chi4: 0.0, prob: 0.35 },
-            RotamerAngles { chi1: -1.1345, chi2: 0.3491,  chi3: 0.0, chi4: 0.0, prob: 0.30 },
-            RotamerAngles { chi1: 3.14159, chi2: -0.3491, chi3: 0.0, chi4: 0.0, prob: 0.15 },
-            RotamerAngles { chi1: 3.14159, chi2: 0.3491,  chi3: 0.0, chi4: 0.0, prob: 0.10 },
-            RotamerAngles { chi1: 1.1345,  chi2: -0.3491, chi3: 0.0, chi4: 0.0, prob: 0.05 },
-            RotamerAngles { chi1: 1.1345,  chi2: 0.3491,  chi3: 0.0, chi4: 0.0, prob: 0.05 },
-        ],
-        "GLU" => &[
-            RotamerAngles { chi1: -1.1345, chi2: 3.14159, chi3: 0.0, chi4: 0.0, prob: 0.35 },
-            RotamerAngles { chi1: -1.1345, chi2: -1.1345, chi3: 0.0, chi4: 0.0, prob: 0.25 },
-            RotamerAngles { chi1: 3.14159, chi2: 3.14159, chi3: 0.0, chi4: 0.0, prob: 0.15 },
-            RotamerAngles { chi1: 3.14159, chi2: -1.1345, chi3: 0.0, chi4: 0.0, prob: 0.10 },
-            RotamerAngles { chi1: -1.1345, chi2: 1.1345,  chi3: 0.0, chi4: 0.0, prob: 0.08 },
-            RotamerAngles { chi1: 1.1345,  chi2: 3.14159, chi3: 0.0, chi4: 0.0, prob: 0.07 },
-        ],
-        "GLN" => &[
-            RotamerAngles { chi1: -1.1345, chi2: 3.14159, chi3: 0.0, chi4: 0.0, prob: 0.35 },
-            RotamerAngles { chi1: -1.1345, chi2: -1.1345, chi3: 0.0, chi4: 0.0, prob: 0.25 },
-            RotamerAngles { chi1: 3.14159, chi2: 3.14159, chi3: 0.0, chi4: 0.0, prob: 0.15 },
-            RotamerAngles { chi1: 3.14159, chi2: -1.1345, chi3: 0.0, chi4: 0.0, prob: 0.10 },
-            RotamerAngles { chi1: -1.1345, chi2: 1.1345,  chi3: 0.0, chi4: 0.0, prob: 0.08 },
-            RotamerAngles { chi1: 1.1345,  chi2: 3.14159, chi3: 0.0, chi4: 0.0, prob: 0.07 },
-        ],
-        "LYS" => &[
-            RotamerAngles { chi1: -1.1345, chi2: 3.14159, chi3: 3.14159, chi4: 3.14159, prob: 0.40 },
-            RotamerAngles { chi1: -1.1345, chi2: -1.1345, chi3: 3.14159, chi4: 3.14159, prob: 0.20 },
-            RotamerAngles { chi1: 3.14159, chi2: 3.14159, chi3: 3.14159, chi4: 3.14159, prob: 0.15 },
-            RotamerAngles { chi1: 3.14159, chi2: -1.1345, chi3: 3.14159, chi4: 3.14159, prob: 0.10 },
-            RotamerAngles { chi1: -1.1345, chi2: 1.1345,  chi3: 3.14159, chi4: 3.14159, prob: 0.08 },
-            RotamerAngles { chi1: 1.1345,  chi2: 3.14159, chi3: 3.14159, chi4: 3.14159, prob: 0.07 },
-        ],
-        "ARG" => &[
-            RotamerAngles { chi1: -1.1345, chi2: 3.14159, chi3: 3.14159, chi4: 3.14159, prob: 0.40 },
-            RotamerAngles { chi1: -1.1345, chi2: -1.1345, chi3: 3.14159, chi4: 3.14159, prob: 0.20 },
-            RotamerAngles { chi1: 3.14159, chi2: 3.14159, chi3: 3.14159, chi4: 3.14159, prob: 0.15 },
-            RotamerAngles { chi1: 3.14159, chi2: -1.1345, chi3: 3.14159, chi4: 3.14159, prob: 0.10 },
-            RotamerAngles { chi1: -1.1345, chi2: 1.1345,  chi3: 3.14159, chi4: 3.14159, prob: 0.08 },
-            RotamerAngles { chi1: 1.1345,  chi2: 3.14159, chi3: 3.14159, chi4: 3.14159, prob: 0.07 },
-        ],
-        "PHE" => &[
-            RotamerAngles { chi1: -1.1345, chi2: 1.3963, chi3: 0.0, chi4: 0.0, prob: 0.45 },
-            RotamerAngles { chi1: -1.1345, chi2: 1.7453, chi3: 0.0, chi4: 0.0, prob: 0.25 },
-            RotamerAngles { chi1: 3.14159, chi2: 1.3963, chi3: 0.0, chi4: 0.0, prob: 0.15 },
-            RotamerAngles { chi1: 3.14159, chi2: 1.7453, chi3: 0.0, chi4: 0.0, prob: 0.10 },
-            RotamerAngles { chi1: 1.1345,  chi2: 1.3963, chi3: 0.0, chi4: 0.0, prob: 0.03 },
-            RotamerAngles { chi1: 1.1345,  chi2: 1.7453, chi3: 0.0, chi4: 0.0, prob: 0.02 },
-        ],
-        "TYR" => &[
-            RotamerAngles { chi1: -1.1345, chi2: 1.3963, chi3: 0.0, chi4: 0.0, prob: 0.45 },
-            RotamerAngles { chi1: -1.1345, chi2: 1.7453, chi3: 0.0, chi4: 0.0, prob: 0.25 },
-            RotamerAngles { chi1: 3.14159, chi2: 1.3963, chi3: 0.0, chi4: 0.0, prob: 0.15 },
-            RotamerAngles { chi1: 3.14159, chi2: 1.7453, chi3: 0.0, chi4: 0.0, prob: 0.10 },
-            RotamerAngles { chi1: 1.1345,  chi2: 1.3963, chi3: 0.0, chi4: 0.0, prob: 0.03 },
-            RotamerAngles { chi1: 1.1345,  chi2: 1.7453, chi3: 0.0, chi4: 0.0, prob: 0.02 },
-        ],
-        "TRP" => &[
-            RotamerAngles { chi1: -1.1345, chi2: -1.5708, chi3: 0.0, chi4: 0.0, prob: 0.45 },
-            RotamerAngles { chi1: -1.1345, chi2: 1.5708,  chi3: 0.0, chi4: 0.0, prob: 0.25 },
-            RotamerAngles { chi1: 3.14159, chi2: -1.5708, chi3: 0.0, chi4: 0.0, prob: 0.15 },
-            RotamerAngles { chi1: 3.14159, chi2: 1.5708,  chi3: 0.0, chi4: 0.0, prob: 0.10 },
-            RotamerAngles { chi1: 1.1345,  chi2: -1.5708, chi3: 0.0, chi4: 0.0, prob: 0.03 },
-            RotamerAngles { chi1: 1.1345,  chi2: 1.5708,  chi3: 0.0, chi4: 0.0, prob: 0.02 },
-        ],
-        "HIS" => &[
-            RotamerAngles { chi1: -1.1345, chi2: -1.3090, chi3: 0.0, chi4: 0.0, prob: 0.40 },
-            RotamerAngles { chi1: -1.1345, chi2: 1.3090,  chi3: 0.0, chi4: 0.0, prob: 0.30 },
-            RotamerAngles { chi1: 3.14159, chi2: -1.3090, chi3: 0.0, chi4: 0.0, prob: 0.15 },
-            RotamerAngles { chi1: 3.14159, chi2: 1.3090,  chi3: 0.0, chi4: 0.0, prob: 0.10 },
-            RotamerAngles { chi1: 1.1345,  chi2: -1.3090, chi3: 0.0, chi4: 0.0, prob: 0.03 },
-            RotamerAngles { chi1: 1.1345,  chi2: 1.3090,  chi3: 0.0, chi4: 0.0, prob: 0.02 },
-        ],
-        "PRO" => &[
-            RotamerAngles { chi1: -0.4363, chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.65 }, // Cgamma-endo
-            RotamerAngles { chi1: 0.4363,  chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.35 }, // Cgamma-exo
-        ],
+        "VAL" => match basin {
+            RamachandranBasin::Alpha => &[
+                RotamerAngles { chi1: 3.14159, chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.88 }, // trans (180°)
+                RotamerAngles { chi1: -1.0472, chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.10 }, // gauche- (-60°)
+                RotamerAngles { chi1: 1.0472,  chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.02 }, // gauche+ (+60°)
+            ],
+            RamachandranBasin::Beta | RamachandranBasin::Ppii => &[
+                RotamerAngles { chi1: 3.14159, chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.58 },
+                RotamerAngles { chi1: -1.0472, chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.38 },
+                RotamerAngles { chi1: 1.0472,  chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.04 },
+            ],
+            RamachandranBasin::AlphaL => &[
+                RotamerAngles { chi1: 1.0472,  chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.52 },
+                RotamerAngles { chi1: 3.14159, chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.38 },
+                RotamerAngles { chi1: -1.0472, chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.10 },
+            ],
+            RamachandranBasin::General => &[
+                RotamerAngles { chi1: 3.14159, chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.75 },
+                RotamerAngles { chi1: -1.0472, chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.15 },
+                RotamerAngles { chi1: 1.0472,  chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.10 },
+            ],
+        },
+        "LEU" => match basin {
+            RamachandranBasin::Alpha => &[
+                RotamerAngles { chi1: -1.1345, chi2: 3.0543, chi3: 0.0, chi4: 0.0, prob: 0.74 }, // g-, t
+                RotamerAngles { chi1: 3.0543,  chi2: 1.1345, chi3: 0.0, chi4: 0.0, prob: 0.18 }, // t, g+
+                RotamerAngles { chi1: -1.1345, chi2: 1.1345, chi3: 0.0, chi4: 0.0, prob: 0.08 }, // g-, g+
+            ],
+            RamachandranBasin::Beta => &[
+                RotamerAngles { chi1: 3.0543,  chi2: 1.1345, chi3: 0.0, chi4: 0.0, prob: 0.44 }, // t, g+
+                RotamerAngles { chi1: -1.1345, chi2: 3.0543, chi3: 0.0, chi4: 0.0, prob: 0.38 }, // g-, t
+                RotamerAngles { chi1: -1.1345, chi2: 1.1345, chi3: 0.0, chi4: 0.0, prob: 0.12 }, // g-, g+
+                RotamerAngles { chi1: 3.0543,  chi2: 3.0543, chi3: 0.0, chi4: 0.0, prob: 0.06 }, // t, t
+            ],
+            RamachandranBasin::Ppii => &[
+                RotamerAngles { chi1: -1.1345, chi2: 3.0543, chi3: 0.0, chi4: 0.0, prob: 0.62 },
+                RotamerAngles { chi1: 3.0543,  chi2: 1.1345, chi3: 0.0, chi4: 0.0, prob: 0.28 },
+                RotamerAngles { chi1: -1.1345, chi2: 1.1345, chi3: 0.0, chi4: 0.0, prob: 0.10 },
+            ],
+            _ => &[
+                RotamerAngles { chi1: -1.1345, chi2: 3.0543, chi3: 0.0, chi4: 0.0, prob: 0.58 }, // g-, t
+                RotamerAngles { chi1: -1.1345, chi2: 1.1345, chi3: 0.0, chi4: 0.0, prob: 0.15 }, // g-, g+
+                RotamerAngles { chi1: 3.0543,  chi2: 1.1345, chi3: 0.0, chi4: 0.0, prob: 0.13 }, // t, g+
+                RotamerAngles { chi1: 3.0543,  chi2: 3.0543, chi3: 0.0, chi4: 0.0, prob: 0.08 }, // t, t
+                RotamerAngles { chi1: 1.1345,  chi2: 1.1345, chi3: 0.0, chi4: 0.0, prob: 0.04 }, // g+, g+
+                RotamerAngles { chi1: 1.1345,  chi2: 3.0543, chi3: 0.0, chi4: 0.0, prob: 0.02 }, // g+, t
+            ],
+        },
+        "ILE" => match basin {
+            RamachandranBasin::Alpha => &[
+                RotamerAngles { chi1: -1.0472, chi2: 2.9670, chi3: 0.0, chi4: 0.0, prob: 0.82 }, // g-, t
+                RotamerAngles { chi1: 2.9670,  chi2: 2.9670, chi3: 0.0, chi4: 0.0, prob: 0.12 }, // t, t
+                RotamerAngles { chi1: -1.0472, chi2: -1.0472,chi3: 0.0, chi4: 0.0, prob: 0.06 }, // g-, g-
+            ],
+            RamachandranBasin::Beta => &[
+                RotamerAngles { chi1: 2.9670,  chi2: 2.9670, chi3: 0.0, chi4: 0.0, prob: 0.56 }, // t, t
+                RotamerAngles { chi1: -1.0472, chi2: 2.9670, chi3: 0.0, chi4: 0.0, prob: 0.32 }, // g-, t
+                RotamerAngles { chi1: -1.0472, chi2: -1.0472,chi3: 0.0, chi4: 0.0, prob: 0.08 }, // g-, g-
+                RotamerAngles { chi1: 2.9670,  chi2: -1.0472,chi3: 0.0, chi4: 0.0, prob: 0.04 }, // t, g-
+            ],
+            RamachandranBasin::Ppii => &[
+                RotamerAngles { chi1: -1.0472, chi2: 2.9670, chi3: 0.0, chi4: 0.0, prob: 0.58 },
+                RotamerAngles { chi1: 2.9670,  chi2: 2.9670, chi3: 0.0, chi4: 0.0, prob: 0.34 },
+                RotamerAngles { chi1: -1.0472, chi2: -1.0472,chi3: 0.0, chi4: 0.0, prob: 0.08 },
+            ],
+            _ => &[
+                RotamerAngles { chi1: -1.0472, chi2: 2.9670, chi3: 0.0, chi4: 0.0, prob: 0.60 }, // g-, t
+                RotamerAngles { chi1: 2.9670,  chi2: 2.9670, chi3: 0.0, chi4: 0.0, prob: 0.16 }, // t, t
+                RotamerAngles { chi1: -1.0472, chi2: -1.0472,chi3: 0.0, chi4: 0.0, prob: 0.12 }, // g-, g-
+                RotamerAngles { chi1: 2.9670,  chi2: -1.0472,chi3: 0.0, chi4: 0.0, prob: 0.06 }, // t, g-
+                RotamerAngles { chi1: 1.0472,  chi2: 2.9670, chi3: 0.0, chi4: 0.0, prob: 0.04 }, // g+, t
+                RotamerAngles { chi1: 1.0472,  chi2: -1.0472,chi3: 0.0, chi4: 0.0, prob: 0.02 }, // g+, g-
+            ],
+        },
+        "SER" => match basin {
+            RamachandranBasin::Alpha => &[
+                RotamerAngles { chi1: -1.0472, chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.62 },
+                RotamerAngles { chi1: 3.14159, chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.28 },
+                RotamerAngles { chi1: 1.0472,  chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.10 },
+            ],
+            RamachandranBasin::Beta => &[
+                RotamerAngles { chi1: 3.14159, chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.48 },
+                RotamerAngles { chi1: -1.0472, chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.34 },
+                RotamerAngles { chi1: 1.0472,  chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.18 },
+            ],
+            _ => &[
+                RotamerAngles { chi1: -1.0472, chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.45 },
+                RotamerAngles { chi1: 3.14159, chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.35 },
+                RotamerAngles { chi1: 1.0472,  chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.20 },
+            ],
+        },
+        "THR" => match basin {
+            RamachandranBasin::Alpha => &[
+                RotamerAngles { chi1: -1.0472, chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.68 },
+                RotamerAngles { chi1: 3.14159, chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.28 },
+                RotamerAngles { chi1: 1.0472,  chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.04 },
+            ],
+            RamachandranBasin::Beta => &[
+                RotamerAngles { chi1: 3.14159, chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.58 },
+                RotamerAngles { chi1: -1.0472, chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.32 },
+                RotamerAngles { chi1: 1.0472,  chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.10 },
+            ],
+            _ => &[
+                RotamerAngles { chi1: -1.0472, chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.48 },
+                RotamerAngles { chi1: 3.14159, chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.45 },
+                RotamerAngles { chi1: 1.0472,  chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.07 },
+            ],
+        },
+        "CYS" => match basin {
+            RamachandranBasin::Alpha => &[
+                RotamerAngles { chi1: -1.0472, chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.65 },
+                RotamerAngles { chi1: 3.14159, chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.25 },
+                RotamerAngles { chi1: 1.0472,  chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.10 },
+            ],
+            RamachandranBasin::Beta => &[
+                RotamerAngles { chi1: 3.14159, chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.50 },
+                RotamerAngles { chi1: -1.0472, chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.35 },
+                RotamerAngles { chi1: 1.0472,  chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.15 },
+            ],
+            _ => &[
+                RotamerAngles { chi1: -1.0472, chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.50 },
+                RotamerAngles { chi1: 3.14159, chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.35 },
+                RotamerAngles { chi1: 1.0472,  chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.15 },
+            ],
+        },
+        "MET" => match basin {
+            RamachandranBasin::Alpha => &[
+                RotamerAngles { chi1: -1.1345, chi2: 3.14159, chi3: 3.14159, chi4: 0.0, prob: 0.55 },
+                RotamerAngles { chi1: -1.1345, chi2: -1.1345, chi3: 3.14159, chi4: 0.0, prob: 0.25 },
+                RotamerAngles { chi1: 3.14159, chi2: 3.14159, chi3: 3.14159, chi4: 0.0, prob: 0.12 },
+                RotamerAngles { chi1: 3.14159, chi2: -1.1345, chi3: 3.14159, chi4: 0.0, prob: 0.08 },
+            ],
+            RamachandranBasin::Beta => &[
+                RotamerAngles { chi1: 3.14159, chi2: 3.14159, chi3: 3.14159, chi4: 0.0, prob: 0.35 },
+                RotamerAngles { chi1: 3.14159, chi2: -1.1345, chi3: 3.14159, chi4: 0.0, prob: 0.25 },
+                RotamerAngles { chi1: -1.1345, chi2: 3.14159, chi3: 3.14159, chi4: 0.0, prob: 0.22 },
+                RotamerAngles { chi1: -1.1345, chi2: -1.1345, chi3: 3.14159, chi4: 0.0, prob: 0.18 },
+            ],
+            _ => &[
+                RotamerAngles { chi1: -1.1345, chi2: 3.14159, chi3: 3.14159, chi4: 0.0, prob: 0.40 },
+                RotamerAngles { chi1: -1.1345, chi2: -1.1345, chi3: 3.14159, chi4: 0.0, prob: 0.20 },
+                RotamerAngles { chi1: 3.14159, chi2: 3.14159, chi3: 3.14159, chi4: 0.0, prob: 0.15 },
+                RotamerAngles { chi1: 3.14159, chi2: -1.1345, chi3: 3.14159, chi4: 0.0, prob: 0.10 },
+                RotamerAngles { chi1: -1.1345, chi2: 1.1345,  chi3: 3.14159, chi4: 0.0, prob: 0.08 },
+                RotamerAngles { chi1: 1.1345,  chi2: 3.14159, chi3: 3.14159, chi4: 0.0, prob: 0.07 },
+            ],
+        },
+        "ASP" => match basin {
+            RamachandranBasin::Alpha => &[
+                RotamerAngles { chi1: -1.1345, chi2: -0.5236, chi3: 0.0, chi4: 0.0, prob: 0.48 },
+                RotamerAngles { chi1: -1.1345, chi2: 0.5236,  chi3: 0.0, chi4: 0.0, prob: 0.32 },
+                RotamerAngles { chi1: 3.14159, chi2: -0.5236, chi3: 0.0, chi4: 0.0, prob: 0.12 },
+                RotamerAngles { chi1: 3.14159, chi2: 0.5236,  chi3: 0.0, chi4: 0.0, prob: 0.08 },
+            ],
+            RamachandranBasin::Beta => &[
+                RotamerAngles { chi1: 3.14159, chi2: -0.5236, chi3: 0.0, chi4: 0.0, prob: 0.35 },
+                RotamerAngles { chi1: 3.14159, chi2: 0.5236,  chi3: 0.0, chi4: 0.0, prob: 0.25 },
+                RotamerAngles { chi1: -1.1345, chi2: -0.5236, chi3: 0.0, chi4: 0.0, prob: 0.22 },
+                RotamerAngles { chi1: -1.1345, chi2: 0.5236,  chi3: 0.0, chi4: 0.0, prob: 0.18 },
+            ],
+            _ => &[
+                RotamerAngles { chi1: -1.1345, chi2: -0.5236, chi3: 0.0, chi4: 0.0, prob: 0.35 },
+                RotamerAngles { chi1: -1.1345, chi2: 0.5236,  chi3: 0.0, chi4: 0.0, prob: 0.30 },
+                RotamerAngles { chi1: 3.14159, chi2: -0.5236, chi3: 0.0, chi4: 0.0, prob: 0.15 },
+                RotamerAngles { chi1: 3.14159, chi2: 0.5236,  chi3: 0.0, chi4: 0.0, prob: 0.10 },
+                RotamerAngles { chi1: 1.1345,  chi2: -0.5236, chi3: 0.0, chi4: 0.0, prob: 0.05 },
+                RotamerAngles { chi1: 1.1345,  chi2: 0.5236,  chi3: 0.0, chi4: 0.0, prob: 0.05 },
+            ],
+        },
+        "ASN" => match basin {
+            RamachandranBasin::Alpha => &[
+                RotamerAngles { chi1: -1.1345, chi2: -0.3491, chi3: 0.0, chi4: 0.0, prob: 0.48 },
+                RotamerAngles { chi1: -1.1345, chi2: 0.3491,  chi3: 0.0, chi4: 0.0, prob: 0.32 },
+                RotamerAngles { chi1: 3.14159, chi2: -0.3491, chi3: 0.0, chi4: 0.0, prob: 0.12 },
+                RotamerAngles { chi1: 3.14159, chi2: 0.3491,  chi3: 0.0, chi4: 0.0, prob: 0.08 },
+            ],
+            RamachandranBasin::Beta => &[
+                RotamerAngles { chi1: 3.14159, chi2: -0.3491, chi3: 0.0, chi4: 0.0, prob: 0.35 },
+                RotamerAngles { chi1: 3.14159, chi2: 0.3491,  chi3: 0.0, chi4: 0.0, prob: 0.25 },
+                RotamerAngles { chi1: -1.1345, chi2: -0.3491, chi3: 0.0, chi4: 0.0, prob: 0.22 },
+                RotamerAngles { chi1: -1.1345, chi2: 0.3491,  chi3: 0.0, chi4: 0.0, prob: 0.18 },
+            ],
+            _ => &[
+                RotamerAngles { chi1: -1.1345, chi2: -0.3491, chi3: 0.0, chi4: 0.0, prob: 0.35 },
+                RotamerAngles { chi1: -1.1345, chi2: 0.3491,  chi3: 0.0, chi4: 0.0, prob: 0.30 },
+                RotamerAngles { chi1: 3.14159, chi2: -0.3491, chi3: 0.0, chi4: 0.0, prob: 0.15 },
+                RotamerAngles { chi1: 3.14159, chi2: 0.3491,  chi3: 0.0, chi4: 0.0, prob: 0.10 },
+                RotamerAngles { chi1: 1.1345,  chi2: -0.3491, chi3: 0.0, chi4: 0.0, prob: 0.05 },
+                RotamerAngles { chi1: 1.1345,  chi2: 0.3491,  chi3: 0.0, chi4: 0.0, prob: 0.05 },
+            ],
+        },
+        "GLU" => match basin {
+            RamachandranBasin::Alpha => &[
+                RotamerAngles { chi1: -1.1345, chi2: 3.14159, chi3: 0.0, chi4: 0.0, prob: 0.50 },
+                RotamerAngles { chi1: -1.1345, chi2: -1.1345, chi3: 0.0, chi4: 0.0, prob: 0.30 },
+                RotamerAngles { chi1: 3.14159, chi2: 3.14159, chi3: 0.0, chi4: 0.0, prob: 0.12 },
+                RotamerAngles { chi1: 3.14159, chi2: -1.1345, chi3: 0.0, chi4: 0.0, prob: 0.08 },
+            ],
+            RamachandranBasin::Beta => &[
+                RotamerAngles { chi1: 3.14159, chi2: 3.14159, chi3: 0.0, chi4: 0.0, prob: 0.35 },
+                RotamerAngles { chi1: 3.14159, chi2: -1.1345, chi3: 0.0, chi4: 0.0, prob: 0.25 },
+                RotamerAngles { chi1: -1.1345, chi2: 3.14159, chi3: 0.0, chi4: 0.0, prob: 0.22 },
+                RotamerAngles { chi1: -1.1345, chi2: -1.1345, chi3: 0.0, chi4: 0.0, prob: 0.18 },
+            ],
+            _ => &[
+                RotamerAngles { chi1: -1.1345, chi2: 3.14159, chi3: 0.0, chi4: 0.0, prob: 0.35 },
+                RotamerAngles { chi1: -1.1345, chi2: -1.1345, chi3: 0.0, chi4: 0.0, prob: 0.25 },
+                RotamerAngles { chi1: 3.14159, chi2: 3.14159, chi3: 0.0, chi4: 0.0, prob: 0.15 },
+                RotamerAngles { chi1: 3.14159, chi2: -1.1345, chi3: 0.0, chi4: 0.0, prob: 0.10 },
+                RotamerAngles { chi1: -1.1345, chi2: 1.1345,  chi3: 0.0, chi4: 0.0, prob: 0.08 },
+                RotamerAngles { chi1: 1.1345,  chi2: 3.14159, chi3: 0.0, chi4: 0.0, prob: 0.07 },
+            ],
+        },
+        "GLN" => match basin {
+            RamachandranBasin::Alpha => &[
+                RotamerAngles { chi1: -1.1345, chi2: 3.14159, chi3: 0.0, chi4: 0.0, prob: 0.50 },
+                RotamerAngles { chi1: -1.1345, chi2: -1.1345, chi3: 0.0, chi4: 0.0, prob: 0.30 },
+                RotamerAngles { chi1: 3.14159, chi2: 3.14159, chi3: 0.0, chi4: 0.0, prob: 0.12 },
+                RotamerAngles { chi1: 3.14159, chi2: -1.1345, chi3: 0.0, chi4: 0.0, prob: 0.08 },
+            ],
+            RamachandranBasin::Beta => &[
+                RotamerAngles { chi1: 3.14159, chi2: 3.14159, chi3: 0.0, chi4: 0.0, prob: 0.35 },
+                RotamerAngles { chi1: 3.14159, chi2: -1.1345, chi3: 0.0, chi4: 0.0, prob: 0.25 },
+                RotamerAngles { chi1: -1.1345, chi2: 3.14159, chi3: 0.0, chi4: 0.0, prob: 0.22 },
+                RotamerAngles { chi1: -1.1345, chi2: -1.1345, chi3: 0.0, chi4: 0.0, prob: 0.18 },
+            ],
+            _ => &[
+                RotamerAngles { chi1: -1.1345, chi2: 3.14159, chi3: 0.0, chi4: 0.0, prob: 0.35 },
+                RotamerAngles { chi1: -1.1345, chi2: -1.1345, chi3: 0.0, chi4: 0.0, prob: 0.25 },
+                RotamerAngles { chi1: 3.14159, chi2: 3.14159, chi3: 0.0, chi4: 0.0, prob: 0.15 },
+                RotamerAngles { chi1: 3.14159, chi2: -1.1345, chi3: 0.0, chi4: 0.0, prob: 0.10 },
+                RotamerAngles { chi1: -1.1345, chi2: 1.1345,  chi3: 0.0, chi4: 0.0, prob: 0.08 },
+                RotamerAngles { chi1: 1.1345,  chi2: 3.14159, chi3: 0.0, chi4: 0.0, prob: 0.07 },
+            ],
+        },
+        "LYS" => match basin {
+            RamachandranBasin::Alpha => &[
+                RotamerAngles { chi1: -1.1345, chi2: 3.14159, chi3: 3.14159, chi4: 3.14159, prob: 0.55 },
+                RotamerAngles { chi1: -1.1345, chi2: -1.1345, chi3: 3.14159, chi4: 3.14159, prob: 0.25 },
+                RotamerAngles { chi1: 3.14159, chi2: 3.14159, chi3: 3.14159, chi4: 3.14159, prob: 0.12 },
+                RotamerAngles { chi1: 3.14159, chi2: -1.1345, chi3: 3.14159, chi4: 3.14159, prob: 0.08 },
+            ],
+            RamachandranBasin::Beta => &[
+                RotamerAngles { chi1: 3.14159, chi2: 3.14159, chi3: 3.14159, chi4: 3.14159, prob: 0.35 },
+                RotamerAngles { chi1: 3.14159, chi2: -1.1345, chi3: 3.14159, chi4: 3.14159, prob: 0.25 },
+                RotamerAngles { chi1: -1.1345, chi2: 3.14159, chi3: 3.14159, chi4: 3.14159, prob: 0.22 },
+                RotamerAngles { chi1: -1.1345, chi2: -1.1345, chi3: 3.14159, chi4: 3.14159, prob: 0.18 },
+            ],
+            _ => &[
+                RotamerAngles { chi1: -1.1345, chi2: 3.14159, chi3: 3.14159, chi4: 3.14159, prob: 0.40 },
+                RotamerAngles { chi1: -1.1345, chi2: -1.1345, chi3: 3.14159, chi4: 3.14159, prob: 0.20 },
+                RotamerAngles { chi1: 3.14159, chi2: 3.14159, chi3: 3.14159, chi4: 3.14159, prob: 0.15 },
+                RotamerAngles { chi1: 3.14159, chi2: -1.1345, chi3: 3.14159, chi4: 3.14159, prob: 0.10 },
+                RotamerAngles { chi1: -1.1345, chi2: 1.1345,  chi3: 3.14159, chi4: 3.14159, prob: 0.08 },
+                RotamerAngles { chi1: 1.1345,  chi2: 3.14159, chi3: 3.14159, chi4: 3.14159, prob: 0.07 },
+            ],
+        },
+        "ARG" => match basin {
+            RamachandranBasin::Alpha => &[
+                RotamerAngles { chi1: -1.1345, chi2: 3.14159, chi3: 3.14159, chi4: 3.14159, prob: 0.55 },
+                RotamerAngles { chi1: -1.1345, chi2: -1.1345, chi3: 3.14159, chi4: 3.14159, prob: 0.25 },
+                RotamerAngles { chi1: 3.14159, chi2: 3.14159, chi3: 3.14159, chi4: 3.14159, prob: 0.12 },
+                RotamerAngles { chi1: 3.14159, chi2: -1.1345, chi3: 3.14159, chi4: 3.14159, prob: 0.08 },
+            ],
+            RamachandranBasin::Beta => &[
+                RotamerAngles { chi1: 3.14159, chi2: 3.14159, chi3: 3.14159, chi4: 3.14159, prob: 0.35 },
+                RotamerAngles { chi1: 3.14159, chi2: -1.1345, chi3: 3.14159, chi4: 3.14159, prob: 0.25 },
+                RotamerAngles { chi1: -1.1345, chi2: 3.14159, chi3: 3.14159, chi4: 3.14159, prob: 0.22 },
+                RotamerAngles { chi1: -1.1345, chi2: -1.1345, chi3: 3.14159, chi4: 3.14159, prob: 0.18 },
+            ],
+            _ => &[
+                RotamerAngles { chi1: -1.1345, chi2: 3.14159, chi3: 3.14159, chi4: 3.14159, prob: 0.40 },
+                RotamerAngles { chi1: -1.1345, chi2: -1.1345, chi3: 3.14159, chi4: 3.14159, prob: 0.20 },
+                RotamerAngles { chi1: 3.14159, chi2: 3.14159, chi3: 3.14159, chi4: 3.14159, prob: 0.15 },
+                RotamerAngles { chi1: 3.14159, chi2: -1.1345, chi3: 3.14159, chi4: 3.14159, prob: 0.10 },
+                RotamerAngles { chi1: -1.1345, chi2: 1.1345,  chi3: 3.14159, chi4: 3.14159, prob: 0.08 },
+                RotamerAngles { chi1: 1.1345,  chi2: 3.14159, chi3: 3.14159, chi4: 3.14159, prob: 0.07 },
+            ],
+        },
+        "PHE" => match basin {
+            RamachandranBasin::Alpha => &[
+                RotamerAngles { chi1: -1.1345, chi2: 1.3963, chi3: 0.0, chi4: 0.0, prob: 0.55 },
+                RotamerAngles { chi1: -1.1345, chi2: 1.7453, chi3: 0.0, chi4: 0.0, prob: 0.35 },
+                RotamerAngles { chi1: 3.14159, chi2: 1.3963, chi3: 0.0, chi4: 0.0, prob: 0.07 },
+                RotamerAngles { chi1: 3.14159, chi2: 1.7453, chi3: 0.0, chi4: 0.0, prob: 0.03 },
+            ],
+            RamachandranBasin::Beta => &[
+                RotamerAngles { chi1: 3.14159, chi2: 1.3963, chi3: 0.0, chi4: 0.0, prob: 0.42 },
+                RotamerAngles { chi1: 3.14159, chi2: 1.7453, chi3: 0.0, chi4: 0.0, prob: 0.22 },
+                RotamerAngles { chi1: -1.1345, chi2: 1.3963, chi3: 0.0, chi4: 0.0, prob: 0.22 },
+                RotamerAngles { chi1: -1.1345, chi2: 1.7453, chi3: 0.0, chi4: 0.0, prob: 0.14 },
+            ],
+            _ => &[
+                RotamerAngles { chi1: -1.1345, chi2: 1.3963, chi3: 0.0, chi4: 0.0, prob: 0.45 },
+                RotamerAngles { chi1: -1.1345, chi2: 1.7453, chi3: 0.0, chi4: 0.0, prob: 0.25 },
+                RotamerAngles { chi1: 3.14159, chi2: 1.3963, chi3: 0.0, chi4: 0.0, prob: 0.15 },
+                RotamerAngles { chi1: 3.14159, chi2: 1.7453, chi3: 0.0, chi4: 0.0, prob: 0.10 },
+                RotamerAngles { chi1: 1.1345,  chi2: 1.3963, chi3: 0.0, chi4: 0.0, prob: 0.03 },
+                RotamerAngles { chi1: 1.1345,  chi2: 1.7453, chi3: 0.0, chi4: 0.0, prob: 0.02 },
+            ],
+        },
+        "TYR" => match basin {
+            RamachandranBasin::Alpha => &[
+                RotamerAngles { chi1: -1.1345, chi2: 1.3963, chi3: 0.0, chi4: 0.0, prob: 0.55 },
+                RotamerAngles { chi1: -1.1345, chi2: 1.7453, chi3: 0.0, chi4: 0.0, prob: 0.35 },
+                RotamerAngles { chi1: 3.14159, chi2: 1.3963, chi3: 0.0, chi4: 0.0, prob: 0.07 },
+                RotamerAngles { chi1: 3.14159, chi2: 1.7453, chi3: 0.0, chi4: 0.0, prob: 0.03 },
+            ],
+            RamachandranBasin::Beta => &[
+                RotamerAngles { chi1: 3.14159, chi2: 1.3963, chi3: 0.0, chi4: 0.0, prob: 0.42 },
+                RotamerAngles { chi1: 3.14159, chi2: 1.7453, chi3: 0.0, chi4: 0.0, prob: 0.22 },
+                RotamerAngles { chi1: -1.1345, chi2: 1.3963, chi3: 0.0, chi4: 0.0, prob: 0.22 },
+                RotamerAngles { chi1: -1.1345, chi2: 1.7453, chi3: 0.0, chi4: 0.0, prob: 0.14 },
+            ],
+            _ => &[
+                RotamerAngles { chi1: -1.1345, chi2: 1.3963, chi3: 0.0, chi4: 0.0, prob: 0.45 },
+                RotamerAngles { chi1: -1.1345, chi2: 1.7453, chi3: 0.0, chi4: 0.0, prob: 0.25 },
+                RotamerAngles { chi1: 3.14159, chi2: 1.3963, chi3: 0.0, chi4: 0.0, prob: 0.15 },
+                RotamerAngles { chi1: 3.14159, chi2: 1.7453, chi3: 0.0, chi4: 0.0, prob: 0.10 },
+                RotamerAngles { chi1: 1.1345,  chi2: 1.3963, chi3: 0.0, chi4: 0.0, prob: 0.03 },
+                RotamerAngles { chi1: 1.1345,  chi2: 1.7453, chi3: 0.0, chi4: 0.0, prob: 0.02 },
+            ],
+        },
+        "TRP" => match basin {
+            RamachandranBasin::Alpha => &[
+                RotamerAngles { chi1: -1.1345, chi2: -1.5708, chi3: 0.0, chi4: 0.0, prob: 0.58 },
+                RotamerAngles { chi1: -1.1345, chi2: 1.5708,  chi3: 0.0, chi4: 0.0, prob: 0.32 },
+                RotamerAngles { chi1: 3.14159, chi2: -1.5708, chi3: 0.0, chi4: 0.0, prob: 0.07 },
+                RotamerAngles { chi1: 3.14159, chi2: 1.5708,  chi3: 0.0, chi4: 0.0, prob: 0.03 },
+            ],
+            RamachandranBasin::Beta => &[
+                RotamerAngles { chi1: 3.14159, chi2: -1.5708, chi3: 0.0, chi4: 0.0, prob: 0.38 },
+                RotamerAngles { chi1: 3.14159, chi2: 1.5708,  chi3: 0.0, chi4: 0.0, prob: 0.26 },
+                RotamerAngles { chi1: -1.1345, chi2: -1.5708, chi3: 0.0, chi4: 0.0, prob: 0.22 },
+                RotamerAngles { chi1: -1.1345, chi2: 1.5708,  chi3: 0.0, chi4: 0.0, prob: 0.14 },
+            ],
+            _ => &[
+                RotamerAngles { chi1: -1.1345, chi2: -1.5708, chi3: 0.0, chi4: 0.0, prob: 0.45 },
+                RotamerAngles { chi1: -1.1345, chi2: 1.5708,  chi3: 0.0, chi4: 0.0, prob: 0.25 },
+                RotamerAngles { chi1: 3.14159, chi2: -1.5708, chi3: 0.0, chi4: 0.0, prob: 0.15 },
+                RotamerAngles { chi1: 3.14159, chi2: 1.5708,  chi3: 0.0, chi4: 0.0, prob: 0.10 },
+                RotamerAngles { chi1: 1.1345,  chi2: -1.5708, chi3: 0.0, chi4: 0.0, prob: 0.03 },
+                RotamerAngles { chi1: 1.1345,  chi2: 1.5708,  chi3: 0.0, chi4: 0.0, prob: 0.02 },
+            ],
+        },
+        "HIS" => match basin {
+            RamachandranBasin::Alpha => &[
+                RotamerAngles { chi1: -1.1345, chi2: -1.3090, chi3: 0.0, chi4: 0.0, prob: 0.50 },
+                RotamerAngles { chi1: -1.1345, chi2: 1.3090,  chi3: 0.0, chi4: 0.0, prob: 0.35 },
+                RotamerAngles { chi1: 3.14159, chi2: -1.3090, chi3: 0.0, chi4: 0.0, prob: 0.10 },
+                RotamerAngles { chi1: 3.14159, chi2: 1.3090,  chi3: 0.0, chi4: 0.0, prob: 0.05 },
+            ],
+            RamachandranBasin::Beta => &[
+                RotamerAngles { chi1: 3.14159, chi2: -1.3090, chi3: 0.0, chi4: 0.0, prob: 0.35 },
+                RotamerAngles { chi1: 3.14159, chi2: 1.3090,  chi3: 0.0, chi4: 0.0, prob: 0.25 },
+                RotamerAngles { chi1: -1.1345, chi2: -1.3090, chi3: 0.0, chi4: 0.0, prob: 0.22 },
+                RotamerAngles { chi1: -1.1345, chi2: 1.3090,  chi3: 0.0, chi4: 0.0, prob: 0.18 },
+            ],
+            _ => &[
+                RotamerAngles { chi1: -1.1345, chi2: -1.3090, chi3: 0.0, chi4: 0.0, prob: 0.40 },
+                RotamerAngles { chi1: -1.1345, chi2: 1.3090,  chi3: 0.0, chi4: 0.0, prob: 0.30 },
+                RotamerAngles { chi1: 3.14159, chi2: -1.3090, chi3: 0.0, chi4: 0.0, prob: 0.15 },
+                RotamerAngles { chi1: 3.14159, chi2: 1.3090,  chi3: 0.0, chi4: 0.0, prob: 0.10 },
+                RotamerAngles { chi1: 1.1345,  chi2: -1.3090, chi3: 0.0, chi4: 0.0, prob: 0.03 },
+                RotamerAngles { chi1: 1.1345,  chi2: 1.3090,  chi3: 0.0, chi4: 0.0, prob: 0.02 },
+            ],
+        },
+        "PRO" => match basin {
+            RamachandranBasin::Alpha => &[
+                RotamerAngles { chi1: -0.4363, chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.75 }, // Cgamma-endo
+                RotamerAngles { chi1: 0.4363,  chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.25 }, // Cgamma-exo
+            ],
+            RamachandranBasin::Beta | RamachandranBasin::Ppii => &[
+                RotamerAngles { chi1: -0.4363, chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.55 },
+                RotamerAngles { chi1: 0.4363,  chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.45 },
+            ],
+            _ => &[
+                RotamerAngles { chi1: -0.4363, chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.65 },
+                RotamerAngles { chi1: 0.4363,  chi2: 0.0, chi3: 0.0, chi4: 0.0, prob: 0.35 },
+            ],
+        },
         _ => &[],
     }
+}
+
+pub fn get_rotamer_candidates(res_name: &str) -> &'static [RotamerAngles] {
+    get_rotamer_candidates_bbdep(res_name, RamachandranBasin::General)
 }
 
 pub fn nerf_place_atom(a: Vec3, b: Vec3, c: Vec3, l: f64, theta: f64, chi: f64) -> Vec3 {
@@ -973,45 +1320,59 @@ pub fn soft_core_steric(dist: f64, elem_a: u8, elem_b: u8, alpha_soft: f64, w_cl
 pub fn is_bonded_residue_atoms(res_i: i32, name_i: &str, res_j: i32, name_j: &str) -> bool {
     let diff = (res_i - res_j).abs();
     if diff == 0 {
-        if (name_i == "N" && (name_j == "CA" || name_j == "C" || name_j == "CB")) ||
-           (name_j == "N" && (name_i == "CA" || name_i == "C" || name_i == "CB")) {
+        if (name_i == "N" && (name_j == "CA" || name_j == "C" || name_j == "CB" || name_j == "CD")) ||
+           (name_j == "N" && (name_i == "CA" || name_i == "C" || name_i == "CB" || name_i == "CD")) {
             return true;
         }
-        if (name_i == "CA" && (name_j == "C" || name_j == "O" || name_j == "CB" || name_j.starts_with("CG") || name_j.starts_with("OG") || name_j.starts_with("SG"))) ||
-           (name_j == "CA" && (name_i == "C" || name_i == "O" || name_i == "CB" || name_i.starts_with("CG") || name_i.starts_with("OG") || name_i.starts_with("SG"))) {
+        if (name_i == "CA" && (name_j == "C" || name_j == "O" || name_j == "CB" || name_j == "CD" || name_j.starts_with("CG") || name_j.starts_with("OG") || name_j.starts_with("SG"))) ||
+           (name_j == "CA" && (name_i == "C" || name_i == "O" || name_i == "CB" || name_i == "CD" || name_i.starts_with("CG") || name_i.starts_with("OG") || name_i.starts_with("SG"))) {
             return true;
         }
         if (name_i == "C" && (name_j == "O" || name_j == "CB")) ||
            (name_j == "C" && (name_i == "O" || name_i == "CB")) {
             return true;
         }
-        if (name_i == "CB" && (name_j.starts_with("CG") || name_j.starts_with("OG") || name_j.starts_with("SG") || name_j.starts_with("CD") || name_j.starts_with("OD") || name_j.starts_with("SD"))) ||
-           (name_j == "CB" && (name_i.starts_with("CG") || name_i.starts_with("OG") || name_i.starts_with("SG") || name_i.starts_with("CD") || name_i.starts_with("OD") || name_i.starts_with("SD"))) {
+        if (name_i == "CB" && (name_j.starts_with("CG") || name_j.starts_with("OG") || name_j.starts_with("SG") || name_j.starts_with("CD") || name_j.starts_with("OD") || name_j.starts_with("SD") || name_j.starts_with("ND"))) ||
+           (name_j == "CB" && (name_i.starts_with("CG") || name_i.starts_with("OG") || name_i.starts_with("SG") || name_i.starts_with("CD") || name_i.starts_with("OD") || name_i.starts_with("SD") || name_i.starts_with("ND"))) {
             return true;
         }
         if (name_i.starts_with("CG") && (name_j.starts_with("CD") || name_j.starts_with("OD") || name_j.starts_with("SD") || name_j.starts_with("ND") || name_j.starts_with("CE") || name_j.starts_with("OE") || name_j.starts_with("NE"))) ||
            (name_j == "CG" && (name_i.starts_with("CD") || name_i.starts_with("OD") || name_i.starts_with("SD") || name_i.starts_with("ND") || name_i.starts_with("CE") || name_i.starts_with("OE") || name_i.starts_with("NE"))) {
             return true;
         }
-        if (name_i.starts_with("CD") && (name_j.starts_with("CE") || name_j.starts_with("OE") || name_j.starts_with("NE") || name_j.starts_with("CZ") || name_j.starts_with("NZ"))) ||
-           (name_j == "CD" && (name_i.starts_with("CE") || name_i.starts_with("OE") || name_i.starts_with("NE") || name_i.starts_with("CZ") || name_i.starts_with("NZ"))) {
+        if (name_i.starts_with("CD") && (name_j.starts_with("CE") || name_j.starts_with("OE") || name_j.starts_with("NE") || name_j.starts_with("CZ") || name_j.starts_with("NZ") || name_j.starts_with("NH") || name_j.starts_with("OH"))) ||
+           (name_j == "CD" && (name_i.starts_with("CE") || name_i.starts_with("OE") || name_i.starts_with("NE") || name_i.starts_with("CZ") || name_i.starts_with("NZ") || name_i.starts_with("NH") || name_i.starts_with("OH"))) {
             return true;
         }
-        if (name_i.starts_with("CE") && (name_j.starts_with("CZ") || name_j.starts_with("NZ") || name_j.starts_with("NH") || name_j.starts_with("OH") || name_j.starts_with("CH"))) ||
-           (name_j == "CE" && (name_i.starts_with("CZ") || name_i.starts_with("NZ") || name_i.starts_with("NH") || name_i.starts_with("OH") || name_i.starts_with("CH"))) {
+        if (name_i.starts_with("CE") && (name_j.starts_with("CZ") || name_j.starts_with("NZ") || name_j.starts_with("NH") || name_j.starts_with("OH") || name_j.starts_with("CH") || name_j.starts_with("ND") || name_j.starts_with("NE") || name_j.starts_with("SD"))) ||
+           (name_j.starts_with("CE") && (name_i.starts_with("CZ") || name_i.starts_with("NZ") || name_i.starts_with("NH") || name_i.starts_with("OH") || name_i.starts_with("CH") || name_i.starts_with("ND") || name_i.starts_with("NE") || name_i.starts_with("SD"))) {
+            return true;
+        }
+        if (name_i.starts_with("CZ") && (name_j.starts_with("NE") || name_j.starts_with("NH") || name_j.starts_with("OH") || name_j.starts_with("CH"))) ||
+           (name_j.starts_with("CZ") && (name_i.starts_with("NE") || name_i.starts_with("NH") || name_i.starts_with("OH") || name_i.starts_with("CH"))) {
+            return true;
+        }
+        if (name_i.starts_with("CH") && (name_j.starts_with("CZ") || name_j.starts_with("CE"))) ||
+           (name_j.starts_with("CH") && (name_i.starts_with("CZ") || name_i.starts_with("CE"))) {
+            return true;
+        }
+        if (name_i.starts_with("NE") && name_j.starts_with("NH")) ||
+           (name_j.starts_with("NE") && name_i.starts_with("NH")) {
             return true;
         }
         if (name_i.starts_with("CG") && name_j.starts_with("CG")) ||
            (name_i.starts_with("CD") && name_j.starts_with("CD")) ||
+           (name_i.starts_with("CE") && name_j.starts_with("CE")) ||
            (name_i.starts_with("OD") && name_j.starts_with("OD")) ||
            (name_i.starts_with("OE") && name_j.starts_with("OE")) ||
-           (name_i.starts_with("NH") && name_j.starts_with("NH")) {
+           (name_i.starts_with("NH") && name_j.starts_with("NH")) ||
+           (name_i.starts_with("ND") && name_j.starts_with("ND")) {
             return true;
         }
     } else if diff == 1 {
         let (first_name, second_name) = if res_i < res_j { (name_i, name_j) } else { (name_j, name_i) };
         if (first_name == "C" && (second_name == "N" || second_name == "CA")) ||
-           (first_name == "O" && second_name == "N") ||
+           (first_name == "O" && (second_name == "N" || second_name == "CA")) ||
            (first_name == "CA" && second_name == "N") {
             return true;
         }
@@ -1020,41 +1381,120 @@ pub fn is_bonded_residue_atoms(res_i: i32, name_i: &str, res_j: i32, name_j: &st
 }
 
 pub fn compute_protein_clashscore(residues: &[ReconstructedResidue]) -> (usize, f64) {
-    let mut total_atoms = 0;
-    for r in residues {
-        total_atoms += 4;
-        if r.cb.is_some() { total_atoms += 1; }
-        total_atoms += r.sidechain_len as usize;
-    }
-    if total_atoms == 0 { return (0, 0.0); }
+    let b = compute_clash_breakdown(residues);
+    (b.total_clashes, b.clashscore)
+}
 
-    let mut clashes = 0;
+/// Clash distance threshold (Å) shared by `compute_protein_clashscore` and `compute_clash_breakdown`.
+pub const CLASH_DIST_THRESHOLD: f64 = 2.0;
+/// Pairs closer than this (Å) that survive the bonded-exclusion filter are almost certainly
+/// covalent bonds missing from `is_bonded_residue_atoms` (or coincident atoms), not steric clashes.
+pub const COVALENT_LIKE_THRESHOLD: f64 = 1.65;
+
+/// Categorized decomposition of the internal clashscore (STRUCT-5a diagnostics).
+///
+/// "Backbone" (`bb`) = N, CA, C, O, CB (the 5-atom frame fixed during rotamer packing).
+/// "Sidechain" (`sc`) = heavy atoms beyond CB placed by the rotamer packer.
+/// The category counters always sum to `total_clashes`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ClashBreakdown {
+    pub total_atoms: usize,
+    pub total_clashes: usize,
+    pub clashscore: f64,
+    /// bb–bb with |i−j| ≤ 1 (intra-residue and adjacent peptide geometry).
+    pub bb_bb_local: usize,
+    /// bb–bb with 2 ≤ |i−j| ≤ 4 (secondary-structure / turn geometry).
+    pub bb_bb_short: usize,
+    /// bb–bb with |i−j| ≥ 5 (tertiary fold collisions).
+    pub bb_bb_long: usize,
+    pub sc_bb_intra: usize,
+    pub sc_bb_inter: usize,
+    pub sc_sc_intra: usize,
+    pub sc_sc_inter: usize,
+    /// Subset of `total_clashes` with d < `COVALENT_LIKE_THRESHOLD` (likely missing bond exclusions).
+    pub covalent_like: usize,
+}
+
+impl ClashBreakdown {
+    #[inline]
+    pub fn bb_bb(&self) -> usize { self.bb_bb_local + self.bb_bb_short + self.bb_bb_long }
+    #[inline]
+    pub fn sc_bb(&self) -> usize { self.sc_bb_intra + self.sc_bb_inter }
+    #[inline]
+    pub fn sc_sc(&self) -> usize { self.sc_sc_intra + self.sc_sc_inter }
+    /// Converts a raw clash count into the same per-1000-atom scale as `clashscore`.
+    #[inline]
+    pub fn per_1000(&self, count: usize) -> f64 {
+        if self.total_atoms == 0 { 0.0 } else { count as f64 * 1000.0 / self.total_atoms as f64 }
+    }
+}
+
+/// Collects (position, name, is_sidechain) for every heavy atom of a residue into a fixed stack buffer.
+#[inline]
+fn collect_residue_atoms<'a>(r: &'a ReconstructedResidue, out: &mut [([f64; 3], &'a str, bool); 15]) -> usize {
+    let mut c = 0;
+    out[c] = (r.n, "N", false); c += 1;
+    out[c] = (r.ca, "CA", false); c += 1;
+    out[c] = (r.c, "C", false); c += 1;
+    out[c] = (r.o, "O", false); c += 1;
+    if let Some(cb) = r.cb {
+        out[c] = (cb, "CB", false); c += 1;
+    }
+    for k in 0..r.sidechain_len as usize {
+        out[c] = (r.sidechain_atoms[k].pos, r.sidechain_atoms[k].name_str(), true); c += 1;
+    }
+    c
+}
+
+/// Computes the internal clashscore (clashes with d < 2.0 Å per 1000 heavy atoms, after bonded
+/// exclusions) together with its decomposition by atom class and sequence separation.
+pub fn compute_clash_breakdown(residues: &[ReconstructedResidue]) -> ClashBreakdown {
+    let mut out = ClashBreakdown::default();
+    for r in residues {
+        out.total_atoms += 4;
+        if r.cb.is_some() { out.total_atoms += 1; }
+        out.total_atoms += r.sidechain_len as usize;
+    }
+    if out.total_atoms == 0 { return out; }
+
+    let thr_sq = CLASH_DIST_THRESHOLD * CLASH_DIST_THRESHOLD;
+    let cov_sq = COVALENT_LIKE_THRESHOLD * COVALENT_LIKE_THRESHOLD;
+    let empty: ([f64; 3], &str, bool) = ([0.0; 3], "", false);
+
+    let record = |out: &mut ClashBreakdown, d_sq: f64, sc_a: bool, sc_b: bool, seq_sep: i32| {
+        out.total_clashes += 1;
+        if d_sq < cov_sq { out.covalent_like += 1; }
+        match (sc_a, sc_b) {
+            (false, false) => {
+                if seq_sep <= 1 { out.bb_bb_local += 1; }
+                else if seq_sep <= 4 { out.bb_bb_short += 1; }
+                else { out.bb_bb_long += 1; }
+            }
+            (true, true) => {
+                if seq_sep == 0 { out.sc_sc_intra += 1; } else { out.sc_sc_inter += 1; }
+            }
+            _ => {
+                if seq_sep == 0 { out.sc_bb_intra += 1; } else { out.sc_bb_inter += 1; }
+            }
+        }
+    };
+
     let n = residues.len();
     for i in 0..n {
         let r_i = &residues[i];
-        let mut atoms_i: [Option<([f64; 3], &str)>; 15] = [None; 15];
-        let mut c_i = 0;
-        atoms_i[c_i] = Some((r_i.n, "N")); c_i += 1;
-        atoms_i[c_i] = Some((r_i.ca, "CA")); c_i += 1;
-        atoms_i[c_i] = Some((r_i.c, "C")); c_i += 1;
-        atoms_i[c_i] = Some((r_i.o, "O")); c_i += 1;
-        if let Some(cb) = r_i.cb {
-            atoms_i[c_i] = Some((cb, "CB")); c_i += 1;
-        }
-        for k in 0..r_i.sidechain_len as usize {
-            atoms_i[c_i] = Some((r_i.sidechain_atoms[k].pos, r_i.sidechain_atoms[k].name_str())); c_i += 1;
-        }
+        let mut atoms_i = [empty; 15];
+        let c_i = collect_residue_atoms(r_i, &mut atoms_i);
 
         for a in 0..c_i {
-            let (pos_a, name_a) = atoms_i[a].unwrap();
+            let (pos_a, name_a, sc_a) = atoms_i[a];
             for b in (a + 1)..c_i {
-                let (pos_b, name_b) = atoms_i[b].unwrap();
+                let (pos_b, name_b, sc_b) = atoms_i[b];
                 if is_bonded_residue_atoms(r_i.res_seq, name_a, r_i.res_seq, name_b) {
                     continue;
                 }
                 let d_sq = (pos_a[0] - pos_b[0]).powi(2) + (pos_a[1] - pos_b[1]).powi(2) + (pos_a[2] - pos_b[2]).powi(2);
-                if d_sq < 4.0 {
-                    clashes += 1;
+                if d_sq < thr_sq {
+                    record(&mut out, d_sq, sc_a, sc_b, 0);
                 }
             }
         }
@@ -1065,38 +1505,29 @@ pub fn compute_protein_clashscore(residues: &[ReconstructedResidue]) -> (usize, 
             if d_ca_sq > 256.0 {
                 continue;
             }
+            let seq_sep = (r_i.res_seq - r_j.res_seq).abs();
 
-            let mut atoms_j: [Option<([f64; 3], &str)>; 15] = [None; 15];
-            let mut c_j = 0;
-            atoms_j[c_j] = Some((r_j.n, "N")); c_j += 1;
-            atoms_j[c_j] = Some((r_j.ca, "CA")); c_j += 1;
-            atoms_j[c_j] = Some((r_j.c, "C")); c_j += 1;
-            atoms_j[c_j] = Some((r_j.o, "O")); c_j += 1;
-            if let Some(cb) = r_j.cb {
-                atoms_j[c_j] = Some((cb, "CB")); c_j += 1;
-            }
-            for k in 0..r_j.sidechain_len as usize {
-                atoms_j[c_j] = Some((r_j.sidechain_atoms[k].pos, r_j.sidechain_atoms[k].name_str())); c_j += 1;
-            }
+            let mut atoms_j = [empty; 15];
+            let c_j = collect_residue_atoms(r_j, &mut atoms_j);
 
             for a in 0..c_i {
-                let (pos_a, name_a) = atoms_i[a].unwrap();
+                let (pos_a, name_a, sc_a) = atoms_i[a];
                 for b in 0..c_j {
-                    let (pos_b, name_b) = atoms_j[b].unwrap();
+                    let (pos_b, name_b, sc_b) = atoms_j[b];
                     if is_bonded_residue_atoms(r_i.res_seq, name_a, r_j.res_seq, name_b) {
                         continue;
                     }
                     let d_sq = (pos_a[0] - pos_b[0]).powi(2) + (pos_a[1] - pos_b[1]).powi(2) + (pos_a[2] - pos_b[2]).powi(2);
-                    if d_sq < 4.0 {
-                        clashes += 1;
+                    if d_sq < thr_sq {
+                        record(&mut out, d_sq, sc_a, sc_b, seq_sep);
                     }
                 }
             }
         }
     }
 
-    let score = (clashes as f64 / total_atoms as f64) * 1000.0;
-    (clashes, score)
+    out.clashscore = (out.total_clashes as f64 / out.total_atoms as f64) * 1000.0;
+    out
 }
 
 pub const MAX_ROTAMERS: usize = 9;
@@ -1178,7 +1609,14 @@ pub fn pack_sidechains(
 
     for i in 0..n {
         let res_name = std::str::from_utf8(&residues[i].res_name).unwrap_or("UNK").trim();
-        let rots = get_rotamer_candidates(res_name);
+        let basin = if i > 0 && i + 1 < n {
+            let phi_deg = calc_dihedral_deg(residues[i - 1].c, residues[i].n, residues[i].ca, residues[i].c);
+            let psi_deg = calc_dihedral_deg(residues[i].n, residues[i].ca, residues[i].c, residues[i + 1].n);
+            classify_ramachandran(phi_deg, psi_deg)
+        } else {
+            RamachandranBasin::General
+        };
+        let rots = get_rotamer_candidates_bbdep(res_name, basin);
         let n_rots = rots.len().min(MAX_ROTAMERS);
         ws.n_rotamers[i] = n_rots as u8;
 
@@ -1201,6 +1639,7 @@ pub fn pack_sidechains(
                 if d_ca > 15.0 {
                     continue;
                 }
+                let num_bb = if residues[j].cb.is_none() { 4 } else { 5 };
                 let bb_atoms: [([f64; 3], u8, &str); 5] = [
                     (residues[j].n, b'N', "N"),
                     (residues[j].ca, b'C', "CA"),
@@ -1214,7 +1653,7 @@ pub fn pack_sidechains(
                     let a_pos = Vec3::from_array(a.pos);
                     let a_name = a.name_str();
 
-                    for &(b_pos, b_elem, b_name) in &bb_atoms {
+                    for &(b_pos, b_elem, b_name) in &bb_atoms[0..num_bb] {
                         if is_bonded_residue_atoms(residues[i].res_seq, a_name, residues[j].res_seq, b_name) {
                             continue;
                         }
@@ -1493,6 +1932,21 @@ impl KinematicBackboneSolver {
         ws: &mut AllAtomWorkspace,
         pack_sidechains_flag: bool,
     ) -> Option<SidechainPackingMetrics> {
+        self.reconstruct_into_with_bfactors(ca_coords, res_names, res_seqs, None, ws, pack_sidechains_flag)
+    }
+
+    /// Zero-allocation kinematic reconstruction writing directly into pre-allocated `AllAtomWorkspace`.
+    /// When `b_factors` is provided, attaches dynamic residue confidence scores to each residue.
+    /// When `pack_sidechains_flag` is true, performs rotamer optimization via NeRF + DEE + ICM (STRUCT-4/5).
+    pub fn reconstruct_into_with_bfactors(
+        &self,
+        ca_coords: &[[f64; 3]],
+        res_names: &[[u8; 3]],
+        res_seqs: &[i32],
+        b_factors: Option<&[f64]>,
+        ws: &mut AllAtomWorkspace,
+        pack_sidechains_flag: bool,
+    ) -> Option<SidechainPackingMetrics> {
         let n = ca_coords.len();
         assert!(n >= 3 && n <= ws.cas.len(), "Invalid sequence length for workspace capacity");
         let num_bonds = n - 1;
@@ -1682,6 +2136,8 @@ impl KinematicBackboneSolver {
                 Some(cb_pos.to_array())
             };
 
+            let b_factor = b_factors.and_then(|bf| bf.get(i).copied()).unwrap_or(50.0);
+
             ws.out_residues[i] = ReconstructedResidue {
                 res_name: res_names[i],
                 res_seq: res_seqs[i],
@@ -1690,6 +2146,7 @@ impl KinematicBackboneSolver {
                 c: c_atom.to_array(),
                 o: o_atom.to_array(),
                 cb,
+                b_factor,
                 sidechain_len: 0,
                 sidechain_atoms: [SideChainAtom::default(); 10],
             };
@@ -1721,7 +2178,8 @@ fn format_pdb_atom_name_field(name: &str) -> String {
 }
 
 /// Generates a Protein Data Bank (.pdb) string containing full all-atom backbone (N, CA, C, O) and C_beta atoms,
-/// plus rotameric sidechain atoms when present (STRUCT-3/4).
+/// plus rotameric sidechain atoms when present (STRUCT-3/4/5).
+/// Writes dynamic residue B-factors in columns 61-66.
 pub fn coords_to_allatom_pdb_string(
     protein_id: &str,
     residues: &[ReconstructedResidue],
@@ -1730,7 +2188,7 @@ pub fn coords_to_allatom_pdb_string(
     out.push_str(&format!("HEADER    CODON-INFER STRUCT-3 ALL-ATOM RECONSTRUCTION {}\n", protein_id));
     let has_sidechains = residues.iter().any(|r| r.sidechain_len > 0);
     let title = if has_sidechains {
-        "ALL-ATOM BACKBONE + ROTAMERIC SIDECHAINS (STRUCT-4 / NERF + DEE + ICM)"
+        "ALL-ATOM BACKBONE + ROTAMERIC SIDECHAINS (STRUCT-4/5 / NERF + DEE + ICM)"
     } else {
         "ALL-ATOM BACKBONE + CB SOLVED VIA PAULING-COREY KINEMATIC SOLVER"
     };
@@ -1741,37 +2199,37 @@ pub fn coords_to_allatom_pdb_string(
         let name_str = std::str::from_utf8(&res.res_name).unwrap_or("UNK");
         // N
         out.push_str(&format!(
-            "ATOM  {:5}{}{:3} A{:4}    {:8.3}{:8.3}{:8.3}  1.00 50.00           N\n",
-            atom_idx, format_pdb_atom_name_field("N"), name_str, res.res_seq, res.n[0], res.n[1], res.n[2]
+            "ATOM  {:5}{}{:3} A{:4}    {:8.3}{:8.3}{:8.3}  1.00{:6.2}           N\n",
+            atom_idx, format_pdb_atom_name_field("N"), name_str, res.res_seq, res.n[0], res.n[1], res.n[2], res.b_factor
         ));
         atom_idx += 1;
 
         // CA
         out.push_str(&format!(
-            "ATOM  {:5}{}{:3} A{:4}    {:8.3}{:8.3}{:8.3}  1.00 50.00           C\n",
-            atom_idx, format_pdb_atom_name_field("CA"), name_str, res.res_seq, res.ca[0], res.ca[1], res.ca[2]
+            "ATOM  {:5}{}{:3} A{:4}    {:8.3}{:8.3}{:8.3}  1.00{:6.2}           C\n",
+            atom_idx, format_pdb_atom_name_field("CA"), name_str, res.res_seq, res.ca[0], res.ca[1], res.ca[2], res.b_factor
         ));
         atom_idx += 1;
 
         // C
         out.push_str(&format!(
-            "ATOM  {:5}{}{:3} A{:4}    {:8.3}{:8.3}{:8.3}  1.00 50.00           C\n",
-            atom_idx, format_pdb_atom_name_field("C"), name_str, res.res_seq, res.c[0], res.c[1], res.c[2]
+            "ATOM  {:5}{}{:3} A{:4}    {:8.3}{:8.3}{:8.3}  1.00{:6.2}           C\n",
+            atom_idx, format_pdb_atom_name_field("C"), name_str, res.res_seq, res.c[0], res.c[1], res.c[2], res.b_factor
         ));
         atom_idx += 1;
 
         // O
         out.push_str(&format!(
-            "ATOM  {:5}{}{:3} A{:4}    {:8.3}{:8.3}{:8.3}  1.00 50.00           O\n",
-            atom_idx, format_pdb_atom_name_field("O"), name_str, res.res_seq, res.o[0], res.o[1], res.o[2]
+            "ATOM  {:5}{}{:3} A{:4}    {:8.3}{:8.3}{:8.3}  1.00{:6.2}           O\n",
+            atom_idx, format_pdb_atom_name_field("O"), name_str, res.res_seq, res.o[0], res.o[1], res.o[2], res.b_factor
         ));
         atom_idx += 1;
 
         // CB
         if let Some(cb) = res.cb {
             out.push_str(&format!(
-                "ATOM  {:5}{}{:3} A{:4}    {:8.3}{:8.3}{:8.3}  1.00 50.00           C\n",
-                atom_idx, format_pdb_atom_name_field("CB"), name_str, res.res_seq, cb[0], cb[1], cb[2]
+                "ATOM  {:5}{}{:3} A{:4}    {:8.3}{:8.3}{:8.3}  1.00{:6.2}           C\n",
+                atom_idx, format_pdb_atom_name_field("CB"), name_str, res.res_seq, cb[0], cb[1], cb[2], res.b_factor
             ));
             atom_idx += 1;
         }
@@ -1782,9 +2240,9 @@ pub fn coords_to_allatom_pdb_string(
             let sc_name = sc_atom.name_str();
             let elem_char = (sc_atom.element as char).to_ascii_uppercase();
             out.push_str(&format!(
-                "ATOM  {:5}{}{:3} A{:4}    {:8.3}{:8.3}{:8.3}  1.00 50.00          {:>2}\n",
+                "ATOM  {:5}{}{:3} A{:4}    {:8.3}{:8.3}{:8.3}  1.00{:6.2}          {:>2}\n",
                 atom_idx, format_pdb_atom_name_field(sc_name), name_str, res.res_seq,
-                sc_atom.pos[0], sc_atom.pos[1], sc_atom.pos[2], elem_char
+                sc_atom.pos[0], sc_atom.pos[1], sc_atom.pos[2], res.b_factor, elem_char
             ));
             atom_idx += 1;
         }
@@ -1812,7 +2270,7 @@ pub fn parse_pdb_atoms(path: &str) -> io::Result<Vec<ReconstructedResidue>> {
     let content = std::fs::read_to_string(path)?;
     let mut map: std::collections::BTreeMap<
         i32,
-        (String, Option<[f64; 3]>, Option<[f64; 3]>, Option<[f64; 3]>, Option<[f64; 3]>, Option<[f64; 3]>),
+        (String, Option<[f64; 3]>, Option<[f64; 3]>, Option<[f64; 3]>, Option<[f64; 3]>, Option<[f64; 3]>, f64),
     > = std::collections::BTreeMap::new();
 
     for line in content.lines() {
@@ -1825,12 +2283,16 @@ pub fn parse_pdb_atoms(path: &str) -> io::Result<Vec<ReconstructedResidue>> {
         let x: f64 = line.get(30..38).and_then(|s| s.trim().parse().ok()).unwrap_or(0.0);
         let y: f64 = line.get(38..46).and_then(|s| s.trim().parse().ok()).unwrap_or(0.0);
         let z: f64 = line.get(46..54).and_then(|s| s.trim().parse().ok()).unwrap_or(0.0);
+        let b_factor: f64 = line.get(60..66).and_then(|s| s.trim().parse().ok()).unwrap_or(50.0);
         let coord = [x, y, z];
 
-        let entry = map.entry(res_seq).or_insert((res_name, None, None, None, None, None));
+        let entry = map.entry(res_seq).or_insert((res_name, None, None, None, None, None, 50.0));
         match atom_name {
             "N" => entry.1 = Some(coord),
-            "CA" => entry.2 = Some(coord),
+            "CA" => {
+                entry.2 = Some(coord);
+                entry.6 = b_factor;
+            }
             "C" => entry.3 = Some(coord),
             "O" => entry.4 = Some(coord),
             "CB" => entry.5 = Some(coord),
@@ -1839,7 +2301,7 @@ pub fn parse_pdb_atoms(path: &str) -> io::Result<Vec<ReconstructedResidue>> {
     }
 
     let residues: Vec<ReconstructedResidue> = map.into_iter()
-        .filter_map(|(res_seq, (res_name, n_opt, ca_opt, c_opt, o_opt, cb_opt))| {
+        .filter_map(|(res_seq, (res_name, n_opt, ca_opt, c_opt, o_opt, cb_opt, b_factor))| {
             let ca = ca_opt?;
             let n = n_opt?;
             let c = c_opt?;
@@ -1871,6 +2333,7 @@ pub fn parse_pdb_atoms(path: &str) -> io::Result<Vec<ReconstructedResidue>> {
                 c,
                 o,
                 cb,
+                b_factor,
                 sidechain_len: 0,
                 sidechain_atoms: [SideChainAtom::default(); 10],
             })
@@ -2047,5 +2510,86 @@ mod tests {
         assert!(pdb_str.contains("ATOM      7  SD  MET A   1"));
         assert!(pdb_str.contains("ATOM      8  CE  MET A   1"));
         assert!(pdb_str.ends_with("END\n"));
+    }
+
+    #[test]
+    fn test_struct5_ramachandran_basins_and_bbdep_rotamers() {
+        // 1. Verify Ramachandran classification
+        assert_eq!(classify_ramachandran(-60.0, -45.0), RamachandranBasin::Alpha);
+        assert_eq!(classify_ramachandran(-120.0, 130.0), RamachandranBasin::Beta);
+        assert_eq!(classify_ramachandran(-75.0, 145.0), RamachandranBasin::Ppii);
+        assert_eq!(classify_ramachandran(55.0, 45.0), RamachandranBasin::AlphaL);
+        assert_eq!(classify_ramachandran(0.0, 0.0), RamachandranBasin::General);
+
+        // 2. Dihedral angle calculation: cis (0 deg), trans (180 deg)
+        let p1 = [1.0, 0.0, 0.0];
+        let p2 = [0.0, 0.0, 0.0];
+        let p3 = [0.0, 1.0, 0.0];
+        let p4_trans = [-1.0, 1.0, 0.0];
+        let p4_cis = [1.0, 1.0, 0.0];
+
+        let d_trans = calc_dihedral_deg(p1, p2, p3, p4_trans);
+        let d_cis = calc_dihedral_deg(p1, p2, p3, p4_cis);
+        assert!((d_trans.abs() - 180.0).abs() < 1e-4, "Trans dihedral should be ~180°");
+        assert!(d_cis.abs() < 1e-4, "Cis dihedral should be ~0°");
+
+        // 3. Backbone-dependent rotamer conditioning
+        let rots_alpha = get_rotamer_candidates_bbdep("LEU", RamachandranBasin::Alpha);
+        let rots_beta = get_rotamer_candidates_bbdep("LEU", RamachandranBasin::Beta);
+        let rots_gen = get_rotamer_candidates_bbdep("LEU", RamachandranBasin::General);
+
+        assert!(!rots_alpha.is_empty());
+        assert!(!rots_beta.is_empty());
+        assert!(!rots_gen.is_empty());
+        // Alpha basin for Leu typically favors chi1 = -65° (-1.1345 rad), Beta favors chi1 = 175° (3.0543 rad)
+        assert_eq!(rots_alpha[0].chi1, -1.1345);
+        assert_eq!(rots_beta[0].chi1, 3.0543);
+
+        // 4. Verify retrocompatible get_rotamer_candidates matches General basin
+        let rots_legacy = get_rotamer_candidates("LEU");
+        assert_eq!(rots_legacy.len(), rots_gen.len());
+        for i in 0..rots_legacy.len() {
+            assert_eq!(rots_legacy[i].chi1, rots_gen[i].chi1);
+            assert_eq!(rots_legacy[i].chi2, rots_gen[i].chi2);
+        }
+    }
+
+    #[test]
+    fn test_dynamic_bfactors_and_pdb_columns() {
+        let ca_coords = [
+            [0.0, 0.0, 0.0],
+            [3.8, 0.0, 0.0],
+            [6.0, 3.1, 0.0],
+        ];
+        let res_names = [*b"ALA", *b"CYS", *b"GLY"];
+        let res_seqs = [1, 2, 3];
+        let b_factors = [88.50, 92.15, 65.40];
+
+        let mut ws = AllAtomWorkspace::new(10);
+        let solver = KinematicBackboneSolver::default();
+        solver.reconstruct_into_with_bfactors(
+            &ca_coords,
+            &res_names,
+            &res_seqs,
+            Some(&b_factors),
+            &mut ws,
+            true,
+        );
+
+        assert_eq!(ws.out_residues[0].b_factor, 88.50);
+        assert_eq!(ws.out_residues[1].b_factor, 92.15);
+        assert_eq!(ws.out_residues[2].b_factor, 65.40);
+
+        let pdb_str = coords_to_allatom_pdb_string("TEST_BFAC", &ws.out_residues[0..3]);
+        // Validate PDB format columns: occupancy 1.00 followed by {:6.2} B-factor
+        assert!(pdb_str.contains("  1.00 88.50"));
+        assert!(pdb_str.contains("  1.00 92.15"));
+        assert!(pdb_str.contains("  1.00 65.40"));
+
+        // CA-only PDB string with B-factors
+        let ca_pdb = coords_to_pdb_string_with_bfactors("ACG", "TEST_CA", &ca_coords, Some(&b_factors));
+        assert!(ca_pdb.contains("ATOM      1  CA  ALA A   1       0.000   0.000   0.000  1.00 88.50           C"));
+        assert!(ca_pdb.contains("ATOM      2  CA  CYS A   2       3.800   0.000   0.000  1.00 92.15           C"));
+        assert!(ca_pdb.contains("ATOM      3  CA  GLY A   3       6.000   3.100   0.000  1.00 65.40           C"));
     }
 }
