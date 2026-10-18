@@ -92,8 +92,10 @@ fn parse_crystal_pdb(path: &str) -> Vec<ReconstructedResidue> {
             };
             let sc_count = r.sc_atoms.len().min(10);
             res.sidechain_len = sc_count as u8;
+            let res_name_str = std::str::from_utf8(&r.name).unwrap_or("UNK");
             for (i, (name, pos, elem)) in r.sc_atoms.into_iter().take(10).enumerate() {
-                res.sidechain_atoms[i] = SideChainAtom::new(&name, pos, elem);
+                let chem = codon_infer::classify_chem_flag(res_name_str, &name);
+                res.sidechain_atoms[i] = SideChainAtom::new_with_chem(&name, pos, elem, chem);
             }
             out.push(res);
         }

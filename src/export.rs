@@ -544,12 +544,19 @@ pub fn aa3_to_aa1(res3: &str) -> char {
     }
 }
 
-/// Heavy atom within a sidechain residue beyond C_beta (STRUCT-4).
+/// Chemical interaction classification flags for heavy atoms (STRUCT-6).
+pub const ATOM_POLAR_DONOR: u8    = 1 << 0; // H-bond donor (N-H, O-H)
+pub const ATOM_POLAR_ACCEPTOR: u8 = 1 << 1; // H-bond acceptor (O, N lone pair)
+pub const ATOM_CATION: u8         = 1 << 2; // Formal positive charge (Lys NZ, Arg NE/NH1/NH2, His ND1/NE2)
+pub const ATOM_ANION: u8          = 1 << 3; // Formal negative charge (Asp OD1/OD2, Glu OE1/OE2)
+
+/// Heavy atom within a sidechain residue beyond C_beta (STRUCT-4/6).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SideChainAtom {
     pub name: [u8; 4],
     pub pos: [f64; 3],
     pub element: u8, // b'C', b'N', b'O', b'S'
+    pub chem_flag: u8,
 }
 
 impl Default for SideChainAtom {
@@ -558,21 +565,102 @@ impl Default for SideChainAtom {
             name: [b' '; 4],
             pos: [0.0; 3],
             element: b'C',
+            chem_flag: 0,
         }
     }
 }
 
 impl SideChainAtom {
     pub fn new(name: &str, pos: [f64; 3], element: u8) -> Self {
+        Self::new_with_chem(name, pos, element, 0)
+    }
+
+    pub fn new_with_chem(name: &str, pos: [f64; 3], element: u8, chem_flag: u8) -> Self {
         let mut b = [b' '; 4];
         let bytes = name.as_bytes();
         let len = bytes.len().min(4);
         b[..len].copy_from_slice(&bytes[..len]);
-        Self { name: b, pos, element }
+        Self { name: b, pos, element, chem_flag }
     }
 
     pub fn name_str(&self) -> &str {
         std::str::from_utf8(&self.name).unwrap_or("XXXX").trim()
+    }
+}
+
+/// Classifies sidechain and backbone heavy atoms into chemical interaction types (STRUCT-6).
+pub fn classify_chem_flag(res_name: &str, atom_name: &str) -> u8 {
+    let a_clean = atom_name.trim();
+    let r_clean = res_name.trim();
+
+    // Backbone atoms
+    if a_clean == "N" {
+        return if r_clean == "PRO" { 0 } else { ATOM_POLAR_DONOR };
+    }
+    if a_clean == "O" {
+        return ATOM_POLAR_ACCEPTOR;
+    }
+
+    match r_clean {
+        "SER" => match a_clean {
+            "OG" => ATOM_POLAR_DONOR | ATOM_POLAR_ACCEPTOR,
+            _ => 0,
+        },
+        "THR" => match a_clean {
+            "OG1" => ATOM_POLAR_DONOR | ATOM_POLAR_ACCEPTOR,
+            _ => 0,
+        },
+        "TYR" => match a_clean {
+            "OH" => ATOM_POLAR_DONOR | ATOM_POLAR_ACCEPTOR,
+            _ => 0,
+        },
+        "TRP" => match a_clean {
+            "NE1" => ATOM_POLAR_DONOR,
+            _ => 0,
+        },
+        "HIS" => match a_clean {
+            "ND1" | "NE2" => ATOM_POLAR_DONOR | ATOM_POLAR_ACCEPTOR,
+            _ => 0,
+        },
+        "ASP" => match a_clean {
+            "OD1" | "OD2" => ATOM_POLAR_ACCEPTOR | ATOM_ANION,
+            _ => 0,
+        },
+        "GLU" => match a_clean {
+            "OE1" | "OE2" => ATOM_POLAR_ACCEPTOR | ATOM_ANION,
+            _ => 0,
+        },
+        "ASN" => match a_clean {
+            "OD1" => ATOM_POLAR_ACCEPTOR,
+            "ND2" => ATOM_POLAR_DONOR,
+            _ => 0,
+        },
+        "GLN" => match a_clean {
+            "OE1" => ATOM_POLAR_ACCEPTOR,
+            "NE2" => ATOM_POLAR_DONOR,
+            _ => 0,
+        },
+        "LYS" => match a_clean {
+            "NZ" => ATOM_POLAR_DONOR | ATOM_CATION,
+            _ => 0,
+        },
+        "ARG" => match a_clean {
+            "NE" | "NH1" | "NH2" => ATOM_POLAR_DONOR | ATOM_CATION,
+            _ => 0,
+        },
+        _ => 0,
+    }
+}
+
+/// Returns the normalized fraction of formal charge carried by an ionizable heavy atom (STRUCT-6).
+#[inline]
+pub fn charge_weight(atom_name: &str) -> f64 {
+    match atom_name.trim() {
+        "NZ" => 1.0,
+        "OD1" | "OD2" | "OE1" | "OE2" => 0.5,
+        "NH1" | "NH2" => 0.4,
+        "NE" => 0.2,
+        _ => 1.0,
     }
 }
 
@@ -1110,7 +1198,8 @@ pub fn build_sidechain_atoms_into(
 
     let mut push_atom = |name: &str, pos: Vec3, elem: u8| {
         if len < 10 {
-            out[len] = SideChainAtom::new(name, pos.to_array(), elem);
+            let chem = classify_chem_flag(res_name, name);
+            out[len] = SideChainAtom::new_with_chem(name, pos.to_array(), elem, chem);
             len += 1;
         }
     };
@@ -1309,12 +1398,76 @@ pub fn vdw_radius(element: u8) -> f64 {
 pub fn soft_core_steric(dist: f64, elem_a: u8, elem_b: u8, alpha_soft: f64, w_clash: f64) -> f64 {
     let r_ab = vdw_radius(elem_a) + vdw_radius(elem_b);
     let r_cut = alpha_soft * r_ab;
+    let mut energy = 0.0;
     if dist < r_cut {
         let pen = 1.0 - (dist / r_cut);
-        w_clash * pen * pen
-    } else {
-        0.0
+        energy += w_clash * pen * pen;
     }
+    // Hard steric barrier at the MolProbity clash threshold (STRUCT-6):
+    // Guarantees physical non-penetration and prevents attractive terms (H-bonds, salt bridges)
+    // from overriding steric exclusion below 2.0 Å.
+    if dist < CLASH_DIST_THRESHOLD {
+        let pen_clash = 1.0 - (dist / CLASH_DIST_THRESHOLD);
+        energy += 50.0 * pen_clash;
+    }
+    energy
+}
+
+/// Radial 10-12 Kortemme-Baker attractive hydrogen bond potential (STRUCT-6).
+/// Active window: r in [2.30, 3.40] Å, optimal r0 = 2.80 Å.
+/// Returns a negative stabilizing energy in kcal/mol.
+#[inline]
+pub fn hbond_energy(r: f64, ang_factor: f64, w_hb: f64) -> f64 {
+    if r < 2.30 || r > 3.40 || ang_factor <= 0.0 || w_hb <= 0.0 {
+        return 0.0;
+    }
+    let r0 = 2.80;
+    let inv_r = r0 / r;
+    let inv_r2 = inv_r * inv_r;
+    let inv_r10 = inv_r2 * inv_r2 * inv_r2 * inv_r2 * inv_r2;
+    let inv_r12 = inv_r10 * inv_r2;
+    // Normalized 10-12 well: at r = r0, 5*(1) - 6*(1) = -1.0
+    let f_rad = (5.0 * inv_r12 - 6.0 * inv_r10).clamp(-1.0, 0.0);
+
+    // Smoothstep taper between 3.0 Å and 3.4 Å for C1 continuity
+    let taper = if r > 3.00 {
+        let t = (3.40 - r) / 0.40;
+        t * t * (3.0 - 2.0 * t)
+    } else {
+        1.0
+    };
+
+    -w_hb * f_rad.abs() * ang_factor * taper
+}
+
+/// Screened electrostatic salt bridge interaction between charged residues (STRUCT-6).
+/// Active window: r in [2.30, 4.20] Å, optimal r_opt = 2.90 Å, sigma = 0.60 Å.
+/// Returns negative energy for attraction (cation-anion).
+#[inline]
+pub fn salt_bridge_energy(r: f64, w_salt: f64) -> f64 {
+    if r < 2.30 || r > 4.20 || w_salt <= 0.0 {
+        return 0.0;
+    }
+    let r_opt = 2.90;
+    let sigma = 0.60;
+    let delta = (r - r_opt) / sigma;
+    let lorentz = 1.0 / (1.0 + delta * delta);
+
+    // Smoothstep taper between 3.5 Å and 4.2 Å
+    let taper = if r > 3.50 {
+        let t = (4.20 - r) / 0.70;
+        t * t * (3.0 - 2.0 * t)
+    } else {
+        1.0
+    };
+
+    -w_salt * lorentz * taper
+}
+
+/// Like-charge electrostatic repulsion between basic-basic or acidic-acidic groups (STRUCT-6).
+#[inline]
+pub fn like_charge_repulsion(r: f64, w_salt: f64) -> f64 {
+    -0.5 * salt_bridge_energy(r, w_salt)
 }
 
 pub fn is_bonded_residue_atoms(res_i: i32, name_i: &str, res_j: i32, name_j: &str) -> bool {
@@ -1593,6 +1746,19 @@ pub fn pack_sidechains(
     w_clash: f64,
     w_rot: f64,
 ) -> SidechainPackingMetrics {
+    pack_sidechains_with_potentials(residues, ws, alpha_soft, w_clash, w_rot, 2.50, 3.00)
+}
+
+/// Rotamer optimization engine with directional H-bonds and screened salt bridges (STRUCT-6).
+pub fn pack_sidechains_with_potentials(
+    residues: &mut [ReconstructedResidue],
+    ws: &mut RotamerWorkspace,
+    alpha_soft: f64,
+    w_clash: f64,
+    w_rot: f64,
+    w_hb: f64,
+    w_salt: f64,
+) -> SidechainPackingMetrics {
     let timer = std::time::Instant::now();
     let n = residues.len();
     if n == 0 {
@@ -1634,6 +1800,7 @@ pub fn pack_sidechains(
             let e_prob = -w_rot * (rots[r].prob + 1e-6).ln();
 
             let mut e_bb_clash = 0.0;
+            let mut e_bb_hbond = 0.0;
             for j in 0..n {
                 let d_ca = ca_pos.dist(Vec3::from_array(residues[j].ca));
                 if d_ca > 15.0 {
@@ -1648,6 +1815,38 @@ pub fn pack_sidechains(
                     (residues[j].cb.unwrap_or(residues[j].ca), b'C', "CB"),
                 ];
 
+                let (u_co, u_nh, has_amide) = if w_hb > 0.0 {
+                    let c_pos = Vec3::from_array(residues[j].c);
+                    let o_pos = Vec3::from_array(residues[j].o);
+                    let co_diff = o_pos.sub(c_pos);
+                    let u_co = if co_diff.norm() > 1e-6 { co_diff.normalize() } else { Vec3::zero() };
+
+                    let res_j_name = residues[j].res_name;
+                    let is_pro = res_j_name == *b"PRO";
+                    let (u_nh, has_amide) = if !is_pro {
+                        let n_pos = Vec3::from_array(residues[j].n);
+                        let ca_j = Vec3::from_array(residues[j].ca);
+                        let v_nh = if j > 0 {
+                            let c_prev = Vec3::from_array(residues[j - 1].c);
+                            let v1 = n_pos.sub(c_prev).normalize();
+                            let v2 = n_pos.sub(ca_j).normalize();
+                            v1.add(v2)
+                        } else {
+                            n_pos.sub(ca_j)
+                        };
+                        if v_nh.norm() > 1e-6 {
+                            (v_nh.normalize(), true)
+                        } else {
+                            (Vec3::zero(), false)
+                        }
+                    } else {
+                        (Vec3::zero(), false)
+                    };
+                    (u_co, u_nh, has_amide)
+                } else {
+                    (Vec3::zero(), Vec3::zero(), false)
+                };
+
                 for a_idx in 0..sc_len as usize {
                     let a = &cand_buf[a_idx];
                     let a_pos = Vec3::from_array(a.pos);
@@ -1659,10 +1858,29 @@ pub fn pack_sidechains(
                         }
                         let d = a_pos.dist(Vec3::from_array(b_pos));
                         e_bb_clash += soft_core_steric(d, a.element, b_elem, alpha_soft, w_clash);
+
+                        // Directional H-bond potential (STRUCT-6)
+                        if w_hb > 0.0 && d >= 2.30 && d <= 3.40 {
+                            if (a.chem_flag & ATOM_POLAR_DONOR) != 0 && b_name == "O" {
+                                let o_pos = Vec3::from_array(b_pos);
+                                let u_od = a_pos.sub(o_pos).normalize();
+                                let cos_th = u_co.dot(u_od);
+                                if cos_th > 0.0 {
+                                    e_bb_hbond += hbond_energy(d, cos_th * cos_th, w_hb);
+                                }
+                            } else if (a.chem_flag & ATOM_POLAR_ACCEPTOR) != 0 && b_name == "N" && has_amide {
+                                let n_pos = Vec3::from_array(b_pos);
+                                let u_na = a_pos.sub(n_pos).normalize();
+                                let cos_th = u_nh.dot(u_na);
+                                if cos_th > 0.0 {
+                                    e_bb_hbond += hbond_energy(d, cos_th * cos_th, w_hb);
+                                }
+                            }
+                        }
                     }
                 }
             }
-            ws.self_energies[i][r] = e_prob + e_bb_clash;
+            ws.self_energies[i][r] = e_prob + e_bb_clash + e_bb_hbond;
         }
     }
 
@@ -1713,6 +1931,33 @@ pub fn pack_sidechains(
                                     }
                                     let d = pos_a.dist(Vec3::from_array(b.pos));
                                     e_pair += soft_core_steric(d, a.element, b.element, alpha_soft, w_clash);
+
+                                    // Directional/distance H-bond (STRUCT-6)
+                                    if w_hb > 0.0 && d >= 2.30 && d <= 3.40 {
+                                        let donor_a = (a.chem_flag & ATOM_POLAR_DONOR) != 0;
+                                        let acc_b = (b.chem_flag & ATOM_POLAR_ACCEPTOR) != 0;
+                                        let donor_b = (b.chem_flag & ATOM_POLAR_DONOR) != 0;
+                                        let acc_a = (a.chem_flag & ATOM_POLAR_ACCEPTOR) != 0;
+                                        if (donor_a && acc_b) || (donor_b && acc_a) {
+                                            e_pair += hbond_energy(d, 1.0, w_hb);
+                                        }
+                                    }
+
+                                    // Screened Salt Bridge & Electrostatics (STRUCT-6)
+                                    if w_salt > 0.0 && d >= 2.30 && d <= 4.20 {
+                                        let cat_a = (a.chem_flag & ATOM_CATION) != 0;
+                                        let ani_a = (a.chem_flag & ATOM_ANION) != 0;
+                                        let cat_b = (b.chem_flag & ATOM_CATION) != 0;
+                                        let ani_b = (b.chem_flag & ATOM_ANION) != 0;
+
+                                        if (cat_a && ani_b) || (ani_a && cat_b) {
+                                            let q_weight = charge_weight(name_a) * charge_weight(name_b);
+                                            e_pair += q_weight * salt_bridge_energy(d, w_salt);
+                                        } else if (cat_a && cat_b) || (ani_a && ani_b) {
+                                            let q_weight = charge_weight(name_a) * charge_weight(name_b);
+                                            e_pair += q_weight * like_charge_repulsion(d, w_salt);
+                                        }
+                                    }
                                 }
                             }
                             ws.pair_energies.push(e_pair);
@@ -2591,5 +2836,75 @@ mod tests {
         assert!(ca_pdb.contains("ATOM      1  CA  ALA A   1       0.000   0.000   0.000  1.00 88.50           C"));
         assert!(ca_pdb.contains("ATOM      2  CA  CYS A   2       3.800   0.000   0.000  1.00 92.15           C"));
         assert!(ca_pdb.contains("ATOM      3  CA  GLY A   3       6.000   3.100   0.000  1.00 65.40           C"));
+    }
+
+    #[test]
+    fn test_struct6_chemical_flags_and_weights() {
+        // Serine hydroxyl: donor and acceptor
+        let ser_og = classify_chem_flag("SER", "OG");
+        assert_eq!(ser_og, ATOM_POLAR_DONOR | ATOM_POLAR_ACCEPTOR);
+
+        // Aspartate carboxylate: acceptor and anion
+        let asp_od1 = classify_chem_flag("ASP", "OD1");
+        assert_eq!(asp_od1, ATOM_POLAR_ACCEPTOR | ATOM_ANION);
+        assert_eq!(charge_weight("OD1"), 0.5);
+
+        // Lysine amino: donor and cation
+        let lys_nz = classify_chem_flag("LYS", "NZ");
+        assert_eq!(lys_nz, ATOM_POLAR_DONOR | ATOM_CATION);
+        assert_eq!(charge_weight("NZ"), 1.0);
+
+        // Arginine guanidinium
+        let arg_nh1 = classify_chem_flag("ARG", "NH1");
+        assert_eq!(arg_nh1, ATOM_POLAR_DONOR | ATOM_CATION);
+        assert_eq!(charge_weight("NH1"), 0.4);
+
+        // Backbone atoms
+        assert_eq!(classify_chem_flag("ALA", "N"), ATOM_POLAR_DONOR);
+        assert_eq!(classify_chem_flag("PRO", "N"), 0); // Proline has no amide H
+        assert_eq!(classify_chem_flag("GLY", "O"), ATOM_POLAR_ACCEPTOR);
+
+        // Hydrophobic non-polar sidechain atoms
+        assert_eq!(classify_chem_flag("VAL", "CG1"), 0);
+        assert_eq!(classify_chem_flag("LEU", "CD1"), 0);
+        assert_eq!(classify_chem_flag("PHE", "CZ"), 0);
+    }
+
+    #[test]
+    fn test_struct6_hbond_potential() {
+        let w_hb = 2.50;
+        // Optimal distance r0 = 2.80 Å with ideal angle gives exact -w_hb
+        let e_opt = hbond_energy(2.80, 1.0, w_hb);
+        assert!((e_opt - (-2.50)).abs() < 1e-4, "Expected -2.50 at r0, got {}", e_opt);
+
+        // Out of active window (< 2.30 or > 3.40) must be 0.0
+        assert_eq!(hbond_energy(2.20, 1.0, w_hb), 0.0);
+        assert_eq!(hbond_energy(3.50, 1.0, w_hb), 0.0);
+
+        // Suboptimal angle scales as ang_factor (cos^2(theta))
+        let e_half = hbond_energy(2.80, 0.5, w_hb);
+        assert!((e_half - (-1.25)).abs() < 1e-4);
+
+        // Orthogonal or backward angle gives 0.0
+        assert_eq!(hbond_energy(2.80, 0.0, w_hb), 0.0);
+        assert_eq!(hbond_energy(2.80, -0.5, w_hb), 0.0);
+    }
+
+    #[test]
+    fn test_struct6_salt_bridge_potential() {
+        let w_salt = 3.00;
+        // Optimal distance r_opt = 2.90 Å gives exact -w_salt
+        let e_opt = salt_bridge_energy(2.90, w_salt);
+        assert!((e_opt - (-3.00)).abs() < 1e-4, "Expected -3.00 at r_opt, got {}", e_opt);
+
+        // Like charge repulsion is +50% of attractive magnitude
+        let e_rep = like_charge_repulsion(2.90, w_salt);
+        assert!((e_rep - 1.50).abs() < 1e-4, "Expected +1.50 for like charges, got {}", e_rep);
+
+        // Out of active window (< 2.30 or > 4.20) must be 0.0
+        assert_eq!(salt_bridge_energy(2.10, w_salt), 0.0);
+        assert_eq!(salt_bridge_energy(4.30, w_salt), 0.0);
+        assert_eq!(like_charge_repulsion(2.10, w_salt), 0.0);
+        assert_eq!(like_charge_repulsion(4.30, w_salt), 0.0);
     }
 }

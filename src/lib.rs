@@ -35,9 +35,11 @@ pub use export::{
     aa1_to_aa3, aa3_to_aa1, coords_to_pdb_string, coords_to_pdb_string_with_bfactors,
     export_ca_pdb, export_ca_pdb_with_bfactors, export_fold_tsv, fold_to_json_string, export_fold_json,
     Vec3, SideChainAtom, ReconstructedResidue, AllAtomWorkspace, KinematicBackboneSolver,
-    SidechainPackingMetrics, RotamerWorkspace, pack_sidechains, compute_protein_clashscore,
-    ClashBreakdown, compute_clash_breakdown,
+    SidechainPackingMetrics, RotamerWorkspace, pack_sidechains, pack_sidechains_with_potentials,
+    compute_protein_clashscore, ClashBreakdown, compute_clash_breakdown,
     RamachandranBasin, classify_ramachandran, calc_dihedral_deg,
+    ATOM_POLAR_DONOR, ATOM_POLAR_ACCEPTOR, ATOM_CATION, ATOM_ANION,
+    classify_chem_flag, charge_weight, hbond_energy, salt_bridge_energy, like_charge_repulsion,
     coords_to_allatom_pdb_string, export_allatom_pdb, parse_pdb_atoms,
     design_to_json_string, export_design_json,
 };
