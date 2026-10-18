@@ -11,7 +11,7 @@
 [![License](https://img.shields.io/badge/licencia-MIT-blue.svg)](LICENSE)
 [![Model](https://img.shields.io/badge/modelo-ESM--2%20(8M%20a%203B)-blueviolet.svg)](https://github.com/facebookresearch/esm)
 [![SIMD](https://img.shields.io/badge/SIMD-AVX512%20%7C%20AVX2%2BFMA%20%7C%20AVX1-red.svg)](#2-optimización-simd-y-despacho-dinámico-de-atención-heterogénea)
-[![Precision](https://img.shields.io/badge/precisión-FP32%20%7C%20Q8__0%20%7C%20Q4__0%20%7C%20Q3__LUT-green.svg)](#e-cuantización-nativa-de-modelos-a-q4_0-y-q8_0-quantize)
+[![Precision](https://img.shields.io/badge/precisión-FP32%20%7C%20Q8__0%20%7C%20Q4__0%20%7C%20Q3__LUT-green.svg)](#e-cuantización-nativa-de-modelos-a-q3_lut-q4_0-y-q8_0-quantize)
 [![Throughput](https://img.shields.io/badge/Rendimiento%20CPU->200%20tokens%2Fseg-success.svg)](#-rendimiento-y-benchmarks-comparativos)
 
 > 📖 **Nota de Idioma:** Este documento constituye la documentación oficial técnica completa en **español**. Para consultar la versión original en inglés técnico, acceda a [README.md](README.md).

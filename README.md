@@ -11,7 +11,7 @@
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Model](https://img.shields.io/badge/model-ESM--2%20(8M%20to%203B)-blueviolet.svg)](https://github.com/facebookresearch/esm)
 [![SIMD](https://img.shields.io/badge/SIMD-AVX512%20%7C%20AVX2%2BFMA%20%7C%20AVX1-red.svg)](#2-simd-optimization-and-heterogeneous-attention-dynamic-dispatch)
-[![Precision](https://img.shields.io/badge/precision-FP32%20%7C%20Q8__0%20%7C%20Q4__0%20%7C%20Q3__LUT-green.svg)](#e-native-q4_0--q8_0-model-quantization-quantize)
+[![Precision](https://img.shields.io/badge/precision-FP32%20%7C%20Q8__0%20%7C%20Q4__0%20%7C%20Q3__LUT-green.svg)](#e-native-in-tree-model-quantization-to-q3_lut-q4_0-and-q8_0-quantize)
 [![Throughput](https://img.shields.io/badge/CPU%20throughput->200%20tokens%2Fsec-success.svg)](#-performance--benchmarks)
 
 `codon-infer` is an ultra-lightweight, dependency-free inference engine and bioinformatic analysis suite for the Evolutionary Scale Modeling (**ESM-2**) protein language model family (`8M`, `35M`, `150M`, `650M`, and `3B`), engineered from first principles in **100% safe, idiomatic Rust (`std` only)**.
