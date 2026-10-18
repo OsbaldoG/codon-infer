@@ -17,7 +17,7 @@ use codon_infer::{
 
 fn print_version() {
     println!("codon-infer v{}", env!("CARGO_PKG_VERSION"));
-    println!("Engine: Pure Rust Zero-Dependencies (std) + Tiled GEMM, Zero-Trunk 3D Fold & BIO-2 Inverse Folding");
+    println!("Engine: Pure Rust Zero-Dependencies (std) + All-Atom Fold (STRUCT-6), Tiled GEMM & BIO-2");
     println!("Vector Dispatch: {}", active_simd_backend());
     println!("Concurrency: Persistent Worker Pool with Atomic Barrier (zero OS thread spawning)");
     println!("Quantization: Multi-Format Block Engine (Q3_LUT 3.50 bpw Lloyd-Max, Q4_0 nibbles & Q8_0 blocks with CODQ header)");
@@ -25,16 +25,23 @@ fn print_version() {
 }
 
 fn print_help(theme: &TerminalTheme) {
+    let ver_str = format!("Version {:<9}", env!("CARGO_PKG_VERSION"));
     let logo = if theme.enabled {
-        "\x1b[38;2;139;92;246m╔═══════════════════════════════════════════════════════════════════════════════╗\n\
-         ║   \x1b[38;2;59;130;246mCODON-INFER\x1b[38;2;139;92;246m: High-Performance Zero-Allocation ESM-2 Engine in Pure Rust     ║\n\
-         ║   \x1b[38;2;16;185;129mVersion 1.9.0\x1b[38;2;139;92;246m     | All-Atom 3D Fold, BIO-2 Inverse Folding & Q3_LUT 3.5bpw ║\n\
-         ╚═══════════════════════════════════════════════════════════════════════════════╝\x1b[0m"
+        format!(
+            "\x1b[38;2;139;92;246m╔═══════════════════════════════════════════════════════════════════════════════╗\n\
+             ║   \x1b[38;2;59;130;246mCODON-INFER\x1b[38;2;139;92;246m: High-Performance Zero-Allocation ESM-2 Engine in Pure Rust     ║\n\
+             ║   \x1b[38;2;16;185;129m{}\x1b[38;2;139;92;246m| All-Atom Fold, H-Bonds & Salt Bridges (STRUCT-6)        ║\n\
+             ╚═══════════════════════════════════════════════════════════════════════════════╝\x1b[0m",
+            ver_str
+        )
     } else {
-        "╔═══════════════════════════════════════════════════════════════════════════════╗\n\
-         ║   CODON-INFER: High-Performance Zero-Allocation ESM-2 Engine in Pure Rust     ║\n\
-         ║   Version 1.9.0     | All-Atom 3D Fold, BIO-2 Inverse Folding & Q3_LUT 3.5bpw ║\n\
-         ╚═══════════════════════════════════════════════════════════════════════════════╝"
+        format!(
+            "╔═══════════════════════════════════════════════════════════════════════════════╗\n\
+             ║   CODON-INFER: High-Performance Zero-Allocation ESM-2 Engine in Pure Rust     ║\n\
+             ║   {}| All-Atom Fold, H-Bonds & Salt Bridges (STRUCT-6)        ║\n\
+             ╚═══════════════════════════════════════════════════════════════════════════════╝",
+            ver_str
+        )
     };
     println!("{}", logo);
     println!("\nUSAGE:");
