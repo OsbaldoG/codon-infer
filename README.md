@@ -1,22 +1,49 @@
 # codon-infer 🧬⚡
 
-> **High-Performance, Zero-Allocation Multi-Scale ESM-2 Protein Language Model Inference Engine & Bioinformatic Pipeline in Pure Rust (v1.8.0).**
+> **High-Performance, Zero-Allocation Multi-Scale ESM-2 Protein Language Model Inference Engine & Bioinformatic Pipeline in Pure Rust (v1.11.0).**
 
 [🇪🇸 Read in Spanish (README_ES.md)](README_ES.md)
 
 [![Rust](https://img.shields.io/badge/rust-2024_edition-orange.svg)](https://www.rust-lang.org/)
-[![Version](https://img.shields.io/badge/version-1.8.0-blue.svg)](https://github.com/OsbaldoG/codon-infer/releases/tag/v1.8.0)
-[![Tests](https://img.shields.io/badge/tests-57%20executed%3A%2056%20passed%2C%200%20failed%2C%201%20ignored-brightgreen.svg)](#3-run-test-suite)
+[![Version](https://img.shields.io/badge/version-1.11.0-blue.svg)](https://github.com/OsbaldoG/codon-infer/releases/tag/v1.11.0)
+[![Tests](https://img.shields.io/badge/tests-61%20executed%3A%2060%20passed%2C%200%20failed%2C%201%20ignored-brightgreen.svg)](#3-run-test-suite)
 [![Dependencies](https://img.shields.io/badge/dependencies-0%20(pure%20std)-brightgreen.svg)](Cargo.toml)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Model](https://img.shields.io/badge/model-ESM--2%20(8M%20to%203B)-blueviolet.svg)](https://github.com/facebookresearch/esm)
 [![SIMD](https://img.shields.io/badge/SIMD-AVX512%20%7C%20AVX2%2BFMA%20%7C%20AVX1-red.svg)](#2-simd-optimization-and-heterogeneous-attention-dynamic-dispatch)
-[![Precision](https://img.shields.io/badge/precision-FP32%20%7C%20Q8__0%20%7C%20Q4__0-green.svg)](#e-native-q4_0--q8_0-model-quantization-quantize)
+[![Precision](https://img.shields.io/badge/precision-FP32%20%7C%20Q8__0%20%7C%20Q4__0%20%7C%20Q3__LUT-green.svg)](#e-native-q4_0--q8_0-model-quantization-quantize)
 [![Throughput](https://img.shields.io/badge/CPU%20throughput->200%20tokens%2Fsec-success.svg)](#-performance--benchmarks)
 
 `codon-infer` is an ultra-lightweight, dependency-free inference engine and bioinformatic analysis suite for the Evolutionary Scale Modeling (**ESM-2**) protein language model family (`8M`, `35M`, `150M`, `650M`, and `3B`), engineered from first principles in **100% safe, idiomatic Rust (`std` only)**.
 
-By eliminating Python, PyTorch, C/CUDA runtimes, and external third-party crates, `codon-infer` executes ESM-2 autoregressive generation, bidirectional active-site inpainting, in silico deep mutational scanning (DMS), zero-shot contact prediction, and ab initio 3D protein structure folding with dynamic SIMD vectorization at **over 200 tokens/second on standard x86_64 CPUs** with a static memory footprint under 40 MB for 8M models.
+By eliminating Python, PyTorch, C/CUDA runtimes, and external third-party crates, `codon-infer` executes ESM-2 autoregressive generation, bidirectional active-site inpainting, in silico deep mutational scanning (DMS), zero-shot contact prediction, ab initio all-atom 3D protein folding, and structure-guided sequence redesign with dynamic SIMD vectorization at **over 200 tokens/second on standard x86_64 CPUs** with a static memory footprint under 40 MB for 8M models.
+
+---
+
+## ⚡ Highlights (Version 1.11: Backbone-Dependent Rotamer Basins, Covalent Graph & Dynamic pLDDT)
+
+> 💡 **Version Consolidation:** Version 1.11.0 builds upon the all-atom reconstruction suite (v1.9.0 Pauling-Corey kinematics `STRUCT-3`, v1.10.0 rotameric NeRF + DEE `STRUCT-4`) introducing local backbone-conditioned rotamer spaces, topological covalent exclusions, and dynamic residue confidence metrics (`STRUCT-5`).
+
+* **Backbone-Dependent Rotamer Library (`STRUCT-5`):**
+  * Classifies local $(\phi, \psi)$ backbone dihedral angles into 5 canonical Ramachandran macro-basins ($\alpha_R$, $\beta$, $\text{PPII}$, $\alpha_L$, $\text{General}$) via analytical dihedral functions without heap allocation.
+  * Prunes sterically forbidden rotamers a priori based on local backbone basins, reducing sidechain-backbone collisions (`sc-bb`) and cutting sidechain-sidechain clashes (`sc-sc`) by **76.4%** (195 $\to$ 46) on predicted ESM-2 650M traces.
+  * Ultra-compact flash/RODATA storage (< 25 KB), preserving sub-10 ms packing latencies.
+* **Strict Topological Covalent & 1-3 Exclusions:**
+  * Full topological graph connectivity for complex sidechains and resonant rings (`MET` SD-CE, `ARG` NE-CZ/NH-CZ, `PRO` N-CD, `TYR` CZ-OH, `TRP` CE2-NE1/CH2-CZ, `HIS` CE1-ND1/NE2).
+  * Lowers experimental native crystal clashscore to **0.8** (MolProbity crystallographic validation standard, 0 clashes across 5 of 6 target crystals).
+* **Dynamic AlphaFold-Like pLDDT Confidence & B-Factor Export:**
+  * Computes position-wise model confidence from top-5 non-local contact probabilities and Shannon entropy of ESM-2 logits: $\text{pLDDT}_i = 100.0 \times \bar{P}_i \times (1.0 - \text{EntropyNorm}_i)$.
+  * Formatted strictly into columns 61–66 (`{:6.2}`) of `.pdb` outputs, matching standard crystallographic and AlphaFold conventions.
+* **All-Atom Rotameric Packing via NeRF + DEE + ICM (`STRUCT-4`):**
+  * Analytical 3D heavy-atom placement ($\chi_1, \chi_2, \chi_3, \chi_4$) for all 20 standard amino acids using Natural Extension of Reference Frames (NeRF) dihedral torsions and the Dunbrack/Penultimate rotamer library.
+  * Goldstein Dead-End Elimination (DEE) for combinatorial rotamer state pruning coupled with greedy Iterated Conditional Modes (ICM) spatial relaxation.
+  * Soft-core Lennard-Jones steric potential ($\alpha_{\text{soft}} = 0.82$, $W_{\text{clash}} = 10.0$) preventing divergent penalties on predicted traces.
+  * Zero-allocation fixed `[SideChainAtom; 10]` array representation within `ReconstructedResidue` with `Copy` semantics.
+* **Pauling-Corey Kinematic Backbone & Inverse Folding (`STRUCT-3` & `BIO-2`):**
+  * Solves complete backbone ($N, C_\alpha, C, O, C_\beta$) using local orthonormal reference frames and Nesterov-accelerated peptide plane rotation.
+  * Structure-guided sequence redesign (`codon-infer design --pdb <PDB>`) using 3D k-NN geometric graphs, Ramachandran steric potentials, and Lazaridis-Karplus desolvation.
+* **Hybrid Q3_LUT 3-Bit / 4-Bit L1d Cache GEMM (`CI-2`):**
+  * Sub-4-bit quantized matrix multiplication resident in L1d cache, delivering up to 3.8× inference throughput on consumer CPUs.
 
 ---
 

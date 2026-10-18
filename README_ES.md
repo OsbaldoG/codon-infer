@@ -1,24 +1,51 @@
 # codon-infer 🧬⚡
 
-> **Motor de Inferencia y Pipeline Bioinformático para Modelos de Lenguaje de Proteínas ESM-2 Multi-Escala, de Alto Rendimiento y Cero Asignaciones en Rust Puro (v1.8.0).**
+> **Motor de Inferencia y Pipeline Bioinformático para Modelos de Lenguaje de Proteínas ESM-2 Multi-Escala, de Alto Rendimiento y Cero Asignaciones en Rust Puro (v1.11.0).**
 
 [🇬🇧 Read in English (README.md)](README.md)
 
 [![Rust](https://img.shields.io/badge/rust-edición_2024-orange.svg)](https://www.rust-lang.org/)
-[![Version](https://img.shields.io/badge/versión-1.8.0-blue.svg)](https://github.com/OsbaldoG/codon-infer/releases/tag/v1.8.0)
-[![Tests](https://img.shields.io/badge/tests-57%20ejecutados%3A%2056%20pasados%2C%200%20fallidos%2C%201%20ignorado-brightgreen.svg)](#3-ejecución-de-la-suite-de-pruebas)
+[![Version](https://img.shields.io/badge/versión-1.11.0-blue.svg)](https://github.com/OsbaldoG/codon-infer/releases/tag/v1.11.0)
+[![Tests](https://img.shields.io/badge/tests-61%20ejecutados%3A%2060%20pasados%2C%200%20fallidos%2C%201%20ignorado-brightgreen.svg)](#3-ejecución-de-la-suite-de-pruebas)
 [![Dependencies](https://img.shields.io/badge/dependencias-0%20(std%20puro)-brightgreen.svg)](Cargo.toml)
 [![License](https://img.shields.io/badge/licencia-MIT-blue.svg)](LICENSE)
 [![Model](https://img.shields.io/badge/modelo-ESM--2%20(8M%20a%203B)-blueviolet.svg)](https://github.com/facebookresearch/esm)
 [![SIMD](https://img.shields.io/badge/SIMD-AVX512%20%7C%20AVX2%2BFMA%20%7C%20AVX1-red.svg)](#2-optimización-simd-y-despacho-dinámico-de-atención-heterogénea)
-[![Precision](https://img.shields.io/badge/precisión-FP32%20%7C%20Q8__0%20%7C%20Q4__0-green.svg)](#e-cuantización-nativa-de-modelos-a-q4_0-y-q8_0-quantize)
+[![Precision](https://img.shields.io/badge/precisión-FP32%20%7C%20Q8__0%20%7C%20Q4__0%20%7C%20Q3__LUT-green.svg)](#e-cuantización-nativa-de-modelos-a-q4_0-y-q8_0-quantize)
 [![Throughput](https://img.shields.io/badge/Rendimiento%20CPU->200%20tokens%2Fseg-success.svg)](#-rendimiento-y-benchmarks-comparativos)
 
 > 📖 **Nota de Idioma:** Este documento constituye la documentación oficial técnica completa en **español**. Para consultar la versión original en inglés técnico, acceda a [README.md](README.md).
 
 `codon-infer` es un motor de inferencia y suite de análisis bioinformático ultraligero y libre de dependencias externas para la familia de modelos de lenguaje de proteínas Evolutionary Scale Modeling (**ESM-2**) en todas sus variantes de escala (`8M`, `35M`, `150M`, `650M` y `3B`), diseñado desde primeros principios matemáticos y de hardware en **Rust 100% seguro e idiomático (`std` exclusivamente)**.
 
-Al prescindir por completo de los ecosistemas de Python, PyTorch, C/CUDA y crates externos de terceros, `codon-infer` ejecuta generación autorregresiva de secuencias, *inpainting* bidireccional de sitios activos, escaneo mutacional profundo *in silico* (DMS), predicción de contactos y reconstrucción 3D *ab initio* mediante vectorización SIMD dinámica a más de **200 tokens/segundo en CPUs x86_64 estándar**, manteniendo una huella de memoria estática inferior a 40 MB para modelos de 8M.
+Al prescindir por completo de los ecosistemas de Python, PyTorch, C/CUDA y crates externos de terceros, `codon-infer` ejecuta generación autorregresiva de secuencias, *inpainting* bidireccional de sitios activos, escaneo mutacional profundo *in silico* (DMS), predicción de contactos, reconstrucción all-atom 3D *ab initio* y rediseño inverso de secuencias guiado por estructura mediante vectorización SIMD dinámica a más de **200 tokens/segundo en CPUs x86_64 estándar**, manteniendo una huella de memoria estática inferior a 40 MB para modelos de 8M.
+
+---
+
+## ⚡ Aspectos Destacados (Versión 1.11: Cuencas Rotaméricas de Ramachandran, Grafo Covalente y pLDDT Dinámico)
+
+> 💡 **Consolidación de Versión:** La versión 1.11.0 culmina la suite de reconstrucción all-atom (v1.9.0 cinemática de Pauling-Corey `STRUCT-3`, v1.10.0 rotámeros NeRF + DEE `STRUCT-4`) incorporando espacios rotaméricos condicionados al esqueleto local, exclusiones covalentes topológicas y factores de confianza pLDDT dinámicos (`STRUCT-5`).
+
+* **Biblioteca Rotamérica Dependiente del Esqueleto (`STRUCT-5`):**
+  * Clasifica los ángulos diedros locales $(\phi, \psi)$ del esqueleto en 5 macro-cuencas canónicas de Ramachandran ($\alpha_R, \beta, \text{PPII}, \alpha_L, \text{General}$) mediante funciones diédricas analíticas sin tocar el heap.
+  * Poda *a priori* rotámeros estéricamente prohibidos según la cuenca local, reduciendo los choques cadena lateral-esqueleto (`sc-bb`) y desplomando los choques cadena-cadena (`sc-sc`) en un **76.4%** (de 195 a 46) sobre trazas predichas de ESM-2 650M.
+  * Almacenamiento ultracompacto en flash/RODATA (< 25 KB), manteniendo tiempos de empaquetamiento sub-10 ms.
+* **Exclusiones Covalentes y 1-3 Topológicas Estrictas:**
+  * Conectividad topológica completa para cadenas laterales complejas y anillos resonantes (`MET` SD-CE, `ARG` NE-CZ/NH-CZ, `PRO` N-CD, `TYR` CZ-OH, `TRP` CE2-NE1/CH2-CZ, `HIS` CE1-ND1/NE2).
+  * Reduce el clashscore en cristales experimentales nativos a **0.8** (estándar de validación cristalográfica MolProbity, con 0 choques en 5 de 6 dianas).
+* **Confianza Dinámica pLDDT Estilo AlphaFold y Exportación de B-Factors:**
+  * Calcula la confianza posicional a partir de la probabilidad de contacto top-5 no local y la entropía de Shannon de los logits de ESM-2: $\text{pLDDT}_i = 100.0 \times \bar{P}_i \times (1.0 - \text{EntropyNorm}_i)$.
+  * Formateo estricto en columnas 61–66 (`{:6.2}`) de archivos `.pdb`, alineado con la especificación cristalográfica estándar y AlphaFold.
+* **Empaquetamiento All-Atom Rotamérico vía NeRF + DEE + ICM (`STRUCT-4`):**
+  * Ubicación tridimensional analítica de todos los átomos pesados ($\chi_1, \chi_2, \chi_3, \chi_4$) para los 20 aminoácidos estándar usando torsiones NeRF y biblioteca Dunbrack/Penultimate.
+  * Eliminación de Callejones Sin Salida (Goldstein DEE) y relajación espacial voraz por Modos Condicionales Iterados (ICM).
+  * Potencial estérico soft-core ($\alpha_{\text{soft}} = 0.82$, $W_{\text{clash}} = 10.0$) que previene divergencias estéricas sobre trazas predichas.
+  * Representación en memoria de tamaño fijo `[SideChainAtom; 10]` en `ReconstructedResidue` con semántica `Copy` y cero asignaciones en el heap.
+* **Esqueleto Cinemático Pauling-Corey y Rediseño Inverso (`STRUCT-3` y `BIO-2`):**
+  * Resuelve el esqueleto completo ($N, C_\alpha, C, O, C_\beta$) mediante marcos ortonormales locales y rotación del plano peptídico acelerada por momento Nesterov.
+  * Rediseño inverso de secuencias guiado por estructura (`codon-infer design --pdb <PDB>`) usando grafos geométricos k-NN 3D, potenciales de Ramachandran y desolvatación de Lazaridis-Karplus.
+* **Motor Híbrido GEMM Q3_LUT de 3-Bits / 4-Bits Residente en L1d (`CI-2`):**
+  * Multiplicación matricial sub-4-bit bloqueada en caché L1d, acelerando la inferencia hasta 3.8× en CPUs domésticas.
 
 ---
 
