@@ -1,7 +1,7 @@
 use std::time::Instant;
 use crate::{
     forward_bidirectional, forward_bidirectional_parallel, forward_bidirectional_q8,
-    forward_bidirectional_q4, log_softmax_canonical, BidirectionalRunState, EsmConfig,
+    forward_bidirectional_q4, forward_bidirectional_q3, log_softmax_canonical, BidirectionalRunState, EsmConfig,
     EsmWeights, ModelWeightsRef, Tokenizer,
 };
 use crate::benchmark::{ContactPair, CANONICAL_AAS};
@@ -142,6 +142,9 @@ pub fn run_pipeline_dms_with_mode(
                     ModelWeightsRef::Q4(w_q4) => {
                         forward_bidirectional_q4(&tokens, config, w_q4, &mut state, num_threads);
                     }
+                    ModelWeightsRef::Q3(w_q3) => {
+                        forward_bidirectional_q3(&tokens, config, w_q3, &mut state, num_threads);
+                    }
                 }
 
                 let logits = &state.logits[tok_pos * config.vocab_size..(tok_pos + 1) * config.vocab_size];
@@ -186,6 +189,9 @@ pub fn run_pipeline_dms_with_mode(
                     }
                     ModelWeightsRef::Q4(w_q4) => {
                         forward_bidirectional_q4(&tokens, config, w_q4, &mut state, num_threads);
+                    }
+                    ModelWeightsRef::Q3(w_q3) => {
+                        forward_bidirectional_q3(&tokens, config, w_q3, &mut state, num_threads);
                     }
                 }
 
@@ -241,6 +247,9 @@ pub fn run_pipeline_dms_with_mode(
                         }
                         ModelWeightsRef::Q4(w_q4) => {
                             forward_bidirectional_q4(&tokens, config, w_q4, &mut state, num_threads);
+                        }
+                        ModelWeightsRef::Q3(w_q3) => {
+                            forward_bidirectional_q3(&tokens, config, w_q3, &mut state, num_threads);
                         }
                     }
 
@@ -428,6 +437,9 @@ pub fn compute_pipeline_contacts_parallel(
         }
         ModelWeightsRef::Q4(w_q4) => {
             forward_bidirectional_q4(&tokens, config, w_q4, &mut state, num_threads);
+        }
+        ModelWeightsRef::Q3(w_q3) => {
+            forward_bidirectional_q3(&tokens, config, w_q3, &mut state, num_threads);
         }
     }
 
@@ -628,6 +640,9 @@ pub fn compute_pipeline_inpaint_parallel(
         ModelWeightsRef::Q4(w_q4) => {
             forward_bidirectional_q4(&tokens, config, w_q4, &mut state, num_threads);
         }
+        ModelWeightsRef::Q3(w_q3) => {
+            forward_bidirectional_q3(&tokens, config, w_q3, &mut state, num_threads);
+        }
     }
 
     let mut mask_indices = Vec::new();
@@ -763,6 +778,7 @@ pub struct FoldPipelineResult {
     pub forward_ms: f64,
     pub solve_ms: f64,
     pub radius_of_gyration: f64,
+    pub allatom_residues: Option<Vec<crate::export::ReconstructedResidue>>,
 }
 
 struct RestraintPair {
@@ -841,6 +857,22 @@ pub fn mds_spectral_init(target_dist: &[f64], n: usize) -> Vec<[f64; 3]> {
                 v[i] = next_v[i] / norm;
             }
         }
+
+        // Enforce canonical sign convention: the largest component in magnitude must be positive
+        let mut max_abs = 0.0;
+        let mut max_val = 0.0;
+        for &val in &v {
+            if val.abs() > max_abs {
+                max_abs = val.abs();
+                max_val = val;
+            }
+        }
+        if max_val < 0.0 {
+            for x in &mut v {
+                *x = -*x;
+            }
+        }
+
         let scale = lambda.max(0.1).sqrt();
         for i in 0..n {
             coords[i][dim] = v[i] * scale;
@@ -1206,6 +1238,9 @@ pub fn compute_pipeline_fold_parallel(
         ModelWeightsRef::Q4(w_q4) => {
             forward_bidirectional_q4(&tokens, config, w_q4, &mut state, num_threads);
         }
+        ModelWeightsRef::Q3(w_q3) => {
+            forward_bidirectional_q3(&tokens, config, w_q3, &mut state, num_threads);
+        }
     }
     let forward_ms = t_fwd0.elapsed().as_secs_f64() * 1000.0;
 
@@ -1231,6 +1266,28 @@ pub fn compute_pipeline_fold_parallel(
     }
     let radius_of_gyration = (rg_sq / n as f64).sqrt();
 
+    // If sequence length >= 3, compute full all-atom coordinates via KinematicBackboneSolver:
+    let allatom_residues = if n >= 3 {
+        let mut ws = crate::export::AllAtomWorkspace::new(n);
+        let mut res_names = Vec::with_capacity(n);
+        let mut res_seqs = Vec::with_capacity(n);
+        for (i, ch) in seq.chars().enumerate() {
+            let name3 = crate::export::aa1_to_aa3(ch);
+            let mut b = [b' '; 3];
+            let src = name3.as_bytes();
+            for (idx, &byte) in src.iter().take(3).enumerate() {
+                b[idx] = byte;
+            }
+            res_names.push(b);
+            res_seqs.push((i + 1) as i32);
+        }
+        let solver = crate::export::KinematicBackboneSolver::default();
+        solver.reconstruct_into(&coords, &res_names, &res_seqs, &mut ws);
+        Some(ws.out_residues[0..n].to_vec())
+    } else {
+        None
+    };
+
     FoldPipelineResult {
         protein_id: record.id.clone(),
         sequence: seq.clone(),
@@ -1240,6 +1297,7 @@ pub fn compute_pipeline_fold_parallel(
         forward_ms,
         solve_ms,
         radius_of_gyration,
+        allatom_residues,
     }
 }
 
@@ -1247,6 +1305,7 @@ pub fn compute_pipeline_fold_parallel(
 pub fn render_fold_summary(
     result: &FoldPipelineResult,
     export_pdb_path: Option<&str>,
+    all_atom: bool,
     theme: &TerminalTheme,
 ) {
     println!("\n╔═══════════════════════════════════════════════════════════════════════════════════════════╗");
@@ -1261,7 +1320,8 @@ pub fn render_fold_summary(
     println!("  * 3D Geometric Solver Time:  {:.2} ms (Multi-start MDS + 450 gradient steps)", result.solve_ms);
     println!("  * Total End-to-End Latency:  {:.2} ms", result.forward_ms + result.solve_ms);
     if let Some(path) = export_pdb_path {
-        println!("  * Exported PDB Structure:    \x1b[38;2;16;185;129m{}\x1b[0m", path);
+        let mode_desc = if all_atom { "All-Atom Backbone + CB (N, CA, C, O, CB)" } else { "C-alpha Trace" };
+        println!("  * Exported PDB Structure:    \x1b[38;2;16;185;129m{}\x1b[0m ({})", path, mode_desc);
     }
     println!();
 
@@ -1298,16 +1358,548 @@ pub fn run_pipeline_fold_parallel(
     weights: ModelWeightsRef,
     num_threads: usize,
     export_pdb_path: Option<&str>,
+    all_atom: bool,
     theme: &TerminalTheme,
 ) -> FoldPipelineResult {
     let result = compute_pipeline_fold_parallel(record, config, weights, num_threads);
     if let Some(path) = export_pdb_path {
-        if let Err(e) = crate::export::export_ca_pdb(path, &result.sequence, &result.protein_id, &result.coords) {
+        let write_res = if all_atom && result.allatom_residues.is_some() {
+            crate::export::export_allatom_pdb(path, &result.protein_id, result.allatom_residues.as_ref().unwrap())
+                .map(|_| ())
+        } else {
+            crate::export::export_ca_pdb(path, &result.sequence, &result.protein_id, &result.coords)
+                .map(|_| ())
+        };
+        if let Err(e) = write_res {
             eprintln!("Warning: failed to write PDB to '{}': {}", path, e);
         }
     }
-    render_fold_summary(&result, export_pdb_path, theme);
+    render_fold_summary(&result, export_pdb_path, all_atom, theme);
     result
 }
+
+// ============================================================================
+// STRUCTURE-SEQUENCE INVERSE FOLDING & CO-DESIGN (BIO-2 / MPNN-LITE)
+// 3D Backbone k-NN Graph + Ramachandran Sterics + Desolvation Potentials
+// ============================================================================
+
+pub const STANDARD_AMINO_ACIDS: [char; 20] = [
+    'L', 'A', 'G', 'V', 'S', 'E', 'R', 'T', 'I', 'D',
+    'P', 'K', 'Q', 'N', 'F', 'Y', 'M', 'H', 'W', 'C',
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PhysicoClass {
+    Hydrophobic,
+    Polar,
+    Positive,
+    Negative,
+    Special,
+}
+
+impl PhysicoClass {
+    pub fn from_char(c: char) -> Self {
+        match c.to_ascii_uppercase() {
+            'L' | 'A' | 'V' | 'I' | 'F' | 'M' | 'W' => PhysicoClass::Hydrophobic,
+            'S' | 'T' | 'N' | 'Q' | 'Y' => PhysicoClass::Polar,
+            'K' | 'R' | 'H' => PhysicoClass::Positive,
+            'D' | 'E' => PhysicoClass::Negative,
+            'G' | 'P' | 'C' => PhysicoClass::Special,
+            _ => PhysicoClass::Special,
+        }
+    }
+}
+
+pub fn get_token_id(c: char) -> usize {
+    match c {
+        'L' => 4, 'A' => 5, 'G' => 6, 'V' => 7, 'S' => 8, 'E' => 9, 'R' => 10, 'T' => 11, 'I' => 12, 'D' => 13,
+        'P' => 14, 'K' => 15, 'Q' => 16, 'N' => 17, 'F' => 18, 'Y' => 19, 'M' => 20, 'H' => 21, 'W' => 22, 'C' => 23,
+        _ => 3,
+    }
+}
+
+pub fn calc_dihedral(p0: [f64; 3], p1: [f64; 3], p2: [f64; 3], p3: [f64; 3]) -> f64 {
+    let b0 = crate::export::Vec3::from_array(p0).sub(crate::export::Vec3::from_array(p1));
+    let b1 = crate::export::Vec3::from_array(p2).sub(crate::export::Vec3::from_array(p1));
+    let b2 = crate::export::Vec3::from_array(p3).sub(crate::export::Vec3::from_array(p2));
+
+    let b1_u = b1.normalize();
+    let v = crate::export::Vec3([
+        b0.0[0] - b1_u.0[0] * b0.dot(b1_u),
+        b0.0[1] - b1_u.0[1] * b0.dot(b1_u),
+        b0.0[2] - b1_u.0[2] * b0.dot(b1_u),
+    ]);
+    let w = crate::export::Vec3([
+        b2.0[0] - b1_u.0[0] * b2.dot(b1_u),
+        b2.0[1] - b1_u.0[1] * b2.dot(b1_u),
+        b2.0[2] - b1_u.0[2] * b2.dot(b1_u),
+    ]);
+
+    let x = v.dot(w);
+    let y = b1_u.cross(v).dot(w);
+    y.atan2(x)
+}
+
+pub struct Bio2Workspace {
+    pub burial: Vec<f64>,
+    pub phi: Vec<f64>,
+    pub psi: Vec<f64>,
+    pub neighbors: Vec<(usize, f64)>,
+    pub potentials: Vec<[f32; 20]>,
+}
+
+impl Bio2Workspace {
+    pub fn new(max_len: usize) -> Self {
+        Self {
+            burial: vec![0.0; max_len],
+            phi: vec![0.0; max_len],
+            psi: vec![0.0; max_len],
+            neighbors: vec![(0, 0.0); max_len],
+            potentials: vec![[0.0f32; 20]; max_len],
+        }
+    }
+}
+
+pub struct Bio2CoDesigner {
+    pub alpha_pack: f32,
+    pub alpha_ram: f32,
+    pub alpha_hb: f32,
+    pub k_neighbors: usize,
+}
+
+impl Default for Bio2CoDesigner {
+    fn default() -> Self {
+        Self {
+            alpha_pack: 0.35,
+            alpha_ram: 0.65,
+            alpha_hb: 0.45,
+            k_neighbors: 30,
+        }
+    }
+}
+
+impl Bio2CoDesigner {
+    /// Zero-allocation 3D potential evaluation writing directly into pre-allocated `Bio2Workspace`.
+    pub fn compute_geometric_potentials_into(
+        &self,
+        residues: &[crate::export::ReconstructedResidue],
+        use_neighbor_identities: bool,
+        ws: &mut Bio2Workspace,
+    ) {
+        let n = residues.len();
+        assert!(n <= ws.potentials.len(), "Residue count exceeds workspace capacity");
+
+        // 1. Calculate Burial / Coordination Number B_i using virtual/real CB
+        let mut b_sum = 0.0f64;
+        for i in 0..n {
+            let p_i = crate::export::Vec3::from_array(residues[i].cb.unwrap_or(residues[i].ca));
+            let mut b_i = 0.0f64;
+            for j in 0..n {
+                if (i as isize - j as isize).abs() > 2 {
+                    let p_j = crate::export::Vec3::from_array(residues[j].cb.unwrap_or(residues[j].ca));
+                    let d = p_i.sub(p_j).norm();
+                    b_i += 1.0 / (1.0 + ((d - 10.0) / 1.5).exp());
+                }
+            }
+            ws.burial[i] = b_i;
+            b_sum += b_i;
+        }
+        let b_mean = b_sum / n as f64;
+        let mut b_var = 0.0f64;
+        for i in 0..n {
+            let diff = ws.burial[i] - b_mean;
+            b_var += diff * diff;
+        }
+        let b_std = (b_var / n as f64).sqrt().max(1e-4);
+
+        // 2. Calculate Dihedral Angles phi_i and psi_i
+        for i in 0..n {
+            ws.phi[i] = if i > 0 {
+                calc_dihedral(residues[i - 1].c, residues[i].n, residues[i].ca, residues[i].c)
+            } else {
+                0.0
+            };
+            ws.psi[i] = if i + 1 < n {
+                calc_dihedral(residues[i].n, residues[i].ca, residues[i].c, residues[i + 1].n)
+            } else {
+                0.0
+            };
+        }
+
+        // 3. Compute potentials for each residue and amino acid candidate (0 heap allocations)
+        let n_nb = n.saturating_sub(1);
+        for i in 0..n {
+            let norm_burial = (ws.burial[i] - b_mean) / b_std;
+            let phi_deg = ws.phi[i].to_degrees();
+            let psi_deg = ws.psi[i].to_degrees();
+
+            let p_i = crate::export::Vec3::from_array(residues[i].ca);
+            let mut nb_idx = 0;
+            for j in 0..n {
+                if j != i {
+                    let d = p_i.sub(crate::export::Vec3::from_array(residues[j].ca)).norm();
+                    ws.neighbors[nb_idx] = (j, d);
+                    nb_idx += 1;
+                }
+            }
+            let nb_slice = &mut ws.neighbors[0..n_nb];
+            nb_slice.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            let k_nn = &nb_slice[0..self.k_neighbors.min(n_nb)];
+
+            let v_ab_i = crate::export::Vec3::from_array(residues[i].cb.unwrap_or(residues[i].ca)).sub(p_i).normalize();
+
+            let is_in_helix = if i >= 2 && i + 2 < n {
+                let d_prev = crate::export::Vec3::from_array(residues[i - 1].ca).sub(crate::export::Vec3::from_array(residues[i + 2].ca)).norm();
+                let d_prev2 = crate::export::Vec3::from_array(residues[i - 2].ca).sub(crate::export::Vec3::from_array(residues[i + 1].ca)).norm();
+                d_prev < 6.2 && d_prev2 < 6.2
+            } else {
+                false
+            };
+
+            let is_alpha = phi_deg >= -95.0 && phi_deg <= -40.0 && psi_deg >= -70.0 && psi_deg <= -15.0;
+            let is_beta = phi_deg >= -165.0 && phi_deg <= -75.0 && (psi_deg >= 85.0 || psi_deg <= -150.0);
+
+            for (a_idx, &aa) in STANDARD_AMINO_ACIDS.iter().enumerate() {
+                let mut score = 0.0f32;
+
+                let is_charged = matches!(aa, 'D' | 'E' | 'K' | 'R');
+                let is_bulky_hydrophobic = matches!(aa, 'W' | 'F' | 'I' | 'L' | 'M' | 'V');
+                let is_polar = matches!(aa, 'S' | 'T' | 'N' | 'Q' | 'H');
+                let c_class = PhysicoClass::from_char(aa);
+
+                // A. Desolvation and Surface Exposure Penalties (Threshold-based Born physics)
+                if norm_burial > 1.0 {
+                    if is_charged {
+                        let mut has_salt_bridge = false;
+                        if use_neighbor_identities {
+                            for &(j, d) in k_nn {
+                                if d < 5.5 && (i as isize - j as isize).abs() > 2 {
+                                    let neighbor_res_char = crate::export::aa3_to_aa1(std::str::from_utf8(&residues[j].res_name).unwrap_or("UNK"));
+                                    let neighbor_class = PhysicoClass::from_char(neighbor_res_char);
+                                    if (c_class == PhysicoClass::Negative && neighbor_class == PhysicoClass::Positive)
+                                        || (c_class == PhysicoClass::Positive && neighbor_class == PhysicoClass::Negative)
+                                    {
+                                        let p_j = crate::export::Vec3::from_array(residues[j].ca);
+                                        let v_ab_j = crate::export::Vec3::from_array(residues[j].cb.unwrap_or(residues[j].ca)).sub(p_j).normalize();
+                                        if v_ab_i.dot(v_ab_j) < -0.20 {
+                                            has_salt_bridge = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if !has_salt_bridge {
+                            score -= self.alpha_pack * 1.8;
+                        }
+                    } else if is_bulky_hydrophobic {
+                        score += self.alpha_pack * 0.6;
+                    }
+                } else if norm_burial < -1.0 {
+                    if matches!(aa, 'W' | 'F' | 'I' | 'L') {
+                        score -= self.alpha_pack * 1.2;
+                    } else if is_charged || is_polar {
+                        score += self.alpha_pack * 0.4;
+                    }
+                }
+
+                // B. Dihedral / Stereochemical Filter (Ramachandran sterics & secondary structure)
+                if aa == 'G' {
+                    if phi_deg > 20.0 {
+                        score += self.alpha_ram * 2.2;
+                    } else if is_alpha {
+                        score -= self.alpha_ram * 0.4;
+                    }
+                } else if phi_deg > 20.0 {
+                    score -= self.alpha_ram * 2.5;
+                }
+
+                if is_alpha {
+                    if matches!(aa, 'A' | 'L' | 'E' | 'M' | 'K' | 'R' | 'Q') {
+                        score += self.alpha_ram * 0.25;
+                    }
+                } else if is_beta {
+                    if matches!(aa, 'V' | 'I' | 'T' | 'Y' | 'F' | 'W') {
+                        score += self.alpha_ram * 0.35;
+                    }
+                }
+
+                if aa == 'P' {
+                    if is_in_helix || is_alpha {
+                        score -= self.alpha_ram * 3.0;
+                    } else if phi_deg >= -90.0 && phi_deg <= -40.0 {
+                        score += self.alpha_ram * 1.5;
+                    } else if phi_deg > -30.0 || phi_deg < -110.0 {
+                        score -= self.alpha_ram * 2.0;
+                    }
+                }
+
+                // C. Contact / Electrostatic Complementarity
+                if use_neighbor_identities {
+                    let mut contact_bonus = 0.0f32;
+                    for &(j, d) in k_nn {
+                        if d < 6.5 && (i as isize - j as isize).abs() > 2 {
+                            let p_j = crate::export::Vec3::from_array(residues[j].ca);
+                            let v_ab_j = crate::export::Vec3::from_array(residues[j].cb.unwrap_or(residues[j].ca)).sub(p_j).normalize();
+                            let pointing_face_to_face = v_ab_i.dot(v_ab_j) < -0.20;
+
+                            if pointing_face_to_face {
+                                let neighbor_res_char = crate::export::aa3_to_aa1(std::str::from_utf8(&residues[j].res_name).unwrap_or("UNK"));
+                                let neighbor_class = PhysicoClass::from_char(neighbor_res_char);
+
+                                if (c_class == PhysicoClass::Negative && neighbor_class == PhysicoClass::Positive)
+                                    || (c_class == PhysicoClass::Positive && neighbor_class == PhysicoClass::Negative)
+                                {
+                                    contact_bonus += 1.5;
+                                } else if (c_class == PhysicoClass::Negative && neighbor_class == PhysicoClass::Negative)
+                                    || (c_class == PhysicoClass::Positive && neighbor_class == PhysicoClass::Positive)
+                                {
+                                    contact_bonus -= 1.5;
+                                }
+
+                                if matches!(aa, 'F' | 'Y' | 'W') && matches!(neighbor_res_char, 'F' | 'Y' | 'W') {
+                                    contact_bonus += 1.2;
+                                }
+                            }
+                        }
+                    }
+                    score += self.alpha_hb * contact_bonus;
+                }
+
+                ws.potentials[i][a_idx] = score;
+            }
+        }
+    }
+}
+
+/// Candidate amino acid prediction from inverse folding co-design.
+#[derive(Debug, Clone)]
+pub struct DesignCandidate {
+    pub amino_acid: char,
+    pub score: f32,
+    pub probability_pct: f32,
+    pub category: &'static str,
+}
+
+/// Residue site output for sequence design.
+#[derive(Debug, Clone)]
+pub struct DesignPositionSite {
+    pub position: usize,
+    pub native_char: char,
+    pub designed_char: char,
+    pub candidates: Vec<DesignCandidate>,
+}
+
+/// Result of an inverse folding structure-sequence co-design run (BIO-2).
+#[derive(Debug, Clone)]
+pub struct DesignPipelineResult {
+    pub protein_id: String,
+    pub native_sequence: String,
+    pub designed_sequence: String,
+    pub sites: Vec<DesignPositionSite>,
+    pub sequence_recovery_pct: f64,
+    pub physicochemical_recovery_pct: f64,
+    pub forward_ms: f64,
+    pub potential_3d_us: f64,
+    pub total_ms: f64,
+}
+
+/// Computes sequence design conditioned on 3D backbone atomic coordinates (BIO-2).
+pub fn compute_pipeline_design_parallel(
+    protein_id: &str,
+    residues: &[crate::export::ReconstructedResidue],
+    use_neighbor_identities: bool,
+    config: &EsmConfig,
+    weights: ModelWeightsRef,
+    num_threads: usize,
+) -> DesignPipelineResult {
+    let n_res = residues.len();
+    assert!(n_res >= 3, "Residue count too short for structure design");
+
+    let wt_seq: String = residues
+        .iter()
+        .map(|r| crate::export::aa3_to_aa1(std::str::from_utf8(&r.res_name).unwrap_or("UNK")))
+        .collect();
+
+    let mut state = BidirectionalRunState::new(config, n_res + 2);
+    let mut base_tokens = Tokenizer::encode(&wt_seq);
+    let mut masked_logits = vec![0.0f32; n_res * config.vocab_size];
+
+    let t_fwd0 = Instant::now();
+    for i in 0..n_res {
+        let token_pos = i + 1;
+        let orig = base_tokens[token_pos];
+        base_tokens[token_pos] = 32; // Mask token '*'
+        match weights {
+            ModelWeightsRef::Fp32(w) => {
+                if num_threads <= 1 {
+                    forward_bidirectional(&base_tokens, config, w, &mut state);
+                } else {
+                    forward_bidirectional_parallel(&base_tokens, config, w, &mut state, num_threads);
+                }
+            }
+            ModelWeightsRef::Q8(w_q8) => {
+                forward_bidirectional_q8(&base_tokens, config, w_q8, &mut state, num_threads);
+            }
+            ModelWeightsRef::Q4(w_q4) => {
+                forward_bidirectional_q4(&base_tokens, config, w_q4, &mut state, num_threads);
+            }
+            ModelWeightsRef::Q3(w_q3) => {
+                forward_bidirectional_q3(&base_tokens, config, w_q3, &mut state, num_threads);
+            }
+        }
+        let slice = &state.logits[token_pos * config.vocab_size..(token_pos + 1) * config.vocab_size];
+        masked_logits[i * config.vocab_size..(i + 1) * config.vocab_size].copy_from_slice(slice);
+        base_tokens[token_pos] = orig;
+    }
+    let forward_ms = t_fwd0.elapsed().as_secs_f64() * 1000.0;
+
+    let co_designer = Bio2CoDesigner::default();
+    let mut ws = Bio2Workspace::new(n_res);
+
+    let t_pot0 = Instant::now();
+    co_designer.compute_geometric_potentials_into(residues, use_neighbor_identities, &mut ws);
+    let potential_3d_us = t_pot0.elapsed().as_nanos() as f64 / 1000.0;
+
+    let mut sites = Vec::with_capacity(n_res);
+    let mut designed_chars = Vec::with_capacity(n_res);
+    let mut correct_exact = 0;
+    let mut correct_phys = 0;
+
+    for (i, res) in residues.iter().enumerate() {
+        let logits_slice = &masked_logits[i * config.vocab_size..(i + 1) * config.vocab_size];
+        let wt_char = crate::export::aa3_to_aa1(std::str::from_utf8(&res.res_name).unwrap_or("UNK"));
+        let wt_class = PhysicoClass::from_char(wt_char);
+
+        let mut aa_scores: Vec<(char, f32)> = Vec::with_capacity(20);
+        for (a_idx, &aa) in STANDARD_AMINO_ACIDS.iter().enumerate() {
+            let tok_id = get_token_id(aa);
+            let combined = logits_slice[tok_id] + ws.potentials[i][a_idx];
+            aa_scores.push((aa, combined));
+        }
+
+        aa_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let max_s = aa_scores[0].1;
+        let sum_exp: f32 = aa_scores.iter().map(|&(_, s)| (s - max_s).exp()).sum();
+
+        let mut candidates = Vec::with_capacity(aa_scores.len());
+        for &(aa, s) in &aa_scores {
+            let prob_pct = ((s - max_s).exp() / sum_exp) * 100.0;
+            candidates.push(DesignCandidate {
+                amino_acid: aa,
+                score: s,
+                probability_pct: prob_pct,
+                category: aa_category(aa),
+            });
+        }
+
+        let best_aa = candidates[0].amino_acid;
+        designed_chars.push(best_aa);
+
+        if best_aa == wt_char {
+            correct_exact += 1;
+        }
+        if PhysicoClass::from_char(best_aa) == wt_class {
+            correct_phys += 1;
+        }
+
+        sites.push(DesignPositionSite {
+            position: i + 1,
+            native_char: wt_char,
+            designed_char: best_aa,
+            candidates,
+        });
+    }
+
+    let recovery_pct = (correct_exact as f64 / n_res as f64) * 100.0;
+    let phys_recovery_pct = (correct_phys as f64 / n_res as f64) * 100.0;
+    let designed_sequence: String = designed_chars.into_iter().collect();
+
+    DesignPipelineResult {
+        protein_id: protein_id.to_string(),
+        native_sequence: wt_seq,
+        designed_sequence,
+        sites,
+        sequence_recovery_pct: recovery_pct,
+        physicochemical_recovery_pct: phys_recovery_pct,
+        forward_ms,
+        potential_3d_us,
+        total_ms: forward_ms + (potential_3d_us / 1000.0),
+    }
+}
+
+/// Renders sequence design summary table to stdout.
+pub fn render_design_summary(result: &DesignPipelineResult, max_display_rows: usize, theme: &TerminalTheme) {
+    println!("\n╔═══════════════════════════════════════════════════════════════════════════════════════════╗");
+    println!("║       CODON-INFER: 3D STRUCTURE-GUIDED SEQUENCE CO-DESIGN & INVERSE FOLDING (BIO-2)       ║");
+    println!("╚═══════════════════════════════════════════════════════════════════════════════════════════╝");
+    println!("  * Target ID:                 {}", result.protein_id);
+    println!("  * Sequence Length:           {} residues", result.native_sequence.len());
+    println!("  * Native Sequence:           {}", format_sequence(&result.native_sequence, theme));
+    println!("  * Designed Sequence:         {}", format_sequence(&result.designed_sequence, theme));
+    println!("  * Native Sequence Recovery:  {:.1}% exact matches", result.sequence_recovery_pct);
+    println!("  * Physicochemical Recovery:  {:.1}% class conservation", result.physicochemical_recovery_pct);
+    println!("  * 3D Potential Compute Time: {:.1} µs (0 dynamic heap allocations in hot loop)", result.potential_3d_us);
+    println!("  * End-to-End Latency:        {:.2} ms total", result.total_ms);
+    println!();
+
+    println!("┌──────────┬────────┬────────┬─────────────────────────────────────────────────────────────┐");
+    println!("│ Position │ Native │ Design │ Top-5 Candidates & Physicochemical Compatibility            │");
+    println!("├──────────┼────────┼────────┼─────────────────────────────────────────────────────────────┤");
+
+    let display_rows = if result.sites.len() <= max_display_rows {
+        &result.sites[..]
+    } else {
+        &result.sites[..max_display_rows]
+    };
+
+    for site in display_rows {
+        let is_match = site.native_char == site.designed_char;
+        let native_colored = format_aa(site.native_char, theme);
+        let designed_colored = format_aa(site.designed_char, theme);
+        let match_marker = if is_match { "✓" } else { "·" };
+
+        let mut top5_str = String::new();
+        for cand in site.candidates.iter().take(5) {
+            top5_str.push_str(&format!("{}({:.1}%) ", format_aa(cand.amino_acid, theme), cand.probability_pct));
+        }
+
+        println!(
+            "│ Site {:>3} │   {}    │  {} {}  │ {:<59} │",
+            site.position, native_colored, designed_colored, match_marker, top5_str
+        );
+    }
+
+    if result.sites.len() > max_display_rows {
+        println!(
+            "│   ...    │  ...   │  ...   │ ... [Truncated {} additional positions for terminal display] │",
+            result.sites.len() - max_display_rows
+        );
+    }
+    println!("└──────────┴────────┴────────┴─────────────────────────────────────────────────────────────┘\n");
+}
+
+/// Executes sequence design from an input PDB file or residue slice.
+pub fn run_pipeline_design_parallel(
+    protein_id: &str,
+    residues: &[crate::export::ReconstructedResidue],
+    use_neighbor_identities: bool,
+    config: &EsmConfig,
+    weights: ModelWeightsRef,
+    num_threads: usize,
+    theme: &TerminalTheme,
+) -> DesignPipelineResult {
+    let result = compute_pipeline_design_parallel(
+        protein_id,
+        residues,
+        use_neighbor_identities,
+        config,
+        weights,
+        num_threads,
+    );
+    render_design_summary(&result, 25, theme);
+    result
+}
+
 
 

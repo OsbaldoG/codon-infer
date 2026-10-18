@@ -32,7 +32,10 @@ pub use fasta::{FastaRecord, parse_fasta_file, parse_raw_sequence};
 pub use export::{
     DmsPositionRow, export_dms_csv, export_dms_json, export_contacts_csv, export_contacts_json,
     dms_to_json_string, contacts_to_json_string, inpaint_to_json_string, export_inpaint_json,
-    aa1_to_aa3, coords_to_pdb_string, export_ca_pdb, export_fold_tsv, fold_to_json_string, export_fold_json,
+    aa1_to_aa3, aa3_to_aa1, coords_to_pdb_string, export_ca_pdb, export_fold_tsv, fold_to_json_string, export_fold_json,
+    Vec3, ReconstructedResidue, AllAtomWorkspace, KinematicBackboneSolver,
+    coords_to_allatom_pdb_string, export_allatom_pdb, parse_pdb_atoms,
+    design_to_json_string, export_design_json,
 };
 pub use pipeline::{
     DmsScoringMode, run_pipeline_dms, run_pipeline_dms_parallel, run_pipeline_dms_with_mode,
@@ -43,6 +46,9 @@ pub use pipeline::{
     InpaintPipelineResult, InpaintSite, InpaintCandidate, ContactsPipelineResult,
     FoldPipelineResult, mds_spectral_init, helical_init, reconstruct_3d_ca,
     compute_pipeline_fold_parallel, render_fold_summary, run_pipeline_fold_parallel,
+    STANDARD_AMINO_ACIDS, PhysicoClass, get_token_id, calc_dihedral,
+    Bio2Workspace, Bio2CoDesigner, DesignCandidate, DesignPositionSite, DesignPipelineResult,
+    compute_pipeline_design_parallel, render_design_summary, run_pipeline_design_parallel,
 };
 pub use benchmark::{
     ModelBenchmarkMetrics, MultiModelBenchmarkReport, MultiScaleSimdReport,
@@ -593,6 +599,31 @@ impl EsmWeights {
             classifier_weights: self.classifier_weights.clone(),
         }
     }
+
+    pub fn quantize_q3(&self) -> EsmWeightsQ3 {
+        EsmWeightsQ3 {
+            token_embedding_table: self.token_embedding_table.clone(),
+            ln_1_weight: self.ln_1_weight.clone(),
+            ln_1_bias: self.ln_1_bias.clone(),
+            wq: quantize_slice_to_q4(&self.wq),
+            bq: self.bq.clone(),
+            wk: quantize_slice_to_q4(&self.wk),
+            bk: self.bk.clone(),
+            wv: quantize_slice_to_q4(&self.wv),
+            bv: self.bv.clone(),
+            wo: quantize_slice_to_q4(&self.wo),
+            bo: self.bo.clone(),
+            ln_2_weight: self.ln_2_weight.clone(),
+            ln_2_bias: self.ln_2_bias.clone(),
+            fc1_weight: quantize_slice_to_q3_lut(&self.fc1_weight),
+            fc1_bias: self.fc1_bias.clone(),
+            fc2_weight: quantize_slice_to_q3_lut(&self.fc2_weight),
+            fc2_bias: self.fc2_bias.clone(),
+            ln_f_weight: self.ln_f_weight.clone(),
+            ln_f_bias: self.ln_f_bias.clone(),
+            classifier_weights: self.classifier_weights.clone(),
+        }
+    }
 }
 
 /// Loads and initializes ESM-2 configuration and weights from file path with automatic architecture detection.
@@ -837,6 +868,7 @@ pub const CODQ_VERSION: u32 = 1;
 pub const DTYPE_FP32: u32 = 0;
 pub const DTYPE_Q8_0: u32 = 1;
 pub const DTYPE_Q4_0: u32 = 2;
+pub const DTYPE_Q3_LUT: u32 = 3;
 
 pub const ARCH_8M: u32 = 0;
 pub const ARCH_35M: u32 = 1;
@@ -1246,6 +1278,583 @@ impl EsmWeightsQ4 {
     }
 }
 
+// ============================================================================
+// BLOCK Q3_LUT DATA STRUCTURE & SUB-BYTE QUANTIZATION (CI-NEXT-1, 3.50 BPW)
+// ============================================================================
+
+#[inline(always)]
+pub fn f32_to_f16(val: f32) -> u16 {
+    let bits = val.to_bits();
+    let sign = (bits >> 31) & 1;
+    let exp = ((bits >> 23) & 0xFF) as i32;
+    let frac = bits & 0x7FFFFF;
+
+    if exp == 0 {
+        (sign << 15) as u16
+    } else if exp == 0xFF {
+        ((sign << 15) | 0x7C00 | (frac >> 13).min(0x3FF)) as u16
+    } else {
+        let new_exp = exp - 127 + 15;
+        if new_exp >= 31 {
+            ((sign << 15) | 0x7C00) as u16
+        } else if new_exp <= 0 {
+            (sign << 15) as u16
+        } else {
+            ((sign << 15) | ((new_exp as u32) << 10) | (frac >> 13)) as u16
+        }
+    }
+}
+
+#[inline(always)]
+pub fn f16_to_f32(val: u16) -> f32 {
+    let sign = ((val >> 15) as u32) << 31;
+    let exp = ((val >> 10) & 0x1F) as i32;
+    let frac = (val & 0x3FF) as u32;
+
+    if exp == 0 {
+        if frac == 0 {
+            f32::from_bits(sign)
+        } else {
+            let mut f = frac;
+            let mut shift = 0;
+            while (f & 0x400) == 0 {
+                f <<= 1;
+                shift += 1;
+            }
+            let exp_f32 = (127 - 15 + 1 - shift) as u32;
+            let frac_f32 = (f & 0x3FF) << 13;
+            f32::from_bits(sign | (exp_f32 << 23) | frac_f32)
+        }
+    } else if exp == 31 {
+        f32::from_bits(sign | 0x7F800000 | (frac << 13))
+    } else {
+        f32::from_bits(sign | ((exp as u32 + 127 - 15) << 23) | (frac << 13))
+    }
+}
+
+pub const CENTROIDS_Q3: [f32; 4] = [0.0955, 0.3030, 0.5496, 0.8849];
+
+#[repr(C, packed)]
+#[derive(Clone, Copy, Debug)]
+pub struct BlockQ3_LUT {
+    pub signs: [u8; 4],   // 4 bytes: 32 signs (1 bit per weight)
+    pub indices: [u8; 8], // 8 bytes: 32 indices (4 x 2 bits per byte)
+    pub scale: u16,       // 2 bytes: scale float16 per block
+}
+
+const _: () = assert!(core::mem::size_of::<BlockQ3_LUT>() == 14);
+
+impl BlockQ3_LUT {
+    /// Multi-start Alternating Minimization + Least Squares (AM-LS) quantization.
+    pub fn quantize(src: &[f32]) -> Self {
+        assert!(src.len() >= 32, "Block must have at least 32 elements");
+        let chunk = &src[0..32];
+
+        let mut signs_u32 = 0u32;
+        let mut mags = [0.0f32; 32];
+        let mut max_abs = 0.0f32;
+        let mut sum_sq = 0.0f32;
+
+        for (i, &v) in chunk.iter().enumerate() {
+            if v < 0.0 {
+                signs_u32 |= 1 << i;
+            }
+            let a = v.abs();
+            mags[i] = a;
+            if a > max_abs {
+                max_abs = a;
+            }
+            sum_sq += a * a;
+        }
+
+        if max_abs < 1e-8 {
+            return Self {
+                signs: [0; 4],
+                indices: [0; 8],
+                scale: 0,
+            };
+        }
+
+        let rms = (sum_sq / 32.0).sqrt();
+        let init_scales = [
+            max_abs / CENTROIDS_Q3[3],
+            max_abs,
+            rms * 2.2,
+            rms * 1.6,
+        ];
+
+        let mut best_err = f32::MAX;
+        let mut best_scale_f16 = 0u16;
+        let mut best_indices = [0u8; 32];
+
+        for &s_init in &init_scales {
+            let mut s = s_init.max(1e-8);
+            let mut idx_arr = [0u8; 32];
+
+            for _step in 0..4 {
+                let mut num = 0.0f32;
+                let mut den = 0.0f32;
+
+                for i in 0..32 {
+                    let mag = mags[i];
+                    let mut best_k = 0u8;
+                    let mut min_d = (mag - s * CENTROIDS_Q3[0]).abs();
+                    for k in 1..4 {
+                        let d = (mag - s * CENTROIDS_Q3[k]).abs();
+                        if d < min_d {
+                            min_d = d;
+                            best_k = k as u8;
+                        }
+                    }
+                    idx_arr[i] = best_k;
+                    let c = CENTROIDS_Q3[best_k as usize];
+                    num += mag * c;
+                    den += c * c;
+                }
+
+                if den > 1e-8 {
+                    s = num / den;
+                }
+            }
+
+            let cand_f16 = f32_to_f16(s);
+            let s_q = f16_to_f32(cand_f16);
+            let mut err_sq = 0.0f32;
+
+            for i in 0..32 {
+                let mag = mags[i];
+                let mut best_k = 0u8;
+                let mut min_d = (mag - s_q * CENTROIDS_Q3[0]).abs();
+                for k in 1..4 {
+                    let d = (mag - s_q * CENTROIDS_Q3[k]).abs();
+                    if d < min_d {
+                        min_d = d;
+                        best_k = k as u8;
+                    }
+                }
+                idx_arr[i] = best_k;
+                let diff = mag - s_q * CENTROIDS_Q3[best_k as usize];
+                err_sq += diff * diff;
+            }
+
+            if err_sq < best_err {
+                best_err = err_sq;
+                best_scale_f16 = cand_f16;
+                best_indices = idx_arr;
+            }
+        }
+
+        let signs = signs_u32.to_le_bytes();
+        let mut indices = [0u8; 8];
+        for byte_idx in 0..8 {
+            let i0 = best_indices[byte_idx * 4] & 0x03;
+            let i1 = (best_indices[byte_idx * 4 + 1] & 0x03) << 2;
+            let i2 = (best_indices[byte_idx * 4 + 2] & 0x03) << 4;
+            let i3 = (best_indices[byte_idx * 4 + 3] & 0x03) << 6;
+            indices[byte_idx] = i0 | i1 | i2 | i3;
+        }
+
+        Self {
+            signs,
+            indices,
+            scale: best_scale_f16,
+        }
+    }
+
+    #[inline(always)]
+    pub fn dequantize_to(&self, dst: &mut [f32]) {
+        assert!(dst.len() >= 32);
+        let s = f16_to_f32(self.scale);
+
+        let lut: [f32; 8] = [
+            CENTROIDS_Q3[0] * s,
+            CENTROIDS_Q3[1] * s,
+            CENTROIDS_Q3[2] * s,
+            CENTROIDS_Q3[3] * s,
+            -CENTROIDS_Q3[0] * s,
+            -CENTROIDS_Q3[1] * s,
+            -CENTROIDS_Q3[2] * s,
+            -CENTROIDS_Q3[3] * s,
+        ];
+
+        let signs_u32 = u32::from_le_bytes(self.signs);
+
+        for byte_idx in 0..8 {
+            let b = self.indices[byte_idx];
+            let base_idx = byte_idx * 4;
+
+            let idx0 = (b & 0x03) as usize;
+            let sign0 = ((signs_u32 >> base_idx) & 1) as usize;
+            dst[base_idx] = lut[(sign0 << 2) | idx0];
+
+            let idx1 = ((b >> 2) & 0x03) as usize;
+            let sign1 = ((signs_u32 >> (base_idx + 1)) & 1) as usize;
+            dst[base_idx + 1] = lut[(sign1 << 2) | idx1];
+
+            let idx2 = ((b >> 4) & 0x03) as usize;
+            let sign2 = ((signs_u32 >> (base_idx + 2)) & 1) as usize;
+            dst[base_idx + 2] = lut[(sign2 << 2) | idx2];
+
+            let idx3 = ((b >> 6) & 0x03) as usize;
+            let sign3 = ((signs_u32 >> (base_idx + 3)) & 1) as usize;
+            dst[base_idx + 3] = lut[(sign3 << 2) | idx3];
+        }
+    }
+}
+
+pub fn quantize_slice_to_q3_lut(src: &[f32]) -> Vec<BlockQ3_LUT> {
+    assert!(src.len() % 32 == 0, "Source length must be a multiple of 32");
+    src.chunks_exact(32).map(BlockQ3_LUT::quantize).collect()
+}
+
+pub fn dequantize_q3_slice(blocks: &[BlockQ3_LUT]) -> Vec<f32> {
+    let mut out = vec![0.0f32; blocks.len() * 32];
+    for (i, b) in blocks.iter().enumerate() {
+        b.dequantize_to(&mut out[i * 32..(i + 1) * 32]);
+    }
+    out
+}
+
+pub fn read_q3_blocks(file: &mut File, num_blocks: usize) -> io::Result<Vec<BlockQ3_LUT>> {
+    let mut blocks = vec![BlockQ3_LUT { signs: [0; 4], indices: [0; 8], scale: 0 }; num_blocks];
+    unsafe {
+        let byte_slice = std::slice::from_raw_parts_mut(
+            blocks.as_mut_ptr() as *mut u8,
+            num_blocks * std::mem::size_of::<BlockQ3_LUT>(),
+        );
+        file.read_exact(byte_slice)?;
+    }
+    Ok(blocks)
+}
+
+#[allow(clippy::manual_slice_size_calculation)]
+pub fn write_q3_blocks(file: &mut File, blocks: &[BlockQ3_LUT]) -> io::Result<()> {
+    let byte_slice = unsafe {
+        std::slice::from_raw_parts(
+            blocks.as_ptr() as *const u8,
+            blocks.len() * std::mem::size_of::<BlockQ3_LUT>(),
+        )
+    };
+    file.write_all(byte_slice)
+}
+
+pub struct EsmWeightsQ3 {
+    pub token_embedding_table: Vec<f32>,
+    pub ln_1_weight: Vec<f32>, pub ln_1_bias: Vec<f32>,
+    pub wq: Vec<BlockQ4_0>, pub bq: Vec<f32>,
+    pub wk: Vec<BlockQ4_0>, pub bk: Vec<f32>,
+    pub wv: Vec<BlockQ4_0>, pub bv: Vec<f32>,
+    pub wo: Vec<BlockQ4_0>, pub bo: Vec<f32>,
+    pub ln_2_weight: Vec<f32>, pub ln_2_bias: Vec<f32>,
+    pub fc1_weight: Vec<BlockQ3_LUT>, pub fc1_bias: Vec<f32>,
+    pub fc2_weight: Vec<BlockQ3_LUT>, pub fc2_bias: Vec<f32>,
+    pub ln_f_weight: Vec<f32>, pub ln_f_bias: Vec<f32>,
+    pub classifier_weights: Vec<f32>,
+}
+
+impl EsmWeightsQ3 {
+    pub fn save_to_file(&self, path: &str, config: &EsmConfig) -> io::Result<()> {
+        let mut file = File::create(path)?;
+        let header = CodqHeader::new(DTYPE_Q3_LUT, config);
+        header.write_to(&mut file)?;
+        write_floats(&mut file, &self.token_embedding_table)?;
+        write_floats(&mut file, &self.ln_1_weight)?;
+        write_floats(&mut file, &self.ln_1_bias)?;
+        write_q4_blocks(&mut file, &self.wq)?;
+        write_floats(&mut file, &self.bq)?;
+        write_q4_blocks(&mut file, &self.wk)?;
+        write_floats(&mut file, &self.bk)?;
+        write_q4_blocks(&mut file, &self.wv)?;
+        write_floats(&mut file, &self.bv)?;
+        write_q4_blocks(&mut file, &self.wo)?;
+        write_floats(&mut file, &self.bo)?;
+        write_floats(&mut file, &self.ln_2_weight)?;
+        write_floats(&mut file, &self.ln_2_bias)?;
+        write_q3_blocks(&mut file, &self.fc1_weight)?;
+        write_floats(&mut file, &self.fc1_bias)?;
+        write_q3_blocks(&mut file, &self.fc2_weight)?;
+        write_floats(&mut file, &self.fc2_bias)?;
+        write_floats(&mut file, &self.ln_f_weight)?;
+        write_floats(&mut file, &self.ln_f_bias)?;
+        write_floats(&mut file, &self.classifier_weights)?;
+        file.flush()?;
+        Ok(())
+    }
+
+    pub fn from_file(path: &str, config: &EsmConfig) -> io::Result<Self> {
+        let mut file = File::open(path)?;
+        let file_len = file.metadata()?.len();
+        if file_len >= 64 {
+            let mut magic = [0u8; 4];
+            if file.read_exact(&mut magic).is_ok() && magic == CODQ_MAGIC {
+                file.seek(io::SeekFrom::Start(0))?;
+                let header = CodqHeader::read_from(&mut file)?;
+                if header.dtype != DTYPE_Q3_LUT {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Expected Q3_LUT dtype ({}), got {}", DTYPE_Q3_LUT, header.dtype),
+                    ));
+                }
+                header.validate(config)?;
+            } else {
+                file.seek(io::SeekFrom::Start(0))?;
+            }
+        } else {
+            file.seek(io::SeekFrom::Start(0))?;
+        }
+
+        let token_embedding_table = read_floats(&mut file, config.vocab_size * config.dim)?;
+        let ln_1_weight = read_floats(&mut file, config.n_layers * config.dim)?;
+        let ln_1_bias = read_floats(&mut file, config.n_layers * config.dim)?;
+        let wq = read_q4_blocks(&mut file, config.n_layers * config.dim * (config.dim / 32))?;
+        let bq = read_floats(&mut file, config.n_layers * config.dim)?;
+        let wk = read_q4_blocks(&mut file, config.n_layers * config.dim * (config.dim / 32))?;
+        let bk = read_floats(&mut file, config.n_layers * config.dim)?;
+        let wv = read_q4_blocks(&mut file, config.n_layers * config.dim * (config.dim / 32))?;
+        let bv = read_floats(&mut file, config.n_layers * config.dim)?;
+        let wo = read_q4_blocks(&mut file, config.n_layers * config.dim * (config.dim / 32))?;
+        let bo = read_floats(&mut file, config.n_layers * config.dim)?;
+        let ln_2_weight = read_floats(&mut file, config.n_layers * config.dim)?;
+        let ln_2_bias = read_floats(&mut file, config.n_layers * config.dim)?;
+        let fc1_weight = read_q3_blocks(&mut file, config.n_layers * config.hidden_dim * (config.dim / 32))?;
+        let fc1_bias = read_floats(&mut file, config.n_layers * config.hidden_dim)?;
+        let fc2_weight = read_q3_blocks(&mut file, config.n_layers * config.dim * (config.hidden_dim / 32))?;
+        let fc2_bias = read_floats(&mut file, config.n_layers * config.dim)?;
+        let ln_f_weight = read_floats(&mut file, config.dim)?;
+        let ln_f_bias = read_floats(&mut file, config.dim)?;
+
+        let current_pos = file.stream_position()?;
+        if current_pos > file_len {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Stream position exceeds file length"));
+        }
+        let remaining_bytes = (file_len - current_pos) as usize;
+        let remaining_floats = remaining_bytes / 4;
+        let classifier_weights = read_floats(&mut file, remaining_floats)?;
+
+        Ok(Self {
+            token_embedding_table,
+            ln_1_weight,
+            ln_1_bias,
+            wq,
+            bq,
+            wk,
+            bk,
+            wv,
+            bv,
+            wo,
+            bo,
+            ln_2_weight,
+            ln_2_bias,
+            fc1_weight,
+            fc1_bias,
+            fc2_weight,
+            fc2_bias,
+            ln_f_weight,
+            ln_f_bias,
+            classifier_weights,
+        })
+    }
+
+    pub fn load_from_file(model_path: &str) -> io::Result<(EsmConfig, Self)> {
+        let config = match EsmConfig::detect_from_file(model_path) {
+            Ok(cfg) => cfg,
+            Err(_) => EsmConfig::esm2_8m(),
+        };
+        let weights = Self::from_file(model_path, &config)?;
+        Ok((config, weights))
+    }
+
+    pub fn to_fp32(&self) -> EsmWeights {
+        EsmWeights {
+            token_embedding_table: self.token_embedding_table.clone(),
+            ln_1_weight: self.ln_1_weight.clone(),
+            ln_1_bias: self.ln_1_bias.clone(),
+            wq: dequantize_q4_to_vec(&self.wq),
+            bq: self.bq.clone(),
+            wk: dequantize_q4_to_vec(&self.wk),
+            bk: self.bk.clone(),
+            wv: dequantize_q4_to_vec(&self.wv),
+            bv: self.bv.clone(),
+            wo: dequantize_q4_to_vec(&self.wo),
+            bo: self.bo.clone(),
+            ln_2_weight: self.ln_2_weight.clone(),
+            ln_2_bias: self.ln_2_bias.clone(),
+            fc1_weight: dequantize_q3_slice(&self.fc1_weight),
+            fc1_bias: self.fc1_bias.clone(),
+            fc2_weight: dequantize_q3_slice(&self.fc2_weight),
+            fc2_bias: self.fc2_bias.clone(),
+            ln_f_weight: self.ln_f_weight.clone(),
+            ln_f_bias: self.ln_f_bias.clone(),
+            classifier_weights: self.classifier_weights.clone(),
+        }
+    }
+}
+
+pub fn quantize_file_streaming_q3(
+    src_path: &str,
+    dst_path: &str,
+    config: &EsmConfig,
+) -> io::Result<u64> {
+    let mut src_file = File::open(src_path)?;
+    let file_len = src_file.metadata()?.len();
+
+    let start_pos = if file_len >= 64 {
+        let hdr = CodqHeader::read_from(&mut src_file)?;
+        hdr.validate(config)?;
+        if hdr.dtype != DTYPE_FP32 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Expected FP32 source in quantize_file_streaming_q3, found dtype={}", hdr.dtype),
+            ));
+        }
+        64u64
+    } else {
+        src_file.seek(io::SeekFrom::Start(0))?;
+        0u64
+    };
+
+    let rem_bytes = file_len.saturating_sub(start_pos);
+    let expected_bytes = config.grouped_canonical_bytes();
+    if rem_bytes != expected_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "quantize_file_streaming_q3 requires grouped_canonical_v1 layout ({} bytes) for {}, found {} bytes in '{}'",
+                expected_bytes,
+                config.model_name(),
+                rem_bytes,
+                src_path
+            ),
+        ));
+    }
+
+    let mut reader = io::BufReader::with_capacity(4 * 1024 * 1024, src_file);
+    let dst_file = File::create(dst_path)?;
+    let mut writer = io::BufWriter::with_capacity(4 * 1024 * 1024, dst_file);
+
+    let header = CodqHeader::new(DTYPE_Q3_LUT, config);
+    let header_bytes = unsafe {
+        std::slice::from_raw_parts(
+            &header as *const CodqHeader as *const u8,
+            std::mem::size_of::<CodqHeader>(),
+        )
+    };
+    writer.write_all(header_bytes)?;
+
+    #[allow(non_camel_case_types)]
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum QuantTarget {
+        Fp32,
+        Q4_0,
+        Q3_LUT,
+    }
+
+    let schedule: [(usize, QuantTarget); 20] = [
+        (config.vocab_size * config.dim, QuantTarget::Fp32),
+        (config.n_layers * config.dim, QuantTarget::Fp32),
+        (config.n_layers * config.dim, QuantTarget::Fp32),
+        (config.n_layers * config.dim * config.dim, QuantTarget::Q4_0), // wq
+        (config.n_layers * config.dim, QuantTarget::Fp32),
+        (config.n_layers * config.dim * config.dim, QuantTarget::Q4_0), // wk
+        (config.n_layers * config.dim, QuantTarget::Fp32),
+        (config.n_layers * config.dim * config.dim, QuantTarget::Q4_0), // wv
+        (config.n_layers * config.dim, QuantTarget::Fp32),
+        (config.n_layers * config.dim * config.dim, QuantTarget::Q4_0), // wo
+        (config.n_layers * config.dim, QuantTarget::Fp32),
+        (config.n_layers * config.dim, QuantTarget::Fp32),
+        (config.n_layers * config.dim, QuantTarget::Fp32),
+        (config.n_layers * config.dim * config.hidden_dim, QuantTarget::Q3_LUT), // fc1
+        (config.n_layers * config.hidden_dim, QuantTarget::Fp32),
+        (config.n_layers * config.hidden_dim * config.dim, QuantTarget::Q3_LUT), // fc2
+        (config.n_layers * config.dim, QuantTarget::Fp32),
+        (config.dim, QuantTarget::Fp32),
+        (config.dim, QuantTarget::Fp32),
+        (config.lm_head_floats(), QuantTarget::Fp32),
+    ];
+
+    const BATCH_BLOCKS: usize = 2048;
+    let mut in_buf = vec![0u8; BATCH_BLOCKS * 32 * 4];
+    let mut out_buf_q4 = vec![0u8; BATCH_BLOCKS * 20];
+    let mut out_buf_q3 = vec![0u8; BATCH_BLOCKS * 14];
+
+    for (num_floats, target) in schedule {
+        match target {
+            QuantTarget::Fp32 => {
+                stream_copy_floats(&mut reader, &mut writer, num_floats)?;
+            }
+            QuantTarget::Q4_0 => {
+                if num_floats % 32 != 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Quantized tensor length {} is not a multiple of 32", num_floats),
+                    ));
+                }
+                let mut rem_blocks = num_floats / 32;
+                while rem_blocks > 0 {
+                    let batch = rem_blocks.min(BATCH_BLOCKS);
+                    let in_len = batch * 32 * 4;
+                    reader.read_exact(&mut in_buf[..in_len])?;
+                    for b in 0..batch {
+                        let mut vals = [0.0f32; 32];
+                        let b_in = &in_buf[b * 128..(b + 1) * 128];
+                        for i in 0..32 {
+                            vals[i] = f32::from_le_bytes([
+                                b_in[i * 4],
+                                b_in[i * 4 + 1],
+                                b_in[i * 4 + 2],
+                                b_in[i * 4 + 3],
+                            ]);
+                        }
+                        let blk = BlockQ4_0::quantize(&vals);
+                        let b_out = &mut out_buf_q4[b * 20..(b + 1) * 20];
+                        b_out[0..4].copy_from_slice(&blk.d.to_le_bytes());
+                        b_out[4..20].copy_from_slice(&blk.qs);
+                    }
+                    writer.write_all(&out_buf_q4[..batch * 20])?;
+                    rem_blocks -= batch;
+                }
+            }
+            QuantTarget::Q3_LUT => {
+                if num_floats % 32 != 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Quantized tensor length {} is not a multiple of 32", num_floats),
+                    ));
+                }
+                let mut rem_blocks = num_floats / 32;
+                while rem_blocks > 0 {
+                    let batch = rem_blocks.min(BATCH_BLOCKS);
+                    let in_len = batch * 32 * 4;
+                    reader.read_exact(&mut in_buf[..in_len])?;
+                    for b in 0..batch {
+                        let mut vals = [0.0f32; 32];
+                        let b_in = &in_buf[b * 128..(b + 1) * 128];
+                        for i in 0..32 {
+                            vals[i] = f32::from_le_bytes([
+                                b_in[i * 4],
+                                b_in[i * 4 + 1],
+                                b_in[i * 4 + 2],
+                                b_in[i * 4 + 3],
+                            ]);
+                        }
+                        let blk = BlockQ3_LUT::quantize(&vals);
+                        let b_out = &mut out_buf_q3[b * 14..(b + 1) * 14];
+                        b_out[0..4].copy_from_slice(&blk.signs);
+                        b_out[4..12].copy_from_slice(&blk.indices);
+                        b_out[12..14].copy_from_slice(&blk.scale.to_le_bytes());
+                    }
+                    writer.write_all(&out_buf_q3[..batch * 14])?;
+                    rem_blocks -= batch;
+                }
+            }
+        }
+    }
+
+    writer.flush()?;
+    let out_file = writer.into_inner().map_err(|e| e.into_error())?;
+    out_file.metadata().map(|m| m.len())
+}
+
 fn stream_copy_floats<R: Read, W: Write>(reader: &mut R, writer: &mut W, num_floats: usize) -> io::Result<()> {
     let mut rem_bytes = (num_floats as u64) * 4;
     let mut buf = [0u8; 65536];
@@ -1641,6 +2250,8 @@ pub enum QuantizationMode {
     Fp32,
     Q8_0,
     Q4_0,
+    #[allow(non_camel_case_types)]
+    Q3_LUT,
 }
 
 #[derive(Clone, Copy)]
@@ -1648,6 +2259,7 @@ pub enum ModelWeightsRef<'a> {
     Fp32(&'a EsmWeights),
     Q8(&'a EsmWeightsQ8),
     Q4(&'a EsmWeightsQ4),
+    Q3(&'a EsmWeightsQ3),
 }
 
 pub fn compute_cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
@@ -3614,6 +4226,196 @@ pub fn project_lm_head_q4(
     }
 }
 
+pub fn forward_q3(
+    token: usize,
+    pos: usize,
+    config: &EsmConfig,
+    weights: &EsmWeightsQ3,
+    state: &mut RunState,
+    num_threads: usize,
+) {
+    let dim = config.dim;
+    let head_dim = dim / config.n_heads;
+    let inv_scale = 1.0 / (head_dim as f32).sqrt();
+
+    let embed_scale = 1.0 - 0.12;
+    if token == 32 {
+        state.x[0..dim].fill(0.0);
+    } else {
+        let embed_row = &weights.token_embedding_table[token * dim..(token + 1) * dim];
+        for i in 0..dim {
+            state.x[i] = embed_row[i] * embed_scale;
+        }
+    }
+
+    let q4_matrix_blocks = dim * (dim / 32);
+    let q3_fc1_blocks = config.hidden_dim * (dim / 32);
+    let q3_fc2_blocks = dim * (config.hidden_dim / 32);
+
+    #[cfg(target_arch = "x86_64")]
+    let has_avx = std::is_x86_feature_detected!("avx") && (head_dim == 16 || head_dim == 24 || head_dim == 32 || head_dim == 64);
+
+    for l in 0..config.n_layers {
+        let layer_dim_offset = l * dim;
+        let layer_matrix_q4 = l * q4_matrix_blocks;
+
+        layer_norm(
+            &mut state.xb,
+            &state.x,
+            &weights.ln_1_weight[layer_dim_offset..layer_dim_offset + dim],
+            &weights.ln_1_bias[layer_dim_offset..layer_dim_offset + dim],
+        );
+
+        matmul_q4_parallel(
+            &mut state.q,
+            &state.xb,
+            &weights.wq[layer_matrix_q4..layer_matrix_q4 + q4_matrix_blocks],
+            &weights.bq[layer_dim_offset..layer_dim_offset + dim],
+            dim,
+            dim,
+            num_threads,
+        );
+        matmul_q4_parallel(
+            &mut state.k,
+            &state.xb,
+            &weights.wk[layer_matrix_q4..layer_matrix_q4 + q4_matrix_blocks],
+            &weights.bk[layer_dim_offset..layer_dim_offset + dim],
+            dim,
+            dim,
+            num_threads,
+        );
+        matmul_q4_parallel(
+            &mut state.v,
+            &state.xb,
+            &weights.wv[layer_matrix_q4..layer_matrix_q4 + q4_matrix_blocks],
+            &weights.bv[layer_dim_offset..layer_dim_offset + dim],
+            dim,
+            dim,
+            num_threads,
+        );
+
+        apply_rope(&mut state.q, &mut state.k, &state.rope_cos, &state.rope_sin, pos, dim, config.n_heads);
+
+        let layer_kv_base = l * config.max_seq_len * dim;
+        let kv_offset = layer_kv_base + pos * dim;
+        state.key_cache[kv_offset..kv_offset + dim].copy_from_slice(&state.k);
+        state.value_cache[kv_offset..kv_offset + dim].copy_from_slice(&state.v);
+
+        for h in 0..config.n_heads {
+            let q_offset = h * head_dim;
+            let q_head = &state.q[q_offset..q_offset + head_dim];
+            let att_offset = h * config.max_seq_len;
+            let att_head = &mut state.att[att_offset..att_offset + config.max_seq_len];
+            let xb2_head = &mut state.xb2[q_offset..q_offset + head_dim];
+
+            #[cfg(target_arch = "x86_64")]
+            if has_avx {
+                unsafe {
+                    attention_head_avx1(
+                        q_head,
+                        &state.key_cache,
+                        &state.value_cache,
+                        att_head,
+                        xb2_head,
+                        layer_kv_base,
+                        q_offset,
+                        pos,
+                        dim,
+                        head_dim,
+                        inv_scale,
+                    );
+                }
+                continue;
+            }
+
+            for t in 0..=pos {
+                let cache_offset = layer_kv_base + t * dim + q_offset;
+                let k_head = &state.key_cache[cache_offset..cache_offset + head_dim];
+                let mut score = 0.0f32;
+                for i in 0..head_dim {
+                    score += q_head[i] * k_head[i];
+                }
+                att_head[t] = score * inv_scale;
+            }
+            softmax(&mut att_head[0..=pos]);
+            xb2_head.fill(0.0);
+            for t in 0..=pos {
+                let prob = att_head[t];
+                let cache_offset = layer_kv_base + t * dim + q_offset;
+                let v_head = &state.value_cache[cache_offset..cache_offset + head_dim];
+                for i in 0..head_dim {
+                    xb2_head[i] += prob * v_head[i];
+                }
+            }
+        }
+
+        matmul_q4_parallel(
+            &mut state.xb,
+            &state.xb2,
+            &weights.wo[layer_matrix_q4..layer_matrix_q4 + q4_matrix_blocks],
+            &weights.bo[layer_dim_offset..layer_dim_offset + dim],
+            dim,
+            dim,
+            num_threads,
+        );
+
+        for i in 0..dim {
+            state.x[i] += state.xb[i];
+        }
+
+        layer_norm(
+            &mut state.xb,
+            &state.x,
+            &weights.ln_2_weight[layer_dim_offset..layer_dim_offset + dim],
+            &weights.ln_2_bias[layer_dim_offset..layer_dim_offset + dim],
+        );
+
+        let fc1_q3 = l * q3_fc1_blocks;
+        let fc1_b = l * config.hidden_dim;
+        matmul_tiled_q3_parallel(
+            &mut state.hb,
+            &state.xb,
+            &weights.fc1_weight[fc1_q3..fc1_q3 + q3_fc1_blocks],
+            &weights.fc1_bias[fc1_b..fc1_b + config.hidden_dim],
+            dim,
+            config.hidden_dim,
+            1,
+            num_threads,
+        );
+
+        gelu(&mut state.hb2, &state.hb);
+
+        let fc2_q3 = l * q3_fc2_blocks;
+        matmul_tiled_q3_parallel(
+            &mut state.xb,
+            &state.hb2,
+            &weights.fc2_weight[fc2_q3..fc2_q3 + q3_fc2_blocks],
+            &weights.fc2_bias[layer_dim_offset..layer_dim_offset + dim],
+            config.hidden_dim,
+            dim,
+            1,
+            num_threads,
+        );
+
+        for i in 0..dim {
+            state.x[i] += state.xb[i];
+        }
+    }
+
+    layer_norm(&mut state.xb, &state.x, &weights.ln_f_weight, &weights.ln_f_bias);
+    project_lm_head_q4(
+        &mut state.logits,
+        &state.xb,
+        &weights.classifier_weights,
+        &weights.token_embedding_table,
+        config,
+        &mut state.hb,
+        &mut state.hb2,
+        num_threads,
+    );
+}
+
+
 
 pub fn log_softmax_canonical(logits: &[f32]) -> [f32; 33] {
     let mut out = [-f32::INFINITY; 33];
@@ -3947,6 +4749,14 @@ pub unsafe fn unpack_q4_row(row_blocks: &[BlockQ4_0], w_buf: *mut f32) {
     }
 }
 
+#[inline]
+pub unsafe fn unpack_q3_lut_row(row_blocks: &[BlockQ3_LUT], w_buf: *mut f32) {
+    for (b_idx, block) in row_blocks.iter().enumerate() {
+        let dst_slice = std::slice::from_raw_parts_mut(w_buf.add(b_idx * 32), 32);
+        block.dequantize_to(dst_slice);
+    }
+}
+
 struct TiledFp32Job<'a> {
     out_batch: *mut f32,
     x_batch: &'a [f32],
@@ -4141,6 +4951,76 @@ pub fn matmul_tiled_q4_parallel(
         unsafe { run_tiled_q4_slice(&job as *const _ as *const (), 0, 1); }
     } else {
         get_global_pool().run_parallel(num_threads, run_tiled_q4_slice, &job as *const _ as *const ());
+    }
+}
+
+struct TiledQ3Job<'a> {
+    out_batch: *mut f32,
+    x_batch: &'a [f32],
+    w: &'a [BlockQ3_LUT],
+    bias: &'a [f32],
+    in_dim: usize,
+    out_dim: usize,
+    seq_len: usize,
+}
+
+unsafe impl<'a> Send for TiledQ3Job<'a> {}
+unsafe impl<'a> Sync for TiledQ3Job<'a> {}
+
+unsafe fn run_tiled_q3_slice(ctx: *const (), t_idx: usize, n_threads: usize) {
+    let job = &*(ctx as *const TiledQ3Job);
+    let chunk_size = (job.out_dim + n_threads - 1) / n_threads;
+    let start_row = t_idx * chunk_size;
+    if start_row >= job.out_dim {
+        return;
+    }
+    let end_row = (start_row + chunk_size).min(job.out_dim);
+    let blocks_per_row = job.in_dim / 32;
+    let x_ptr = job.x_batch.as_ptr();
+
+    let mut w_l1d = [0.0f32; 10240];
+    let w_buf_ptr = w_l1d.as_mut_ptr();
+
+    for i in start_row..end_row {
+        let row_blocks = &job.w[i * blocks_per_row..(i + 1) * blocks_per_row];
+        let bias_val = *job.bias.get_unchecked(i);
+        unpack_q3_lut_row(row_blocks, w_buf_ptr);
+        dot_row_batch_m4(
+            job.out_batch,
+            job.out_dim,
+            i,
+            x_ptr,
+            w_buf_ptr,
+            bias_val,
+            job.in_dim,
+            job.seq_len,
+        );
+    }
+}
+
+pub fn matmul_tiled_q3_parallel(
+    out_batch: &mut [f32],
+    x_batch: &[f32],
+    w: &[BlockQ3_LUT],
+    bias: &[f32],
+    in_dim: usize,
+    out_dim: usize,
+    seq_len: usize,
+    num_threads: usize,
+) {
+    let job = TiledQ3Job {
+        out_batch: out_batch.as_mut_ptr(),
+        x_batch,
+        w,
+        bias,
+        in_dim,
+        out_dim,
+        seq_len,
+    };
+    if num_threads <= 1 || out_dim < 16 {
+        unsafe { run_tiled_q3_slice(&job as *const _ as *const (), 0, 1); }
+    } else {
+        get_global_pool().run_parallel(num_threads, run_tiled_q3_slice, &job as *const _ as *const ());
     }
 }
 
@@ -5260,6 +6140,365 @@ pub fn forward_bidirectional_q4_ext(
     }
 }
 
+pub fn forward_bidirectional_q3(
+    tokens: &[usize],
+    config: &EsmConfig,
+    weights: &EsmWeightsQ3,
+    state: &mut BidirectionalRunState,
+    num_threads: usize,
+) {
+    forward_bidirectional_q3_ext(tokens, config, weights, state, num_threads, None);
+}
+
+pub fn forward_bidirectional_q3_ext(
+    tokens: &[usize],
+    config: &EsmConfig,
+    weights: &EsmWeightsQ3,
+    state: &mut BidirectionalRunState,
+    num_threads: usize,
+    mut on_layer: Option<&mut dyn FnMut(usize, &[f32])>,
+) {
+    let seq_len = tokens.len();
+    assert!(seq_len <= state.max_len, "Sequence length {} exceeds max_len {}", seq_len, state.max_len);
+    let dim = config.dim;
+    let head_dim = dim / config.n_heads;
+    let inv_scale = 1.0 / (head_dim as f32).sqrt();
+    let hidden_dim = config.hidden_dim;
+
+    #[cfg(target_arch = "x86_64")]
+    let has_avx512 = head_dim == 64 && std::is_x86_feature_detected!("avx512f");
+    #[cfg(target_arch = "x86_64")]
+    let has_avx = std::is_x86_feature_detected!("avx") && (head_dim == 16 || head_dim == 24 || head_dim == 32 || head_dim == 64);
+
+    let mask_count = tokens.iter().filter(|&&t| t == 32).count();
+    let mask_ratio_observed = mask_count as f32 / seq_len as f32;
+    let embed_scale = if mask_ratio_observed >= 1.0 { 0.0 } else { (1.0 - 0.12) / (1.0 - mask_ratio_observed) };
+
+    for p in 0..seq_len {
+        let token = tokens[p];
+        if token == 32 {
+            state.x[p * dim..(p + 1) * dim].fill(0.0);
+        } else {
+            let embed_row = &weights.token_embedding_table[token * dim..(token + 1) * dim];
+            for i in 0..dim {
+                state.x[p * dim + i] = embed_row[i] * embed_scale;
+            }
+        }
+    }
+
+    let n_res = seq_len.saturating_sub(2);
+    let do_contacts = state.compute_contacts && n_res > 0;
+    let (ch_weights, ch_bias) = config.contact_head_weights();
+    if do_contacts {
+        state.contact_probs[0..n_res * n_res].fill(0.0);
+    }
+
+    let q4_matrix_blocks = dim * (dim / 32);
+    let q3_fc1_blocks = hidden_dim * (dim / 32);
+    let q3_fc2_blocks = dim * (hidden_dim / 32);
+
+    for l in 0..config.n_layers {
+        let layer_dim_offset = l * dim;
+        let layer_matrix_q4 = l * q4_matrix_blocks;
+        let fc1_q3 = l * q3_fc1_blocks;
+        let fc1_b = l * hidden_dim;
+        let fc2_q3 = l * q3_fc2_blocks;
+
+        let ln1_w = &weights.ln_1_weight[layer_dim_offset..layer_dim_offset + dim];
+        let ln1_b = &weights.ln_1_bias[layer_dim_offset..layer_dim_offset + dim];
+        for p in 0..seq_len {
+            layer_norm(
+                &mut state.xb[p * dim..(p + 1) * dim],
+                &state.x[p * dim..(p + 1) * dim],
+                ln1_w,
+                ln1_b,
+            );
+        }
+
+        matmul_tiled_q4_parallel(
+            &mut state.q[0..seq_len * dim],
+            &state.xb[0..seq_len * dim],
+            &weights.wq[layer_matrix_q4..layer_matrix_q4 + q4_matrix_blocks],
+            &weights.bq[layer_dim_offset..layer_dim_offset + dim],
+            dim,
+            dim,
+            seq_len,
+            num_threads,
+        );
+        matmul_tiled_q4_parallel(
+            &mut state.k[0..seq_len * dim],
+            &state.xb[0..seq_len * dim],
+            &weights.wk[layer_matrix_q4..layer_matrix_q4 + q4_matrix_blocks],
+            &weights.bk[layer_dim_offset..layer_dim_offset + dim],
+            dim,
+            dim,
+            seq_len,
+            num_threads,
+        );
+        matmul_tiled_q4_parallel(
+            &mut state.v[0..seq_len * dim],
+            &state.xb[0..seq_len * dim],
+            &weights.wv[layer_matrix_q4..layer_matrix_q4 + q4_matrix_blocks],
+            &weights.bv[layer_dim_offset..layer_dim_offset + dim],
+            dim,
+            dim,
+            seq_len,
+            num_threads,
+        );
+
+        for p in 0..seq_len {
+            apply_rope(
+                &mut state.q[p * dim..(p + 1) * dim],
+                &mut state.k[p * dim..(p + 1) * dim],
+                &state.rope_cos,
+                &state.rope_sin,
+                p,
+                dim,
+                config.n_heads,
+            );
+        }
+
+        let is_last_layer = l == config.n_layers - 1;
+        if is_last_layer {
+            state.final_layer_att[0..seq_len * seq_len].fill(0.0);
+        }
+
+        for h in 0..config.n_heads {
+            for p in 0..seq_len {
+                let q_offset = p * dim + h * head_dim;
+                let q_head = &state.q[q_offset..q_offset + head_dim];
+                let att_head = &mut state.att[h * state.max_len..h * state.max_len + seq_len];
+
+                #[cfg(target_arch = "x86_64")]
+                {
+                    if has_avx512 {
+                        let q_ptr = q_head.as_ptr();
+                        for t in 0..seq_len {
+                            let k_offset = t * dim + h * head_dim;
+                            let k_ptr = unsafe { state.k.as_ptr().add(k_offset) };
+                            let score = unsafe { dot_product_head_avx512_d64(q_ptr, k_ptr) };
+                            att_head[t] = score * inv_scale;
+                        }
+                    } else if has_avx {
+                        let q_ptr = q_head.as_ptr();
+                        for t in 0..seq_len {
+                            let k_offset = t * dim + h * head_dim;
+                            let k_ptr = unsafe { state.k.as_ptr().add(k_offset) };
+                            let score = unsafe { dot_product_head_avx(q_ptr, k_ptr, head_dim) };
+                            att_head[t] = score * inv_scale;
+                        }
+                    } else {
+                        for t in 0..seq_len {
+                            let k_offset = t * dim + h * head_dim;
+                            let k_head = &state.k[k_offset..k_offset + head_dim];
+                            let mut score = 0.0f32;
+                            for i in 0..head_dim { score += q_head[i] * k_head[i]; }
+                            att_head[t] = score * inv_scale;
+                        }
+                    }
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                {
+                    for t in 0..seq_len {
+                        let k_offset = t * dim + h * head_dim;
+                        let k_head = &state.k[k_offset..k_offset + head_dim];
+                        let mut score = 0.0f32;
+                        for i in 0..head_dim { score += q_head[i] * k_head[i]; }
+                        att_head[t] = score * inv_scale;
+                    }
+                }
+                softmax(att_head);
+
+                if do_contacts {
+                    state.head_att_buf[p * seq_len..(p + 1) * seq_len].copy_from_slice(att_head);
+                }
+
+                if is_last_layer {
+                    let head_weight = 1.0 / config.n_heads as f32;
+                    for t in 0..seq_len {
+                        state.final_layer_att[p * seq_len + t] += att_head[t] * head_weight;
+                    }
+                }
+
+                let out_head = &mut state.out_att[p * dim + h * head_dim..p * dim + (h + 1) * head_dim];
+                out_head.fill(0.0);
+                #[cfg(target_arch = "x86_64")]
+                {
+                    if has_avx512 {
+                        let out_ptr = out_head.as_mut_ptr();
+                        for t in 0..seq_len {
+                            let prob = att_head[t];
+                            let v_offset = t * dim + h * head_dim;
+                            let v_ptr = unsafe { state.v.as_ptr().add(v_offset) };
+                            unsafe { accumulate_value_head_avx512_d64(out_ptr, v_ptr, prob); }
+                        }
+                    } else if has_avx {
+                        let out_ptr = out_head.as_mut_ptr();
+                        for t in 0..seq_len {
+                            let prob = att_head[t];
+                            let v_offset = t * dim + h * head_dim;
+                            let v_ptr = unsafe { state.v.as_ptr().add(v_offset) };
+                            unsafe { accumulate_value_head_avx(out_ptr, v_ptr, prob, head_dim); }
+                        }
+                    } else {
+                        for t in 0..seq_len {
+                            let prob = att_head[t];
+                            let v_offset = t * dim + h * head_dim;
+                            let v_head = &state.v[v_offset..v_offset + head_dim];
+                            for i in 0..head_dim { out_head[i] += prob * v_head[i]; }
+                        }
+                    }
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                {
+                    for t in 0..seq_len {
+                        let prob = att_head[t];
+                        let v_offset = t * dim + h * head_dim;
+                        let v_head = &state.v[v_offset..v_offset + head_dim];
+                        for i in 0..head_dim { out_head[i] += prob * v_head[i]; }
+                    }
+                }
+            }
+
+            if do_contacts {
+                let w_lh = ch_weights[l * config.n_heads + h];
+                accumulate_head_apc(
+                    &state.head_att_buf[0..seq_len * seq_len],
+                    &mut state.contact_probs[0..n_res * n_res],
+                    seq_len,
+                    n_res,
+                    w_lh,
+                );
+            }
+        }
+
+        matmul_tiled_q4_parallel(
+            &mut state.xb[0..seq_len * dim],
+            &state.out_att[0..seq_len * dim],
+            &weights.wo[layer_matrix_q4..layer_matrix_q4 + q4_matrix_blocks],
+            &weights.bo[layer_dim_offset..layer_dim_offset + dim],
+            dim,
+            dim,
+            seq_len,
+            num_threads,
+        );
+        for idx in 0..seq_len * dim {
+            state.x[idx] += state.xb[idx];
+        }
+
+        let ln2_w = &weights.ln_2_weight[layer_dim_offset..layer_dim_offset + dim];
+        let ln2_b = &weights.ln_2_bias[layer_dim_offset..layer_dim_offset + dim];
+        for p in 0..seq_len {
+            layer_norm(
+                &mut state.xb[p * dim..(p + 1) * dim],
+                &state.x[p * dim..(p + 1) * dim],
+                ln2_w,
+                ln2_b,
+            );
+        }
+
+        matmul_tiled_q3_parallel(
+            &mut state.hb[0..seq_len * hidden_dim],
+            &state.xb[0..seq_len * dim],
+            &weights.fc1_weight[fc1_q3..fc1_q3 + q3_fc1_blocks],
+            &weights.fc1_bias[fc1_b..fc1_b + hidden_dim],
+            dim,
+            hidden_dim,
+            seq_len,
+            num_threads,
+        );
+        gelu(
+            &mut state.hb2[0..seq_len * hidden_dim],
+            &state.hb[0..seq_len * hidden_dim],
+        );
+        matmul_tiled_q3_parallel(
+            &mut state.xb[0..seq_len * dim],
+            &state.hb2[0..seq_len * hidden_dim],
+            &weights.fc2_weight[fc2_q3..fc2_q3 + q3_fc2_blocks],
+            &weights.fc2_bias[layer_dim_offset..layer_dim_offset + dim],
+            hidden_dim,
+            dim,
+            seq_len,
+            num_threads,
+        );
+        for idx in 0..seq_len * dim {
+            state.x[idx] += state.xb[idx];
+        }
+
+        if let Some(ref mut cb) = on_layer {
+            cb(l, &state.x[0..seq_len * dim]);
+        }
+    }
+
+    if do_contacts {
+        for val in &mut state.contact_probs[0..n_res * n_res] {
+            *val = 1.0 / (1.0 + (-(*val + ch_bias)).exp());
+        }
+    }
+
+    for p in 0..seq_len {
+        layer_norm(
+            &mut state.xb[p * dim..(p + 1) * dim],
+            &state.x[p * dim..(p + 1) * dim],
+            &weights.ln_f_weight,
+            &weights.ln_f_bias,
+        );
+    }
+    state.x[0..seq_len * dim].copy_from_slice(&state.xb[0..seq_len * dim]);
+
+    let required_len = 3 * dim + dim * dim + config.vocab_size * dim + config.vocab_size;
+    if weights.classifier_weights.len() >= required_len {
+        let lm_ln_w = &weights.classifier_weights[0..dim];
+        let lm_ln_b = &weights.classifier_weights[dim..2 * dim];
+        let lm_dense_w = &weights.classifier_weights[2 * dim..2 * dim + dim * dim];
+        let lm_dense_b = &weights.classifier_weights[2 * dim + dim * dim..3 * dim + dim * dim];
+        let lm_dec_w = &weights.classifier_weights[3 * dim + dim * dim..3 * dim + dim * dim + config.vocab_size * dim];
+        let lm_dec_b = &weights.classifier_weights[3 * dim + dim * dim + config.vocab_size * dim..required_len];
+
+        matmul_tiled_fp32_parallel(
+            &mut state.hb[0..seq_len * dim],
+            &state.x[0..seq_len * dim],
+            lm_dense_w,
+            lm_dense_b,
+            dim,
+            dim,
+            seq_len,
+            num_threads,
+        );
+        gelu(&mut state.hb2[0..seq_len * dim], &state.hb[0..seq_len * dim]);
+        for p in 0..seq_len {
+            layer_norm(
+                &mut state.xb[p * dim..(p + 1) * dim],
+                &state.hb2[p * dim..(p + 1) * dim],
+                lm_ln_w,
+                lm_ln_b,
+            );
+        }
+        matmul_tiled_fp32_parallel(
+            &mut state.logits[0..seq_len * config.vocab_size],
+            &state.xb[0..seq_len * dim],
+            lm_dec_w,
+            lm_dec_b,
+            dim,
+            config.vocab_size,
+            seq_len,
+            num_threads,
+        );
+    } else {
+        const ZERO_BIAS: [f32; 33] = [0.0; 33];
+        matmul_tiled_fp32_parallel(
+            &mut state.logits[0..seq_len * config.vocab_size],
+            &state.x[0..seq_len * dim],
+            &weights.token_embedding_table,
+            &ZERO_BIAS,
+            dim,
+            config.vocab_size,
+            seq_len,
+            num_threads,
+        );
+    }
+}
+
 
 pub struct Tokenizer;
 impl Tokenizer {
@@ -5510,6 +6749,76 @@ pub fn generate_sequence_q4(
     }
 }
 
+pub fn generate_sequence_q3(
+    prompt: &str,
+    temperature: f32,
+    max_new_tokens: Option<usize>,
+    seed: u64,
+    config: &EsmConfig,
+    weights: &EsmWeightsQ3,
+    state: &mut RunState,
+    num_threads: usize,
+    mut on_token: Option<&mut dyn FnMut(char)>,
+) -> GenerationMetrics {
+    let mut prompt_tokens = Tokenizer::encode(prompt);
+    prompt_tokens.pop();
+    if prompt_tokens.is_empty() {
+        prompt_tokens.push(0);
+    }
+    let mut pos = 0;
+    let prefill_timer = Instant::now();
+    for &token in &prompt_tokens {
+        if pos >= config.max_seq_len {
+            break;
+        }
+        forward_q3(token, pos, config, weights, state, num_threads);
+        pos += 1;
+    }
+    let prefill_duration = prefill_timer.elapsed();
+    let mut rng = SimpleRng::new(seed);
+    let mut generated_tokens_count = 0;
+    let mut generated_suffix = String::new();
+    let max_limit = max_new_tokens
+        .map(|m| (pos + m).min(config.max_seq_len))
+        .unwrap_or(config.max_seq_len);
+    let gen_timer = Instant::now();
+    while pos < max_limit {
+        let next_token = sample(&mut state.logits, temperature, &mut rng);
+        if next_token == 2 {
+            break;
+        }
+        generated_tokens_count += 1;
+        if let Some(c) = Tokenizer::decode(next_token) {
+            generated_suffix.push(c);
+            if let Some(cb) = on_token.as_mut() {
+                cb(c);
+            }
+        }
+        forward_q3(next_token, pos, config, weights, state, num_threads);
+        pos += 1;
+    }
+    let gen_duration = gen_timer.elapsed();
+    let prefill_ms = prefill_duration.as_secs_f64() * 1000.0;
+    let generation_ms = gen_duration.as_secs_f64() * 1000.0;
+    let throughput_tps = if gen_duration.as_secs_f32() > 0.0 {
+        generated_tokens_count as f32 / gen_duration.as_secs_f32()
+    } else {
+        0.0
+    };
+    let mut full_sequence = String::with_capacity(prompt.len() + generated_suffix.len());
+    full_sequence.push_str(prompt);
+    full_sequence.push_str(&generated_suffix);
+    GenerationMetrics {
+        full_sequence,
+        generated_suffix,
+        tokens_generated: generated_tokens_count,
+        prefill_ms,
+        generation_ms,
+        throughput_tps,
+    }
+}
+
+
 
 #[cfg(test)]
 mod tests {
@@ -5531,6 +6840,20 @@ mod tests {
         }
         mse /= 32.0;
         assert!(mse < 0.02, "MSE {} is not < 0.02", mse);
+    }
+
+    #[test]
+    fn test_q3_lut_quantization_roundtrip() {
+        assert_eq!(core::mem::size_of::<BlockQ3_LUT>(), 14);
+        let mut src = [0.0f32; 32];
+        for i in 0..32 {
+            src[i] = ((i as f32) / 31.0) * 2.0 - 1.0;
+        }
+        let block = BlockQ3_LUT::quantize(&src);
+        let mut dst = [0.0f32; 32];
+        block.dequantize_to(&mut dst);
+        let cos_sim = compute_cosine_similarity(&src, &dst);
+        assert!(cos_sim > 0.98, "Q3_LUT Cosine similarity {} must be > 0.98", cos_sim);
     }
 
     #[test] fn test_layer_norm_stability() {
@@ -7211,6 +8534,213 @@ mod tests_regression {
                 assert!(c.apc_score > 0.0 && c.apc_score < 1.0, "Contact probability {} must be in (0, 1)", c.apc_score);
             }
         }
+    }
+
+    #[test]
+    fn test_q3_lut_hybrid_regression_parity_and_rmsd() {
+        let model_path = "esm2_8m_weights.bin";
+        if !std::path::Path::new(model_path).exists() {
+            return;
+        }
+        let config = EsmConfig::esm2_8m();
+        let weights_fp = EsmWeights::from_file(model_path, &config).expect("Load 8M");
+        let q3_model = weights_fp.quantize_q3();
+        let weights_q3 = q3_model.to_fp32();
+
+        // 1. Verify save & load roundtrip of hybrid Q3_LUT
+        let tmp_path = "test_esm2_8m_hybrid_q3_tmp.bin";
+        q3_model.save_to_file(tmp_path, &config).expect("Save hybrid Q3");
+        let loaded_q3 = EsmWeightsQ3::from_file(tmp_path, &config).expect("Load hybrid Q3");
+        let _ = std::fs::remove_file(tmp_path);
+        assert_eq!(q3_model.wq.len(), loaded_q3.wq.len());
+        assert_eq!(q3_model.fc1_weight.len(), loaded_q3.fc1_weight.len());
+
+        // 2. Parity on 1CHL
+        let rec = crate::fasta::parse_raw_sequence("MCMPCFTTDHQMARKCDDCCGGKGRGKCYGPQCLCR", "1CHL");
+        let contacts_fp = crate::pipeline::compute_pipeline_contacts_parallel(
+            &rec, 6, 1.0, Some(20), &config, ModelWeightsRef::Fp32(&weights_fp), 2,
+        );
+        let contacts_q3 = crate::pipeline::compute_pipeline_contacts_parallel(
+            &rec, 6, 1.0, Some(20), &config, ModelWeightsRef::Fp32(&weights_q3), 2,
+        );
+
+        let set_fp: std::collections::HashSet<(usize, usize)> = contacts_fp.top_contacts.iter().map(|c| (c.pos1, c.pos2)).collect();
+        let set_q3: std::collections::HashSet<(usize, usize)> = contacts_q3.top_contacts.iter().map(|c| (c.pos1, c.pos2)).collect();
+        let intersection = set_fp.intersection(&set_q3).count();
+        let union = set_fp.union(&set_q3).count();
+        let jaccard = if union == 0 { 100.0 } else { (intersection as f64 / union as f64) * 100.0 };
+        let overlap_pct = (intersection as f64 / 20.0) * 100.0;
+        println!("1CHL Q3_LUT vs FP32 Top-20 Contacts Overlap: {:.1}%, Jaccard: {:.1}%", overlap_pct, jaccard);
+        assert!(overlap_pct >= 60.0, "Top-20 contact overlap {:.1}% must be >= 60%", overlap_pct);
+        assert!(jaccard >= 45.0, "Jaccard similarity {:.1}% must be >= 45%", jaccard);
+
+        // 3. 3D Fold and Kabsch RMSD
+        let fold_fp = crate::pipeline::compute_pipeline_fold_parallel(
+            &rec, &config, ModelWeightsRef::Fp32(&weights_fp), 2,
+        );
+        let fold_q3 = crate::pipeline::compute_pipeline_fold_parallel(
+            &rec, &config, ModelWeightsRef::Fp32(&weights_q3), 2,
+        );
+
+        let n = fold_fp.coords.len();
+        assert_eq!(n, fold_q3.coords.len());
+
+        let pts_fp: Vec<[f64; 3]> = fold_fp.coords.iter().map(|c| [c[0] as f64, c[1] as f64, c[2] as f64]).collect();
+        let pts_q3: Vec<[f64; 3]> = fold_q3.coords.iter().map(|c| [c[0] as f64, c[1] as f64, c[2] as f64]).collect();
+
+        // Kabsch alignment
+        let calc_rmsd = |p1: &[[f64; 3]], p2: &[[f64; 3]]| -> f64 {
+            let mut c1 = [0.0; 3];
+            let mut c2 = [0.0; 3];
+            for i in 0..n {
+                for d in 0..3 {
+                    c1[d] += p1[i][d];
+                    c2[d] += p2[i][d];
+                }
+            }
+            for d in 0..3 {
+                c1[d] /= n as f64;
+                c2[d] /= n as f64;
+            }
+
+            let mut h = [[0.0f64; 3]; 3];
+            for i in 0..n {
+                let dp1 = [p1[i][0] - c1[0], p1[i][1] - c1[1], p1[i][2] - c1[2]];
+                let dp2 = [p2[i][0] - c2[0], p2[i][1] - c2[1], p2[i][2] - c2[2]];
+                for r in 0..3 {
+                    for c in 0..3 {
+                        h[r][c] += dp1[r] * dp2[c];
+                    }
+                }
+            }
+
+            let mut hth = [[0.0f64; 3]; 3];
+            for r in 0..3 {
+                for c in 0..3 {
+                    for k in 0..3 {
+                        hth[r][c] += h[k][r] * h[k][c];
+                    }
+                }
+            }
+            let mut a = hth;
+            let mut v = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+            for _ in 0..50 {
+                let off = a[0][1].abs() + a[0][2].abs() + a[1][2].abs();
+                if off < 1e-15 { break; }
+                for &(p, q) in &[(0, 1), (0, 2), (1, 2)] {
+                    let apq = a[p][q];
+                    if apq.abs() < 1e-15 { continue; }
+                    let app = a[p][p];
+                    let aqq = a[q][q];
+                    let tau = (aqq - app) / (2.0 * apq);
+                    let t = if tau >= 0.0 { 1.0 / (tau + (1.0 + tau * tau).sqrt()) } else { -1.0 / (-tau + (1.0 + tau * tau).sqrt()) };
+                    let c_val = 1.0 / (1.0 + t * t).sqrt();
+                    let s_val = t * c_val;
+                    a[p][p] = app - t * apq;
+                    a[q][q] = aqq + t * apq;
+                    a[p][q] = 0.0;
+                    a[q][p] = 0.0;
+                    for r in 0..3 {
+                        if r != p && r != q {
+                            let arp = a[r][p];
+                            let arq = a[r][q];
+                            a[r][p] = c_val * arp - s_val * arq;
+                            a[p][r] = a[r][p];
+                            a[r][q] = s_val * arp + c_val * arq;
+                            a[q][r] = a[r][q];
+                        }
+                    }
+                    for r in 0..3 {
+                        let vrp = v[r][p];
+                        let vrq = v[r][q];
+                        v[r][p] = c_val * vrp - s_val * vrq;
+                        v[r][q] = s_val * vrp + c_val * vrq;
+                    }
+                }
+            }
+            let eig = [a[0][0], a[1][1], a[2][2]];
+            let mut idx = [0, 1, 2];
+            idx.sort_by(|&i, &j| eig[j].partial_cmp(&eig[i]).unwrap_or(std::cmp::Ordering::Equal));
+            let s = [eig[idx[0]].max(0.0).sqrt(), eig[idx[1]].max(0.0).sqrt(), eig[idx[2]].max(0.0).sqrt()];
+            let mut v_sorted = [[0.0; 3]; 3];
+            for r in 0..3 {
+                for c in 0..3 {
+                    v_sorted[r][c] = v[r][idx[c]];
+                }
+            }
+            let det_v = v_sorted[0][0] * (v_sorted[1][1] * v_sorted[2][2] - v_sorted[1][2] * v_sorted[2][1])
+                - v_sorted[0][1] * (v_sorted[1][0] * v_sorted[2][2] - v_sorted[1][2] * v_sorted[2][0])
+                + v_sorted[0][2] * (v_sorted[1][0] * v_sorted[2][1] - v_sorted[1][1] * v_sorted[2][0]);
+            if det_v < 0.0 {
+                for r in 0..3 { v_sorted[r][2] = -v_sorted[r][2]; }
+            }
+
+            let mut u = [[0.0f64; 3]; 3];
+            for i in 0..2 {
+                if s[i] > 1e-10 {
+                    for r in 0..3 {
+                        let mut sum = 0.0;
+                        for c in 0..3 { sum += h[r][c] * v_sorted[c][i]; }
+                        u[r][i] = sum / s[i];
+                    }
+                    let norm = (u[0][i]*u[0][i] + u[1][i]*u[1][i] + u[2][i]*u[2][i]).sqrt();
+                    if norm > 1e-12 {
+                        u[0][i] /= norm; u[1][i] /= norm; u[2][i] /= norm;
+                    }
+                }
+            }
+            let u2 = [
+                u[1][0] * u[2][1] - u[2][0] * u[1][1],
+                u[2][0] * u[0][1] - u[0][0] * u[2][1],
+                u[0][0] * u[1][1] - u[1][0] * u[0][1],
+            ];
+            u[0][2] = u2[0]; u[1][2] = u2[1]; u[2][2] = u2[2];
+
+            let det_u = u[0][0] * (u[1][1] * u[2][2] - u[1][2] * u[2][1])
+                - u[0][1] * (u[1][0] * u[2][2] - u[1][2] * u[2][0])
+                + u[0][2] * (u[1][0] * u[2][1] - u[1][1] * u[2][0]);
+            let d_sign = if det_u < 0.0 { -1.0 } else { 1.0 };
+
+            let mut r_mat = [[0.0f64; 3]; 3];
+            for r in 0..3 {
+                for c in 0..3 {
+                    r_mat[r][c] = u[r][0] * v_sorted[c][0] + u[r][1] * v_sorted[c][1] + d_sign * u[r][2] * v_sorted[c][2];
+                }
+            }
+
+            let mut sum_sq = 0.0;
+            for i in 0..n {
+                let dp1 = [p1[i][0] - c1[0], p1[i][1] - c1[1], p1[i][2] - c1[2]];
+                let rot = [
+                    r_mat[0][0] * dp1[0] + r_mat[0][1] * dp1[1] + r_mat[0][2] * dp1[2] + c2[0],
+                    r_mat[1][0] * dp1[0] + r_mat[1][1] * dp1[1] + r_mat[1][2] * dp1[2] + c2[1],
+                    r_mat[2][0] * dp1[0] + r_mat[2][1] * dp1[1] + r_mat[2][2] * dp1[2] + c2[2],
+                ];
+                let dx = rot[0] - p2[i][0];
+                let dy = rot[1] - p2[i][1];
+                let dz = rot[2] - p2[i][2];
+                sum_sq += dx * dx + dy * dy + dz * dz;
+            }
+            (sum_sq / n as f64).sqrt()
+        };
+
+        let rmsd_direct = calc_rmsd(&pts_q3, &pts_fp);
+        let pts_q3_inv: Vec<[f64; 3]> = pts_q3.iter().map(|p| [-p[0], -p[1], -p[2]]).collect();
+        let rmsd_inv = calc_rmsd(&pts_q3_inv, &pts_fp);
+        let best_rmsd = rmsd_direct.min(rmsd_inv);
+
+        let fold_q4 = crate::pipeline::compute_pipeline_fold_parallel(
+            &rec, &config, ModelWeightsRef::Q4(&weights_fp.quantize_q4()), 2,
+        );
+        let pts_q4: Vec<[f64; 3]> = fold_q4.coords.iter().map(|c| [c[0] as f64, c[1] as f64, c[2] as f64]).collect();
+        let rmsd_q4_direct = calc_rmsd(&pts_q4, &pts_fp);
+        let pts_q4_inv: Vec<[f64; 3]> = pts_q4.iter().map(|p| [-p[0], -p[1], -p[2]]).collect();
+        let rmsd_q4_inv = calc_rmsd(&pts_q4_inv, &pts_fp);
+        let best_rmsd_q4 = rmsd_q4_direct.min(rmsd_q4_inv);
+
+        println!("1CHL Q4_0 vs FP32 Fold Kabsch RMSD: {:.3} Å", best_rmsd_q4);
+        println!("1CHL Q3_LUT vs FP32 Fold Kabsch RMSD: {:.3} Å", best_rmsd);
+        assert!(best_rmsd < 5.5, "Q3_LUT fold Kabsch RMSD {:.3} Å must be < 5.5 Å", best_rmsd);
     }
 }
 

@@ -2,9 +2,10 @@ use std::io::{self, BufRead, Write};
 use crate::{
     active_simd_backend, compute_pipeline_contacts, compute_pipeline_inpaint,
     compute_pipeline_fold_parallel, contacts_to_json_string, dms_to_json_string,
-    generate_sequence, inpaint_to_json_string, coords_to_pdb_string, fold_to_json_string,
-    parse_fasta_file, parse_raw_sequence, run_pipeline_dms_with_mode, DmsScoringMode, EsmConfig,
-    EsmWeights, FastaRecord, ModelWeightsRef, RunState, TerminalTheme,
+    generate_sequence, inpaint_to_json_string, coords_to_pdb_string, coords_to_allatom_pdb_string,
+    fold_to_json_string, parse_fasta_file, parse_raw_sequence, run_pipeline_dms_with_mode,
+    parse_pdb_atoms, compute_pipeline_design_parallel, design_to_json_string,
+    DmsScoringMode, EsmConfig, EsmWeights, FastaRecord, ModelWeightsRef, RunState, TerminalTheme,
 };
 
 /// Escapes special characters for JSON string values (including quotes, backslashes, and control characters).
@@ -165,6 +166,19 @@ pub fn extract_json_f32(json: &str, key: &str) -> Option<f32> {
     None
 }
 
+/// Extracts boolean parameter from JSON (handling true, false, "true", "false", 1, 0).
+pub fn extract_json_bool(json: &str, key: &str) -> Option<bool> {
+    if let Some(v) = extract_json_raw_value(json, key) {
+        let trimmed = v.trim().trim_matches('"').to_lowercase();
+        if trimmed == "true" || trimmed == "1" {
+            return Some(true);
+        } else if trimmed == "false" || trimmed == "0" {
+            return Some(false);
+        }
+    }
+    None
+}
+
 /// Extracts tool name from a tools/call request.
 pub fn extract_tool_name(json: &str) -> Option<String> {
     if let Some(params_pos) = json.find("\"params\"") {
@@ -236,9 +250,9 @@ pub fn wrap_tool_content(id_raw: &str, text: &str) -> String {
     wrap_jsonrpc_result(id_raw, &payload)
 }
 
-/// Returns the MCP tools/list definition schema exposing version 1.8.0 multi-scale capabilities (8M to 3B).
+/// Returns the MCP tools/list definition schema exposing version 1.9.0 multi-scale capabilities (8M to 3B).
 pub fn get_tools_list_json() -> &'static str {
-    r#"{"tools":[{"name":"generate_protein","description":"Autoregressive de novo protein sequence generation and motif extension via ESM-2 (supports 8M, 35M, 150M, 650M, 3B)","inputSchema":{"type":"object","properties":{"prompt":{"type":"string","description":"Seed amino acid sequence (e.g. 'M', 'MCMPCF')"},"sequence":{"type":"string","description":"Alias for prompt"},"temperature":{"type":"number","description":"Sampling temperature (0.0 = greedy argmax, >0.0 = stochastic, default: 0.7)"},"max_tokens":{"type":"integer","description":"Maximum new amino acid residues to generate"},"seed":{"type":"integer","description":"Optional PRNG seed"}}}},{"name":"codon_infer_inpaint","description":"Bidirectional masked sequence infilling & active-site motif reconstruction using ESM-2 (8M to 3B; use '*' or '<mask_1>' for masked positions)","inputSchema":{"type":"object","properties":{"sequence":{"type":"string","description":"Protein sequence containing masked positions '*' (e.g. 'MCMPC*TTDHQMARKCDD')"},"fasta_path":{"type":"string","description":"Optional path to local FASTA file containing masked sequence"}}}},{"name":"codon_infer_dms","description":"In silico Deep Mutational Scanning (DMS) via canonical Masked Marginal or 1-Pass Wildtype Marginal evaluation (ΔLogP) across multi-scale ESM-2 models (8M to 3B)","inputSchema":{"type":"object","properties":{"sequence":{"type":"string","description":"Protein amino acid sequence to scan"},"fasta_path":{"type":"string","description":"Path to local FASTA file (alternative to sequence)"},"mode":{"type":"string","description":"Scoring mode: 'masked' (canonical L-pass) or 'wt' (fast 1-pass wildtype marginal)"},"window":{"type":"integer","description":"Sliding window context size (default: 128)"},"stride":{"type":"integer","description":"Sliding window stride step size (default: 64)"}}}},{"name":"codon_infer_contacts","description":"Zero-shot 3D structural contact map prediction and disulfide bridge detection via official ESM-2 Multi-Layer Contact Head (APC + Logistic Regression, 8M to 3B)","inputSchema":{"type":"object","properties":{"sequence":{"type":"string","description":"Protein amino acid sequence"},"fasta_path":{"type":"string","description":"Path to local FASTA file (alternative to sequence)"},"min_separation":{"type":"integer","description":"Minimum linear sequence distance |i - j| (default: 6)"},"top_contacts":{"type":"integer","description":"Number of top epistatic contact pairs to return (default: 30)"}}}},{"name":"codon_infer_fold","description":"Zero-Trunk 3D protein structure folding and C-alpha atomic coordinate reconstruction via MDS and biophysical gradient optimization (STRUCT-2, returns PDB format)","inputSchema":{"type":"object","properties":{"sequence":{"type":"string","description":"Protein amino acid sequence to fold into 3D structure"},"fasta_path":{"type":"string","description":"Path to local FASTA file (alternative to sequence)"},"export_pdb":{"type":"string","description":"Optional file path to save reconstructed .pdb structure"}}}}]}"#
+    r#"{"tools":[{"name":"generate_protein","description":"Autoregressive de novo protein sequence generation and motif extension via ESM-2 (supports 8M, 35M, 150M, 650M, 3B)","inputSchema":{"type":"object","properties":{"prompt":{"type":"string","description":"Seed amino acid sequence (e.g. 'M', 'MCMPCF')"},"sequence":{"type":"string","description":"Alias for prompt"},"temperature":{"type":"number","description":"Sampling temperature (0.0 = greedy argmax, >0.0 = stochastic, default: 0.7)"},"max_tokens":{"type":"integer","description":"Maximum new amino acid residues to generate"},"seed":{"type":"integer","description":"Optional PRNG seed"}}}},{"name":"codon_infer_inpaint","description":"Bidirectional masked sequence infilling & active-site motif reconstruction using ESM-2 (8M to 3B; use '*' or '<mask_1>' for masked positions)","inputSchema":{"type":"object","properties":{"sequence":{"type":"string","description":"Protein sequence containing masked positions '*' (e.g. 'MCMPC*TTDHQMARKCDD')"},"fasta_path":{"type":"string","description":"Optional path to local FASTA file containing masked sequence"}}}},{"name":"codon_infer_dms","description":"In silico Deep Mutational Scanning (DMS) via canonical Masked Marginal or 1-Pass Wildtype Marginal evaluation (ΔLogP) across multi-scale ESM-2 models (8M to 3B)","inputSchema":{"type":"object","properties":{"sequence":{"type":"string","description":"Protein amino acid sequence to scan"},"fasta_path":{"type":"string","description":"Path to local FASTA file (alternative to sequence)"},"mode":{"type":"string","description":"Scoring mode: 'masked' (canonical L-pass) or 'wt' (fast 1-pass wildtype marginal)"},"window":{"type":"integer","description":"Sliding window context size (default: 128)"},"stride":{"type":"integer","description":"Sliding window stride step size (default: 64)"}}}},{"name":"codon_infer_contacts","description":"Zero-shot 3D structural contact map prediction and disulfide bridge detection via official ESM-2 Multi-Layer Contact Head (APC + Logistic Regression, 8M to 3B)","inputSchema":{"type":"object","properties":{"sequence":{"type":"string","description":"Protein amino acid sequence"},"fasta_path":{"type":"string","description":"Path to local FASTA file (alternative to sequence)"},"min_separation":{"type":"integer","description":"Minimum linear sequence distance |i - j| (default: 6)"},"top_contacts":{"type":"integer","description":"Number of top epistatic contact pairs to return (default: 30)"}}}},{"name":"codon_infer_fold","description":"Zero-Trunk 3D protein structure folding and atomic coordinate reconstruction via MDS and biophysical gradient optimization (STRUCT-2/3, returns PDB format)", "inputSchema":{"type":"object","properties":{"sequence":{"type":"string","description":"Protein amino acid sequence to fold into 3D structure"},"fasta_path":{"type":"string","description":"Path to local FASTA file (alternative to sequence)"},"export_pdb":{"type":"string","description":"Optional file path to save reconstructed .pdb structure"},"all_atom":{"type":"boolean","description":"Reconstruct full all-atom backbone (N, CA, C, O, CB) via KinematicBackboneSolver"}}}},{"name":"codon_infer_design","description":"Zero-shot inverse folding & 3D structure-sequence co-design using ESM-2 logits combined with 3D structural geometric potential (BIO-2, supports PDB or folded sequence)","inputSchema":{"type":"object","properties":{"pdb_path":{"type":"string","description":"Path to local PDB file with 3D backbone coordinates"},"sequence":{"type":"string","description":"Optional sequence to fold first into 3D structure if pdb_path is omitted"},"fasta_path":{"type":"string","description":"Path to local FASTA file (alternative to sequence)"},"use_identities":{"type":"boolean","description":"Use wildtype residue identities in k-NN structural context (default: true; set false for sequence-blind mode)"},"export_fasta":{"type":"string","description":"Optional file path to export designed sequence FASTA"},"export_json":{"type":"string","description":"Optional file path to export full design results JSON"}}}}]}"#
 }
 
 /// Dispatches a single JSON-RPC message against the ESM-2 runtime and returns the formatted response.
@@ -426,6 +440,7 @@ pub fn handle_jsonrpc_message(
                     };
 
                     let export_pdb_path = extract_json_str(msg, "export_pdb");
+                    let all_atom = extract_json_bool(msg, "all_atom").unwrap_or(false);
                     let fold_res = compute_pipeline_fold_parallel(
                         &record,
                         config,
@@ -433,7 +448,15 @@ pub fn handle_jsonrpc_message(
                         1,
                     );
 
-                    let pdb_string = coords_to_pdb_string(&fold_res.sequence, &fold_res.protein_id, &fold_res.coords);
+                    let pdb_string = if all_atom {
+                        if let Some(ref allatom) = fold_res.allatom_residues {
+                            coords_to_allatom_pdb_string(&fold_res.protein_id, allatom)
+                        } else {
+                            coords_to_pdb_string(&fold_res.sequence, &fold_res.protein_id, &fold_res.coords)
+                        }
+                    } else {
+                        coords_to_pdb_string(&fold_res.sequence, &fold_res.protein_id, &fold_res.coords)
+                    };
 
                     if let Some(ref path) = export_pdb_path {
                         if let Err(e) = std::fs::write(path, &pdb_string) {
@@ -446,6 +469,102 @@ pub fn handle_jsonrpc_message(
                     }
 
                     let inner_json = fold_to_json_string(&fold_res, &pdb_string);
+                    wrap_tool_content(id_raw, &inner_json)
+                }
+
+                "codon_infer_design" | "design" => {
+                    let pdb_path_opt = extract_json_str(msg, "pdb_path").or_else(|| extract_json_str(msg, "pdb"));
+                    let use_identities = extract_json_bool(msg, "use_identities").unwrap_or(true);
+                    let export_fasta = extract_json_str(msg, "export_fasta");
+                    let export_json = extract_json_str(msg, "export_json");
+
+                    let (residues, target_id) = if let Some(ref ppath) = pdb_path_opt {
+                        let res_list = match parse_pdb_atoms(ppath) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                return Some(wrap_jsonrpc_error(
+                                    id_raw,
+                                    -32602,
+                                    &format!("Failed to parse PDB '{}': {}", ppath, e),
+                                ));
+                            }
+                        };
+                        let stem = std::path::Path::new(ppath)
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("target_design")
+                            .to_string();
+                        (res_list, stem)
+                    } else {
+                        let record = match resolve_mcp_record(msg, "target_design") {
+                            Ok(r) => r,
+                            Err(e) => {
+                                return Some(wrap_jsonrpc_error(
+                                    id_raw,
+                                    -32602,
+                                    &format!("Invalid parameters for codon_infer_design: provide 'pdb_path' or 'sequence'/'fasta_path': {}", e),
+                                ));
+                            }
+                        };
+                        let fold_res = compute_pipeline_fold_parallel(
+                            &record,
+                            config,
+                            ModelWeightsRef::Fp32(weights),
+                            1,
+                        );
+                        match fold_res.allatom_residues {
+                            Some(res_list) => (res_list, fold_res.protein_id),
+                            None => {
+                                return Some(wrap_jsonrpc_error(
+                                    id_raw,
+                                    -32603,
+                                    "Failed to compute 3D backbone for sequence design",
+                                ));
+                            }
+                        }
+                    };
+
+                    if residues.len() < 3 {
+                        return Some(wrap_jsonrpc_error(
+                            id_raw,
+                            -32602,
+                            "Structure contains fewer than 3 residues",
+                        ));
+                    }
+
+                    let design_res = compute_pipeline_design_parallel(
+                        &target_id,
+                        &residues,
+                        use_identities,
+                        config,
+                        ModelWeightsRef::Fp32(weights),
+                        1,
+                    );
+
+                    let inner_json = design_to_json_string(&design_res);
+
+                    if let Some(ref path) = export_json {
+                        if let Err(e) = std::fs::write(path, &inner_json) {
+                            return Some(wrap_jsonrpc_error(
+                                id_raw,
+                                -32603,
+                                &format!("Failed to export design JSON to '{}': {}", path, e),
+                            ));
+                        }
+                    }
+                    if let Some(ref path) = export_fasta {
+                        let mut fasta_content = format!(">{} | recovery={:.1}% physico={:.1}%\n", design_res.protein_id, design_res.sequence_recovery_pct, design_res.physicochemical_recovery_pct);
+                        fasta_content.push_str(&design_res.designed_sequence);
+                        fasta_content.push('\n');
+                        if let Err(e) = std::fs::write(path, fasta_content) {
+                            return Some(wrap_jsonrpc_error(
+                                id_raw,
+                                -32603,
+                                &format!("Failed to export design FASTA to '{}': {}", path, e),
+                            ));
+                        }
+                    }
+
                     wrap_tool_content(id_raw, &inner_json)
                 }
 
@@ -540,6 +659,15 @@ mod tests {
     }
 
     #[test]
+    fn test_mcp_extract_json_bool() {
+        assert_eq!(extract_json_bool(r#"{"flag": true}"#, "flag"), Some(true));
+        assert_eq!(extract_json_bool(r#"{"flag": false}"#, "flag"), Some(false));
+        assert_eq!(extract_json_bool(r#"{"flag": "true"}"#, "flag"), Some(true));
+        assert_eq!(extract_json_bool(r#"{"flag": "false"}"#, "flag"), Some(false));
+        assert_eq!(extract_json_bool(r#"{"other": 123}"#, "flag"), None);
+    }
+
+    #[test]
     fn test_mcp_tools_list_schema() {
         let tools_json = get_tools_list_json();
         assert!(tools_json.contains("generate_protein"));
@@ -547,6 +675,7 @@ mod tests {
         assert!(tools_json.contains("codon_infer_dms"));
         assert!(tools_json.contains("codon_infer_contacts"));
         assert!(tools_json.contains("codon_infer_fold"));
+        assert!(tools_json.contains("codon_infer_design"));
 
         let config = EsmConfig::esm2_8m();
         let mut run_state = RunState::new(&config);
@@ -557,6 +686,7 @@ mod tests {
         assert!(resp.contains("codon_infer_dms"));
         assert!(resp.contains("codon_infer_contacts"));
         assert!(resp.contains("codon_infer_fold"));
+        assert!(resp.contains("codon_infer_design"));
     }
 
     #[test]
@@ -598,15 +728,22 @@ mod tests {
         assert!(contacts_resp.contains("top_contacts"));
         assert!(contacts_resp.contains("cys_positions"));
 
-        // 3. Test codon_infer_fold tool call
-        let fold_req = r#"{"jsonrpc":"2.0","id":103,"method":"tools/call","params":{"name":"codon_infer_fold","arguments":{"sequence":"MCMPCFTTDHQMARKCDDCCGGKGRGKCYGPQCLCR"}}}"#;
+        // 3. Test codon_infer_fold tool call with all_atom: true
+        let fold_req = r#"{"jsonrpc":"2.0","id":103,"method":"tools/call","params":{"name":"codon_infer_fold","arguments":{"sequence":"MCMPCFTTDHQMARKCDDCCGGKGRGKCYGPQCLCR","all_atom":true}}}"#;
         let fold_resp = handle_jsonrpc_message(fold_req, &config, Some(&weights), &mut run_state).unwrap();
         assert!(fold_resp.contains("\"id\":103"));
         assert!(fold_resp.contains("coordinates"));
         assert!(fold_resp.contains("ATOM"));
         assert!(fold_resp.contains("num_restraints"));
 
-        // 4. Test unknown tool error response
+        // 4. Test codon_infer_design tool call
+        let design_req = r#"{"jsonrpc":"2.0","id":104,"method":"tools/call","params":{"name":"codon_infer_design","arguments":{"sequence":"MCMPCFTTDHQMARKCDDCCGGKGRGKCYGPQCLCR","use_identities":true}}}"#;
+        let design_resp = handle_jsonrpc_message(design_req, &config, Some(&weights), &mut run_state).unwrap();
+        assert!(design_resp.contains("\"id\":104"));
+        assert!(design_resp.contains("designed_sequence"));
+        assert!(design_resp.contains("sequence_recovery_pct"));
+
+        // 5. Test unknown tool error response
         let unknown_req = r#"{"jsonrpc":"2.0","id":999,"method":"tools/call","params":{"name":"invalid_tool","arguments":{}}}"#;
         let unknown_resp = handle_jsonrpc_message(unknown_req, &config, Some(&weights), &mut run_state).unwrap();
         assert!(unknown_resp.contains("-32601"));

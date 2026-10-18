@@ -2,22 +2,25 @@ use std::io::{self, Write};
 use std::time::Instant;
 use codon_infer::{
     active_simd_backend, export_contacts_csv, export_contacts_json,
-    export_dms_csv, export_dms_json, export_inpaint_json, export_ca_pdb, export_fold_tsv, export_fold_json,
-    generate_sequence_parallel, generate_sequence_q8, generate_sequence_q4,
+    export_dms_csv, export_dms_json, export_inpaint_json, export_ca_pdb,
+    export_fold_tsv, export_fold_json, export_design_json, parse_pdb_atoms,
+    generate_sequence_parallel, generate_sequence_q8, generate_sequence_q4, generate_sequence_q3,
     parse_fasta_file, parse_raw_sequence, render_dms_heatmap,
     run_pipeline_contacts_parallel, run_pipeline_dms_with_mode,
-    run_pipeline_inpaint_parallel, run_pipeline_fold_parallel, reconstruct_3d_ca,
-    detect_optimal_threads, EsmConfig, EsmWeights, EsmWeightsQ8,
-    EsmWeightsQ4, FastaRecord, ModelWeightsRef, RunState, TerminalTheme,
-    CodqHeader, CODQ_MAGIC, DTYPE_Q4_0, DTYPE_Q8_0, DTYPE_FP32, QuantizationMode, DmsScoringMode,
+    run_pipeline_inpaint_parallel, run_pipeline_fold_parallel, run_pipeline_design_parallel,
+    compute_pipeline_fold_parallel, reconstruct_3d_ca,
+    detect_optimal_threads, EsmConfig, EsmWeights, EsmWeightsQ8, EsmWeightsQ4, EsmWeightsQ3,
+    FastaRecord, ModelWeightsRef, RunState, TerminalTheme,
+    CodqHeader, CODQ_MAGIC, DTYPE_Q4_0, DTYPE_Q8_0, DTYPE_FP32, DTYPE_Q3_LUT,
+    QuantizationMode, DmsScoringMode,
 };
 
 fn print_version() {
     println!("codon-infer v{}", env!("CARGO_PKG_VERSION"));
-    println!("Engine: Pure Rust Zero-Dependencies (std) + Tiled GEMM & Zero-Trunk 3D Reconstruction");
+    println!("Engine: Pure Rust Zero-Dependencies (std) + Tiled GEMM, Zero-Trunk 3D Fold & BIO-2 Inverse Folding");
     println!("Vector Dispatch: {}", active_simd_backend());
     println!("Concurrency: Persistent Worker Pool with Atomic Barrier (zero OS thread spawning)");
-    println!("Quantization: Multi-Format Block Engine (Q4_0 nibbles & Q8_0 blocks with CODQ header)");
+    println!("Quantization: Multi-Format Block Engine (Q3_LUT 3.50 bpw Lloyd-Max, Q4_0 nibbles & Q8_0 blocks with CODQ header)");
     println!("Target Model: ESM-2 Multi-Scale [8M, 35M, 150M, 650M, 3B] (Meta AI / UniRef50)");
 }
 
@@ -25,12 +28,12 @@ fn print_help(theme: &TerminalTheme) {
     let logo = if theme.enabled {
         "\x1b[38;2;139;92;246m╔═══════════════════════════════════════════════════════════════════════════════╗\n\
          ║   \x1b[38;2;59;130;246mCODON-INFER\x1b[38;2;139;92;246m: High-Performance Zero-Allocation ESM-2 Engine in Pure Rust     ║\n\
-         ║   \x1b[38;2;16;185;129mVersion 1.8.0\x1b[38;2;139;92;246m     | Tiled GEMM, Canonical DMS, Contacts & 3D Fold Suite    ║\n\
+         ║   \x1b[38;2;16;185;129mVersion 1.9.0\x1b[38;2;139;92;246m     | All-Atom 3D Fold, BIO-2 Inverse Folding & Q3_LUT 3.5bpw ║\n\
          ╚═══════════════════════════════════════════════════════════════════════════════╝\x1b[0m"
     } else {
         "╔═══════════════════════════════════════════════════════════════════════════════╗\n\
          ║   CODON-INFER: High-Performance Zero-Allocation ESM-2 Engine in Pure Rust     ║\n\
-         ║   Version 1.8.0     | Tiled GEMM, Canonical DMS, Contacts & 3D Fold Suite    ║\n\
+         ║   Version 1.9.0     | All-Atom 3D Fold, BIO-2 Inverse Folding & Q3_LUT 3.5bpw ║\n\
          ╚═══════════════════════════════════════════════════════════════════════════════╝"
     };
     println!("{}", logo);
@@ -42,14 +45,16 @@ fn print_help(theme: &TerminalTheme) {
     println!("    dms          In silico Deep Mutational Scanning (Masked Marginal & 1-Pass Fast mode)");
     println!("    contacts     Zero-shot 3D contact map prediction (Official Multi-Layer APC + LR Head)");
     println!("    fold         Zero-trunk 3D protein structure folding & PDB atomic coordinate reconstruction");
-    println!("    quantize     Export quantized weights binary in Q4_0 or Q8_0 block format");
+    println!("    design       Zero-shot inverse folding & 3D structure-sequence co-design (BIO-2 geometric graph)");
+    println!("    quantize     Export quantized weights binary in Q3_LUT (3.50 bpw), Q4_0 or Q8_0 block format");
     println!("    benchmark    Hardware validation suite (SIMD parity, cache thrashing, scaling)");
     println!("\nGLOBAL OPTIONS:");
     println!("    -h, --help               Print help information");
     println!("    -V, --version            Print engine version and active vector acceleration");
     println!("    -m, --model <PATH>       Path to weights binary (or 'all' for multi-scale benchmark)");
     println!("    -t, --threads <N>        Number of CPU threads (default: available physical cores)");
-    println!("    --quantize <q4_0|q8_0|fp32> Quantization mode for execution (default: auto/fp32)");
+    println!("    --quantize <q3_lut|q4_0|q8_0|fp32> Quantization mode for execution (default: auto/fp32)");
+    println!("    --q3                     Shortcut flag for '--quantize q3_lut'");
     println!("    --q4                     Shortcut flag for '--quantize q4_0'");
     println!("    --q8                     Shortcut flag for '--quantize q8_0'");
     println!("    --color <auto|always|never> Control ANSI TrueColor terminal styling");
@@ -57,21 +62,25 @@ fn print_help(theme: &TerminalTheme) {
     println!("\nPIPELINE & EXPORT OPTIONS:");
     println!("    -s, --sequence <SEQ>     Input amino acid sequence (default 'M' in generate; required otherwise)");
     println!("    -f, --fasta <PATH>       Input FASTA file path (or '-' for stdin)");
-    println!("    --export-pdb <PATH>      Export reconstructed 3D C_alpha coordinates to PDB (contacts, fold)");
+    println!("    -p, --pdb <PATH>         Input 3D structure PDB file for inverse folding design");
+    println!("    --all-atom               Reconstruct full all-atom backbone (N, CA, C, O, CB) in fold PDB export");
+    println!("    --blind                  Run sequence-blind inverse folding in design subcommand");
+    println!("    --temperature <T>        Sampling temperature for design or generate (default: 0.1 for design)");
+    println!("    --export-fasta <PATH>    Export designed sequences to FASTA (design)");
+    println!("    --export-pdb <PATH>      Export reconstructed 3D coordinates to PDB (contacts, fold)");
     println!("    --export-tsv <PATH>      Export 3D coordinates table to TSV (fold)");
     println!("    --export-csv <PATH>      Export rectangular analysis matrix to CSV (dms, contacts)");
-    println!("    --export-json <PATH>     Export structured metrics report to JSON (dms, contacts, inpaint, fold, benchmark)");
+    println!("    --export-json <PATH>     Export structured metrics report to JSON (dms, contacts, inpaint, fold, design, benchmark)");
     println!("\nSUBCOMMAND EXAMPLES:");
     println!("    codon-infer generate --sequence \"M\" --temperature 0.7 --max-tokens 50 --threads 4");
-    println!("    codon-infer generate --sequence \"M\" --model esm2_650m_q4_0.bin --threads 4");
     println!("    codon-infer inpaint --sequence \"MCMPC*TTDHQMARKCDD\" --threads 4");
     println!("    codon-infer dms --fasta protein.fasta --window 128 --export-csv dms.csv --threads 4");
-    println!("    codon-infer dms --fasta protein.fasta --fast --export-csv dms_fast.csv --threads 4");
     println!("    codon-infer contacts --sequence \"MCMPCFTTDHQMARKCDDCCGGKGRGKCYGPQCLCR\" --export-pdb contacts.pdb --threads 4");
-    println!("    codon-infer fold --sequence \"MCMPCFTTDHQMARKCDDCCGGKGRGKCYGPQCLCR\" --export-pdb structure.pdb --threads 4");
-    println!("    codon-infer quantize --model esm2_650m_weights.bin --output esm2_650m_q4_0.bin");
+    println!("    codon-infer fold --sequence \"MCMPCFTTDHQMARKCDDCCGGKGRGKCYGPQCLCR\" --all-atom --export-pdb structure.pdb --threads 4");
+    println!("    codon-infer design --pdb structure.pdb --export-fasta designed.fasta --export-json design.json --threads 4");
+    println!("    codon-infer quantize q3_lut --model esm2_650m_weights.bin --output esm2_650m_q3_lut.bin");
     println!("    codon-infer quantize q4_0 --model esm2_8m_weights.bin --output esm2_8m_q4_0.bin");
-    println!("    codon-infer quantize --model esm2_8m_weights.bin --output esm2_8m_q8_0.bin");
+    println!("    codon-infer quantize q8_0 --model esm2_8m_weights.bin --output esm2_8m_q8_0.bin");
     println!("    codon-infer benchmark --suite full --threads 4");
 }
 
@@ -103,6 +112,7 @@ pub enum LoadedWeights {
     Fp32(EsmWeights),
     Q8(EsmWeightsQ8),
     Q4(EsmWeightsQ4),
+    Q3(EsmWeightsQ3),
 }
 
 impl LoadedWeights {
@@ -111,6 +121,7 @@ impl LoadedWeights {
             LoadedWeights::Fp32(ref w) => ModelWeightsRef::Fp32(w),
             LoadedWeights::Q8(ref w) => ModelWeightsRef::Q8(w),
             LoadedWeights::Q4(ref w) => ModelWeightsRef::Q4(w),
+            LoadedWeights::Q3(ref w) => ModelWeightsRef::Q3(w),
         }
     }
 }
@@ -129,6 +140,10 @@ pub fn load_model_weights(
             if let Ok(header) = CodqHeader::read_from(&mut file) {
                 if let Ok(config) = header.to_config() {
                     match header.dtype {
+                        DTYPE_Q3_LUT => {
+                            let weights = EsmWeightsQ3::from_file(model_path, &config)?;
+                            return Ok((config, LoadedWeights::Q3(weights)));
+                        }
                         DTYPE_Q4_0 => {
                             let weights = EsmWeightsQ4::from_file(model_path, &config)?;
                             return Ok((config, LoadedWeights::Q4(weights)));
@@ -140,6 +155,9 @@ pub fn load_model_weights(
                         DTYPE_FP32 => {
                             let weights = EsmWeights::from_file(model_path, &config)?;
                             match quant_override {
+                                Some(QuantizationMode::Q3_LUT) => {
+                                    return Ok((config, LoadedWeights::Q3(weights.quantize_q3())));
+                                }
                                 Some(QuantizationMode::Q4_0) => {
                                     return Ok((config, LoadedWeights::Q4(weights.quantize_q4())));
                                 }
@@ -160,6 +178,18 @@ pub fn load_model_weights(
         Ok(cfg) => cfg,
         Err(_) => EsmConfig::esm2_8m(),
     };
+
+    let is_q3_file = model_path.ends_with(".q3")
+        || model_path.ends_with(".q3.bin")
+        || model_path.ends_with("_q3_lut.bin")
+        || model_path.ends_with("_q3.bin")
+        || model_path.contains("q3_lut")
+        || model_path.contains("q3");
+
+    if is_q3_file {
+        let weights_q3 = EsmWeightsQ3::from_file(model_path, &config)?;
+        return Ok((config, LoadedWeights::Q3(weights_q3)));
+    }
 
     let is_q4_file = model_path.ends_with(".q4")
         || model_path.ends_with(".q4.bin")
@@ -188,6 +218,10 @@ pub fn load_model_weights(
     } else {
         let weights = EsmWeights::from_file(model_path, &config)?;
         match quant_override {
+            Some(QuantizationMode::Q3_LUT) => {
+                let q3 = weights.quantize_q3();
+                Ok((config, LoadedWeights::Q3(q3)))
+            }
             Some(QuantizationMode::Q4_0) => {
                 let q4 = weights.quantize_q4();
                 Ok((config, LoadedWeights::Q4(q4)))
@@ -239,13 +273,17 @@ fn main() -> io::Result<()> {
             }
         } else if a == "--quantize" && i + 1 < args.len() {
             let q_str = args[i + 1].to_lowercase();
-            if q_str == "q4_0" || q_str == "q4" {
+            if q_str == "q3_lut" || q_str == "q3" || q_str == "3.5bpw" {
+                global_quantize = Some(QuantizationMode::Q3_LUT);
+            } else if q_str == "q4_0" || q_str == "q4" {
                 global_quantize = Some(QuantizationMode::Q4_0);
             } else if q_str == "q8_0" || q_str == "q8" {
                 global_quantize = Some(QuantizationMode::Q8_0);
             } else if q_str == "fp32" {
                 global_quantize = Some(QuantizationMode::Fp32);
             }
+        } else if a == "--q3" {
+            global_quantize = Some(QuantizationMode::Q3_LUT);
         } else if a == "--q8" {
             global_quantize = Some(QuantizationMode::Q8_0);
         } else if a == "--q4" {
@@ -673,6 +711,7 @@ fn main() -> io::Result<()> {
                 LoadedWeights::Fp32(_) => "FP32 (Canonical)",
                 LoadedWeights::Q8(_) => "Q8_0 (In-Memory Blocks)",
                 LoadedWeights::Q4(_) => "Q4_0 (4-bit Nibble Blocks)",
+                LoadedWeights::Q3(_) => "Q3_LUT (3.50 bpw Hybrid)",
             };
 
             println!("--- Codon-Infer Engine v{} (Zero-Deps Multi-Scale CLI) ---", env!("CARGO_PKG_VERSION"));
@@ -739,6 +778,19 @@ fn main() -> io::Result<()> {
                         Some(&mut print_cb),
                     )
                 }
+                LoadedWeights::Q3(ref weights_q3) => {
+                    generate_sequence_q3(
+                        &prompt,
+                        temperature,
+                        max_tokens,
+                        seed,
+                        &config,
+                        weights_q3,
+                        &mut run_state,
+                        num_threads,
+                        Some(&mut print_cb),
+                    )
+                }
             };
 
             println!("\n\n--- Performance & Validation Report ---");
@@ -756,10 +808,10 @@ fn main() -> io::Result<()> {
             let mut output_path_arg: Option<String> = None;
 
             let mut i = sub_args_start;
-            // Check for positional format: codon-infer quantize q4_0 ... or codon-infer quantize q8_0 ...
+            // Check for positional format: codon-infer quantize q3_lut ... or q4_0 ... or q8_0 ...
             if i < args.len() && !args[i].starts_with('-') {
                 let lower = args[i].to_lowercase();
-                if lower == "q4_0" || lower == "q4" || lower == "q8_0" || lower == "q8" {
+                if lower == "q3_lut" || lower == "q3" || lower == "3.5bpw" || lower == "q4_0" || lower == "q4" || lower == "q8_0" || lower == "q8" {
                     format_arg = Some(lower);
                     i += 1;
                 }
@@ -775,10 +827,12 @@ fn main() -> io::Result<()> {
                 } else if (args[i] == "--format" || args[i] == "-f") && i + 1 < args.len() {
                     format_arg = Some(args[i + 1].to_lowercase());
                     i += 2;
-                } else if !args[i].starts_with('-') && format_arg.is_none() {
+                } else if !args[i].starts_with('-') {
                     let lower = args[i].to_lowercase();
-                    if lower == "q4_0" || lower == "q4" || lower == "q8_0" || lower == "q8" {
+                    if (lower == "q3_lut" || lower == "q3" || lower == "3.5bpw" || lower == "q4_0" || lower == "q4" || lower == "q8_0" || lower == "q8") && format_arg.is_none() {
                         format_arg = Some(lower);
+                    } else if input_model_arg.is_none() {
+                        input_model_arg = Some(args[i].clone());
                     }
                     i += 1;
                 } else {
@@ -786,91 +840,123 @@ fn main() -> io::Result<()> {
                 }
             }
 
-            // Determine whether to use Q4_0 or Q8_0:
-            // Priority:
-            // 1. Explicit format argument (--format or positional)
-            // 2. Auto-detection from output filename:
-            //    - if contains "q4_0" or "q4": Q4_0
-            //    - if contains "q8_0" or "q8": Q8_0
-            // 3. Default: Q8_0
-            let is_q4 = match format_arg.as_deref() {
-                Some("q4_0") | Some("q4") => true,
-                Some("q8_0") | Some("q8") => false,
+            let quant_kind = match format_arg.as_deref() {
+                Some("q3_lut") | Some("q3") | Some("3.5bpw") => QuantizationMode::Q3_LUT,
+                Some("q4_0") | Some("q4") => QuantizationMode::Q4_0,
+                Some("q8_0") | Some("q8") => QuantizationMode::Q8_0,
                 _ => {
                     if let Some(ref out) = output_path_arg {
                         let out_lower = out.to_lowercase();
-                        out_lower.contains("q4_0") || out_lower.contains("q4")
+                        if out_lower.contains("q3_lut") || out_lower.contains("q3") {
+                            QuantizationMode::Q3_LUT
+                        } else if out_lower.contains("q4_0") || out_lower.contains("q4") {
+                            QuantizationMode::Q4_0
+                        } else {
+                            QuantizationMode::Q8_0
+                        }
                     } else {
-                        false
+                        QuantizationMode::Q8_0
                     }
                 }
             };
 
             let input_model = input_model_arg.unwrap_or_else(|| "esm2_650m_weights.bin".to_string());
             let output_path = output_path_arg.unwrap_or_else(|| {
-                if is_q4 {
-                    "esm2_650m_q4_0.bin".to_string()
-                } else {
-                    "esm2_650m_q8_0.bin".to_string()
+                match quant_kind {
+                    QuantizationMode::Q3_LUT => "esm2_650m_q3_lut.bin".to_string(),
+                    QuantizationMode::Q4_0 => "esm2_650m_q4_0.bin".to_string(),
+                    _ => "esm2_650m_q8_0.bin".to_string(),
                 }
             });
 
-            if is_q4 {
-                println!("┌────────────────────────────────────────────────────────────────────────┐");
-                println!("│ CODON-INFER: MOTOR DE CUANTIZACIÓN STREAMING Q4_0                      │");
-                println!("└────────────────────────────────────────────────────────────────────────┘");
-                println!("  -> Archivo fuente FP32: '{}'", input_model);
-                println!("  -> Archivo destino Q4_0: '{}'", output_path);
-                let t0 = Instant::now();
-                let config = EsmConfig::detect_from_file(&input_model)?;
-                println!("  -> Arquitectura detectada: {}", config.model_name());
-                let file_size = match codon_infer::quantize_file_streaming_q4(&input_model, &output_path, &config) {
-                    Ok(sz) => sz,
-                    Err(_) => {
-                        let fp32 = EsmWeights::from_file(&input_model, &config)?;
-                        let q4 = fp32.quantize_q4();
-                        q4.save_to_file(&output_path, &config)?;
-                        std::fs::metadata(&output_path)?.len()
-                    }
-                };
-                let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
-                println!(
-                    "  -> Streaming Q4_0 completado: {} bytes ({:.2} MB) en {:.1} ms.",
-                    file_size,
-                    file_size as f64 / 1_048_576.0,
-                    total_ms
-                );
-                println!("==========================================================================");
-                println!("  ESTADO: BINARIO Q4_0 GENERADO Y VALIDADO EN DISCO                      ");
-                println!("==========================================================================\n");
-            } else {
-                println!("┌────────────────────────────────────────────────────────────────────────┐");
-                println!("│ CODON-INFER: MOTOR DE CUANTIZACIÓN STREAMING Q8_0                      │");
-                println!("└────────────────────────────────────────────────────────────────────────┘");
-                println!("  -> Archivo fuente FP32: '{}'", input_model);
-                println!("  -> Archivo destino Q8_0: '{}'", output_path);
-                let t0 = Instant::now();
-                let config = EsmConfig::detect_from_file(&input_model)?;
-                println!("  -> Arquitectura detectada: {}", config.model_name());
-                let file_size = match codon_infer::quantize_file_streaming_q8(&input_model, &output_path, &config) {
-                    Ok(sz) => sz,
-                    Err(_) => {
-                        let fp32 = EsmWeights::from_file(&input_model, &config)?;
-                        let q8 = fp32.quantize_q8();
-                        q8.save_to_file_with_header(&output_path, &config)?;
-                        std::fs::metadata(&output_path)?.len()
-                    }
-                };
-                let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
-                println!(
-                    "  -> Streaming Q8_0 completado: {} bytes ({:.2} MB) en {:.1} ms.",
-                    file_size,
-                    file_size as f64 / 1_048_576.0,
-                    total_ms
-                );
-                println!("==========================================================================");
-                println!("  ESTADO: BINARIO Q8_0 GENERADO Y VALIDADO EN DISCO                      ");
-                println!("==========================================================================\n");
+            match quant_kind {
+                QuantizationMode::Q3_LUT => {
+                    println!("┌────────────────────────────────────────────────────────────────────────┐");
+                    println!("│ CODON-INFER: MOTOR DE CUANTIZACIÓN STREAMING Q3_LUT (3.50 bpw)        │");
+                    println!("└────────────────────────────────────────────────────────────────────────┘");
+                    println!("  -> Archivo fuente FP32: '{}'", input_model);
+                    println!("  -> Archivo destino Q3_LUT: '{}'", output_path);
+                    let t0 = Instant::now();
+                    let config = EsmConfig::detect_from_file(&input_model)?;
+                    println!("  -> Arquitectura detectada: {}", config.model_name());
+                    let file_size = match codon_infer::quantize_file_streaming_q3(&input_model, &output_path, &config) {
+                        Ok(sz) => sz,
+                        Err(_) => {
+                            let fp32 = EsmWeights::from_file(&input_model, &config)?;
+                            let q3 = fp32.quantize_q3();
+                            q3.save_to_file(&output_path, &config)?;
+                            std::fs::metadata(&output_path)?.len()
+                        }
+                    };
+                    let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                    println!(
+                        "  -> Streaming Q3_LUT completado: {} bytes ({:.2} MB) en {:.1} ms.",
+                        file_size,
+                        file_size as f64 / 1_048_576.0,
+                        total_ms
+                    );
+                    println!("==========================================================================");
+                    println!("  ESTADO: BINARIO Q3_LUT GENERADO Y VALIDADO EN DISCO                    ");
+                    println!("==========================================================================\n");
+                }
+                QuantizationMode::Q4_0 => {
+                    println!("┌────────────────────────────────────────────────────────────────────────┐");
+                    println!("│ CODON-INFER: MOTOR DE CUANTIZACIÓN STREAMING Q4_0                      │");
+                    println!("└────────────────────────────────────────────────────────────────────────┘");
+                    println!("  -> Archivo fuente FP32: '{}'", input_model);
+                    println!("  -> Archivo destino Q4_0: '{}'", output_path);
+                    let t0 = Instant::now();
+                    let config = EsmConfig::detect_from_file(&input_model)?;
+                    println!("  -> Arquitectura detectada: {}", config.model_name());
+                    let file_size = match codon_infer::quantize_file_streaming_q4(&input_model, &output_path, &config) {
+                        Ok(sz) => sz,
+                        Err(_) => {
+                            let fp32 = EsmWeights::from_file(&input_model, &config)?;
+                            let q4 = fp32.quantize_q4();
+                            q4.save_to_file(&output_path, &config)?;
+                            std::fs::metadata(&output_path)?.len()
+                        }
+                    };
+                    let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                    println!(
+                        "  -> Streaming Q4_0 completado: {} bytes ({:.2} MB) en {:.1} ms.",
+                        file_size,
+                        file_size as f64 / 1_048_576.0,
+                        total_ms
+                    );
+                    println!("==========================================================================");
+                    println!("  ESTADO: BINARIO Q4_0 GENERADO Y VALIDADO EN DISCO                      ");
+                    println!("==========================================================================\n");
+                }
+                _ => {
+                    println!("┌────────────────────────────────────────────────────────────────────────┐");
+                    println!("│ CODON-INFER: MOTOR DE CUANTIZACIÓN STREAMING Q8_0                      │");
+                    println!("└────────────────────────────────────────────────────────────────────────┘");
+                    println!("  -> Archivo fuente FP32: '{}'", input_model);
+                    println!("  -> Archivo destino Q8_0: '{}'", output_path);
+                    let t0 = Instant::now();
+                    let config = EsmConfig::detect_from_file(&input_model)?;
+                    println!("  -> Arquitectura detectada: {}", config.model_name());
+                    let file_size = match codon_infer::quantize_file_streaming_q8(&input_model, &output_path, &config) {
+                        Ok(sz) => sz,
+                        Err(_) => {
+                            let fp32 = EsmWeights::from_file(&input_model, &config)?;
+                            let q8 = fp32.quantize_q8();
+                            q8.save_to_file_with_header(&output_path, &config)?;
+                            std::fs::metadata(&output_path)?.len()
+                        }
+                    };
+                    let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                    println!(
+                        "  -> Streaming Q8_0 completado: {} bytes ({:.2} MB) en {:.1} ms.",
+                        file_size,
+                        file_size as f64 / 1_048_576.0,
+                        total_ms
+                    );
+                    println!("==========================================================================");
+                    println!("  ESTADO: BINARIO Q8_0 GENERADO Y VALIDADO EN DISCO                      ");
+                    println!("==========================================================================\n");
+                }
             }
             Ok(())
         }
@@ -881,6 +967,7 @@ fn main() -> io::Result<()> {
             let mut export_pdb: Option<String> = None;
             let mut export_tsv: Option<String> = None;
             let mut export_json: Option<String> = None;
+            let mut all_atom = false;
             let mut num_threads = global_threads.unwrap_or(default_threads);
             let mut quant_mode = global_quantize;
 
@@ -892,12 +979,17 @@ fn main() -> io::Result<()> {
                 } else if (args[i] == "--sequence" || args[i] == "-s") && i + 1 < args.len() {
                     sequence_arg = Some(args[i + 1].clone());
                     i += 2;
+                } else if args[i] == "--all-atom" || args[i] == "--allatom" {
+                    all_atom = true;
+                    i += 1;
                 } else if (args[i] == "--threads" || args[i] == "-t") && i + 1 < args.len() {
                     if let Ok(t) = args[i + 1].parse::<usize>() { num_threads = t.max(1); }
                     i += 2;
                 } else if args[i] == "--quantize" && i + 1 < args.len() {
                     let q_str = args[i + 1].to_lowercase();
-                    if q_str == "q4_0" || q_str == "q4" {
+                    if q_str == "q3_lut" || q_str == "q3" || q_str == "3.5bpw" {
+                        quant_mode = Some(QuantizationMode::Q3_LUT);
+                    } else if q_str == "q4_0" || q_str == "q4" {
                         quant_mode = Some(QuantizationMode::Q4_0);
                     } else if q_str == "q8_0" || q_str == "q8" {
                         quant_mode = Some(QuantizationMode::Q8_0);
@@ -905,6 +997,9 @@ fn main() -> io::Result<()> {
                         quant_mode = Some(QuantizationMode::Fp32);
                     }
                     i += 2;
+                } else if args[i] == "--q3" {
+                    quant_mode = Some(QuantizationMode::Q3_LUT);
+                    i += 1;
                 } else if args[i] == "--q8" {
                     quant_mode = Some(QuantizationMode::Q8_0);
                     i += 1;
@@ -940,6 +1035,7 @@ fn main() -> io::Result<()> {
                 loaded_weights.as_ref(),
                 num_threads,
                 export_pdb.as_deref(),
+                all_atom,
                 &theme,
             );
 
@@ -950,6 +1046,143 @@ fn main() -> io::Result<()> {
             if let Some(ref json_path) = export_json {
                 export_fold_json(json_path, &result)?;
                 println!("  [EXPORT] 3D folding analysis JSON saved to '{}'.", json_path);
+            }
+            Ok(())
+        }
+
+        "design" => {
+            let mut pdb_path: Option<String> = None;
+            let mut fasta_path: Option<String> = None;
+            let mut sequence_arg: Option<String> = None;
+            let mut _temperature: f32 = 0.1;
+            let mut blind_mode = false;
+            let mut export_fasta: Option<String> = None;
+            let mut export_json: Option<String> = None;
+            let mut num_threads = global_threads.unwrap_or(default_threads);
+            let mut quant_mode = global_quantize;
+
+            let mut i = sub_args_start;
+            while i < args.len() {
+                if (args[i] == "--pdb" || args[i] == "-p") && i + 1 < args.len() {
+                    pdb_path = Some(args[i + 1].clone());
+                    i += 2;
+                } else if (args[i] == "--fasta" || args[i] == "-f") && i + 1 < args.len() {
+                    fasta_path = Some(args[i + 1].clone());
+                    i += 2;
+                } else if (args[i] == "--sequence" || args[i] == "-s") && i + 1 < args.len() {
+                    sequence_arg = Some(args[i + 1].clone());
+                    i += 2;
+                } else if args[i] == "--temperature" && i + 1 < args.len() {
+                    if let Ok(t) = args[i + 1].parse::<f32>() { _temperature = t; }
+                    i += 2;
+                } else if args[i] == "--blind" {
+                    blind_mode = true;
+                    i += 1;
+                } else if (args[i] == "--export-fasta" || args[i] == "-o") && i + 1 < args.len() {
+                    export_fasta = Some(args[i + 1].clone());
+                    i += 2;
+                } else if args[i] == "--export-json" && i + 1 < args.len() {
+                    export_json = Some(args[i + 1].clone());
+                    i += 2;
+                } else if (args[i] == "--threads" || args[i] == "-t") && i + 1 < args.len() {
+                    if let Ok(t) = args[i + 1].parse::<usize>() { num_threads = t.max(1); }
+                    i += 2;
+                } else if args[i] == "--quantize" && i + 1 < args.len() {
+                    let q_str = args[i + 1].to_lowercase();
+                    if q_str == "q3_lut" || q_str == "q3" || q_str == "3.5bpw" {
+                        quant_mode = Some(QuantizationMode::Q3_LUT);
+                    } else if q_str == "q4_0" || q_str == "q4" {
+                        quant_mode = Some(QuantizationMode::Q4_0);
+                    } else if q_str == "q8_0" || q_str == "q8" {
+                        quant_mode = Some(QuantizationMode::Q8_0);
+                    } else if q_str == "fp32" {
+                        quant_mode = Some(QuantizationMode::Fp32);
+                    }
+                    i += 2;
+                } else if args[i] == "--q3" {
+                    quant_mode = Some(QuantizationMode::Q3_LUT);
+                    i += 1;
+                } else if args[i] == "--q8" {
+                    quant_mode = Some(QuantizationMode::Q8_0);
+                    i += 1;
+                } else if args[i] == "--q4" {
+                    quant_mode = Some(QuantizationMode::Q4_0);
+                    i += 1;
+                } else if (args[i] == "--model" || args[i] == "-m") && i + 1 < args.len() {
+                    model_path = args[i + 1].clone();
+                    i += 2;
+                } else if args[i] == "--no-color" || args[i] == "--color" {
+                    i += if args[i] == "--color" { 2 } else { 1 };
+                } else {
+                    eprintln!("Warning: unrecognized design option '{}'", args[i]);
+                    i += 1;
+                }
+            }
+
+            let (config, loaded_weights) = load_model_weights(&model_path, quant_mode)?;
+
+            let (residues, _orig_seq_opt) = if let Some(ref ppath) = pdb_path {
+                let parsed = parse_pdb_atoms(ppath)?;
+                let orig_seq = sequence_arg.or_else(|| {
+                    if let Some(ref fpath) = fasta_path {
+                        parse_fasta_file(fpath).ok().and_then(|r| r.into_iter().next().map(|rec| rec.sequence))
+                    } else {
+                        None
+                    }
+                });
+                (parsed, orig_seq)
+            } else {
+                let record = load_input_record(fasta_path.as_deref(), sequence_arg.as_deref(), "target_design")?;
+                println!("  [FOLD] No PDB provided. Pre-computing 3D backbone from sequence via zero-trunk folding...");
+                let fold_res = compute_pipeline_fold_parallel(
+                    &record,
+                    &config,
+                    loaded_weights.as_ref(),
+                    num_threads,
+                );
+                let allatom = fold_res.allatom_residues.ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "Failed to reconstruct 3D backbone from sequence")
+                })?;
+                let orig = fold_res.sequence;
+                (allatom, Some(orig))
+            };
+
+            if residues.len() < 3 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Structure must contain at least 3 residues for inverse folding design.",
+                ));
+            }
+
+            let prot_id = if let Some(ref ppath) = pdb_path {
+                std::path::Path::new(ppath)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("target_design")
+            } else {
+                "target_design"
+            };
+
+            let result = run_pipeline_design_parallel(
+                prot_id,
+                &residues,
+                !blind_mode,
+                &config,
+                loaded_weights.as_ref(),
+                num_threads,
+                &theme,
+            );
+
+            if let Some(ref fa_path) = export_fasta {
+                let mut content = format!(">{} | recovery={:.1}% physico={:.1}%\n", result.protein_id, result.sequence_recovery_pct, result.physicochemical_recovery_pct);
+                content.push_str(&result.designed_sequence);
+                content.push('\n');
+                std::fs::write(fa_path, content)?;
+                println!("  [EXPORT] Designed sequence FASTA saved to '{}'.", fa_path);
+            }
+            if let Some(ref json_path) = export_json {
+                export_design_json(json_path, &result)?;
+                println!("  [EXPORT] 3D structure-sequence design JSON saved to '{}'.", json_path);
             }
             Ok(())
         }
